@@ -1,0 +1,266 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Agent::Session;
+use LLM::Chat::Conversation::Message;
+
+# Failure, bucket by bucket. Every subtest scripts one kind of failure and
+# pins what the loop does about it — which backend it talks to next,
+# whether it waits, what the AttemptFailed says, and what ends up in the
+# conversation and the transcript.
+
+plan 8;
+
+my @prompt = [msg('user', 'hello'),];
+
+my $tmp = $*TMPDIR.add("llm-agent-t05-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+subtest 'a 5xx retries the same backend, waits, and then advances' => {
+	plan 9;
+
+	# max-retries counts ATTEMPTS on a backend, so 2 means one call and
+	# one retry before the chain moves on. Two scripted 500s use both.
+	my $first = scripted-backend(model => 'primary', steps => [
+		{ error => 'upstream exploded', 'error-class' => 'http', 'error-status' => 500 },
+		{ error => 'upstream exploded again', 'error-class' => 'http', 'error-status' => 500 },
+	]);
+	my $second = scripted-backend(model => 'fallback', steps => [
+		{ content => 'the fallback answered' },
+	]);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$first, $second], max-retries => 2,
+	);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the retrying run');
+	my @events = drain-events($run);
+
+	my @failed = events-of(@events, 'attempt-failed');
+	is @failed.elems, 2, 'both attempts on the primary failed';
+
+	is @failed[0].disposition, 'retry-same', 'the first says retry the same one';
+	ok @failed[0].backoff >= 1, 'with a backoff of at least a second';
+	is @failed[0].error-status, 500, 'and the status that put it in that bucket';
+	is @failed[0].model, 'primary', 'named by the model that failed';
+
+	is @failed[1].disposition, 'advance',
+		'the second says advance — the retry budget is spent, and the '
+			~ 'disposition reports what the loop DOES';
+	nok @failed[1].backoff.defined, 'an advance does not wait';
+
+	is $first.recorded-calls.elems, 2, 'exactly two attempts on the primary';
+	is (await $run.result)<final>, 'the fallback answered',
+		'and the fallback finished the job';
+};
+
+subtest 'a 429 advances at once rather than sitting out somebody else’s quota' => {
+	plan 5;
+
+	my $first = scripted-backend(steps => [
+		{ error => 'rate limited', 'error-class' => 'http', 'error-status' => 429 },
+	]);
+	my $second = scripted-backend(steps => [{ content => 'answered' },]);
+
+	my $loop = LLM::Agent::Loop.new(backends => [$first, $second]);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the rate-limited run');
+	my @events = drain-events($run);
+
+	my @failed = events-of(@events, 'attempt-failed');
+	is @failed.elems, 1, 'one failure, not a retry storm';
+	is @failed[0].disposition, 'advance', 'the 429 advances';
+	nok @failed[0].backoff.defined, 'without a wait';
+
+	is $first.recorded-calls.elems, 1, 'the rate-limited backend was tried once';
+	is events-of(@events, 'attempt-started')[1].backend-index, 1,
+		'and the next attempt went to the next backend in the chain';
+};
+
+subtest 'a 4xx aborts the whole chain immediately' => {
+	plan 6;
+
+	my $first = scripted-backend(steps => [
+		{ error => 'invalid api key', 'error-class' => 'http', 'error-status' => 401 },
+	]);
+	my $second = scripted-backend(steps => [{ content => 'never reached' },]);
+
+	my $loop = LLM::Agent::Loop.new(backends => [$first, $second]);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the aborting run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'attempt-failed').head.disposition, 'abort',
+		'an authentication failure aborts';
+	is $second.recorded-calls.elems, 0,
+		'the rest of the chain is never tried — a bad key is bad everywhere';
+
+	is event-kinds(@events).tail, 'run-failed', 'the run fails';
+	my %outcome = await $run.result;
+	is %outcome<outcome>, 'failed', 'and says so in the result';
+	like %outcome<error>, /'invalid api key'/, 'carrying the reason';
+	is %outcome<attempts>.elems, 1, 'with the one attempt that was made';
+};
+
+subtest 'a stalled stream is cancelled at the backend and classified as a timeout' => {
+	plan 7;
+
+	# `stall` emits its fragments and then goes silent for ever: no done,
+	# no quit, and a last-activity-at that stops advancing. Nothing but an
+	# inactivity timeout gets a run out of this.
+	my $first = scripted-backend(steps => [
+		{ chunks => ['thinking'], stall => True },
+	]);
+	my $second = scripted-backend(steps => [{ content => 'answered' },]);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$first, $second], round-trip-timeout => 0.3,
+	);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the stalled run');
+	my @events = drain-events($run);
+
+	is $first.cancelled-responses.elems, 1,
+		'the loop cancelled the stalled response at its backend';
+
+	my $failed = events-of(@events, 'attempt-failed').head;
+	is $failed.error-class, 'timeout', 'and classified it as a timeout';
+	is $failed.disposition, 'advance',
+		'which is the advance bucket — the next backend answers sooner '
+			~ 'than a backoff would end';
+	like $failed.error, /'no activity'/,
+		'the message says what actually happened';
+	nok $failed.error-status.defined, 'and there is no HTTP status to report';
+
+	is (await $run.result)<final>, 'answered', 'the run completed on the fallback';
+	is events-of(@events, 'token').map({ .text }).join, 'thinkinganswered',
+		'the tokens of the abandoned attempt were emitted and then framed '
+			~ 'as failed — not silently dropped, and not retracted for you';
+};
+
+subtest 'a mid-stream failure retracts its tokens but never its transcript' => {
+	plan 7;
+
+	my $path = $tmp.add('midstream.jsonl');
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my $backend = scripted-backend(steps => [
+		# Streams half a sentence, then the connection drops.
+		{ chunks => ['Half a sen', 'tence that never arrives'],
+		  'fail-after-chunks' => 1,
+		  error => 'connection reset', 'error-class' => 'connection' },
+		{ content => 'The whole answer.' },
+	]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$session, max-retries => 2,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the mid-stream failure');
+	my @events = drain-events($run);
+
+	my @kinds = event-kinds(@events);
+	is @kinds.grep({ $_ eq 'attempt-started' }).elems, 2, 'two attempts';
+	is events-of(@events, 'token').map({ .text }).join,
+		'Half a senThe whole answer.',
+		'every fragment that reached the wire was emitted, including the '
+			~ 'ones the failed attempt streamed';
+
+	# The framing is the contract: a consumer discards Tokens back to the
+	# AttemptStarted that opened them.
+	my $failed-at = @kinds.first({ $_ eq 'attempt-failed' }, :k);
+	my $opened-at = @kinds[0 ..^ $failed-at].grep({ $_ eq 'attempt-started' }, :k).tail;
+	is events-of(@events[$opened-at ..^ $failed-at], 'token').map({ .text }).join,
+		'Half a sen',
+		'and the retracted scope is exactly the failed attempt’s fragments';
+
+	is events-of(@events, 'assistant-message').elems, 1,
+		'only the successful attempt was committed';
+	is events-of(@events, 'assistant-message').head.message.content,
+		'The whole answer.',
+		'with only the text the model really finished saying';
+
+	$session.close;
+	my $replayed = LLM::Agent::Session.load(path => $path);
+	is-deeply $replayed.messages.map({ .role ~ ':' ~ .content }).List,
+		('user:hello', 'assistant:The whole answer.'),
+		'and the transcript has no trace of the half sentence';
+	is $replayed.events.grep({ $_<type> eq 'message' }).elems, 2,
+		'two message lines, not three';
+};
+
+subtest 'exhausting every backend reports every attempt' => {
+	plan 7;
+
+	my $first = scripted-backend(model => 'a', steps => [
+		{ chunks => ['partial'], 'fail-after-chunks' => 0,
+		  error => 'network down', 'error-class' => 'connection' },
+	]);
+	my $second = scripted-backend(model => 'b', steps => [
+		{ error => 'also down', 'error-class' => 'connection' },
+	]);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$first, $second], max-retries => 1,
+	);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the exhausted run');
+
+	my %outcome = await $run.result;
+	is %outcome<outcome>, 'failed', 'the run failed';
+	is %outcome<attempts>.elems, 2, 'one attempt recorded per backend';
+	is %outcome<attempts>[0]<backend-index>, 0, 'in chain order';
+	is %outcome<attempts>[0]<model>, 'a', 'naming the model that failed';
+	like %outcome<attempts>[0]<error>, /'[backend 0]'/,
+		'with the error prefixed by which backend it came from';
+	nok %outcome<attempts>[1]<raw-text>:exists,
+		'a failure that streamed nothing has NO raw-text key — an empty '
+			~ 'one would look like a model that answered with nothing';
+	like %outcome<error>, /'every backend failed'/, 'and a summary to match';
+};
+
+subtest 'a failure carrying text keeps it as raw-text' => {
+	plan 2;
+
+	my $backend = scripted-backend(steps => [
+		{ chunks => ['most of an answer'], 'fail-after-chunks' => 1,
+		  error => 'truncated', 'error-class' => 'response' },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], max-retries => 1);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the truncated run');
+
+	my %outcome = await $run.result;
+	ok %outcome<attempts>[0]<raw-text>:exists,
+		'what the model managed to say is kept';
+	is %outcome<attempts>[0]<raw-text>, 'most of an answer', 'verbatim';
+};
+
+subtest 'an unclassifiable failure retries the same backend' => {
+	plan 3;
+
+	# No error-class at all: the conservative reading is a hiccup rather
+	# than a permanent property of the model.
+	my $backend = scripted-backend(steps => [
+		{ error => 'something went wrong' },
+		{ content => 'second time lucky' },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], max-retries => 2);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the unclassified run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'attempt-failed').head.disposition, 'retry-same',
+		'an error nobody has classified is retried';
+	is events-of(@events, 'attempt-failed').head.error-class, 'unknown',
+		'and reported with the class the backend did set';
+	is (await $run.result)<final>, 'second time lucky', 'the retry worked';
+};

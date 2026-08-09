@@ -1,0 +1,412 @@
+=begin pod
+
+=head1 LLM::Agent
+
+The engine behind a coding agent: a streaming loop that calls tools
+through a duck-typed provider, survives backend failure with
+per-round-trip retry and fallback, writes a durable JSONL transcript you
+can resume from tomorrow, and compacts the conversation before it
+outgrows the context window.
+
+It is the machinery, not the product. There is no permission model here
+(that is L<MCP::Client::Policy|https://raku.land/zef:apogee/MCP::Client>),
+no UI, no scheduler, and no opinion about what your agent is for.
+
+=head2 Synopsis
+
+=begin code :lang<raku>
+use LLM::Agent;
+
+my $loop = LLM::Agent::Loop.new(backends => [$primary, $fallback]);
+my $run  = $loop.run([$system-message, $user-message]);
+
+# One Supply, every kind of event.
+start react whenever $run.events -> $event {
+    given $event {
+        when LLM::Agent::Event::Token    { print $event.text }
+        when LLM::Agent::Event::ToolCall { note "  -> {$event.name}" }
+    }
+}
+
+# The Promise is KEPT even when the run failed: a failure is data.
+my %outcome = await $run.result;
+given %outcome<outcome> {
+    when 'completed' { say %outcome<final> }
+    when 'failed'    { note "gave up: {%outcome<error>}" }
+    when 'cancelled' { note 'cancelled' }
+}
+=end code
+
+=head2 The modules
+
+=begin table
+
+Module                  | What it is
+========================|=========================================================
+LLM::Agent::Loop        | the state machine; everything else serves it
+LLM::Agent::Run         | the handle on one run: events, result, cancel
+LLM::Agent::Event       | the typed event taxonomy, and the framing contract
+LLM::Agent::Session     | the durable JSONL transcript, and resuming from one
+LLM::Agent::Compactor   | summarize the middle before the window fills
+LLM::Agent::TokenCount  | how big is this conversation: three answers
+LLM::Agent::Prompt      | the four pieces a system prompt is made of
+
+=end table
+
+C<use LLM::Agent;> loads all seven and is enough for every class. It does
+not re-export C<LLM::Agent::Prompt>'s B<subs> — an C<is export> reaches
+one scope, not two — so call those fully qualified
+(C<LLM::Agent::Prompt::assemble(...)>) or C<use LLM::Agent::Prompt;> as
+well.
+
+=head2 A round, step by step
+
+=item B<Compaction check, at the top.> Before spending a request, not
+after: a round that ends with six tool results is exactly the round that
+blew the budget, so checking on the way in means the next request is the
+one that fits.
+
+=item B<The round trip.> C<AttemptStarted>, a streamed completion,
+C<Token> events as the text arrives. Retry and fallback happen here, per
+round trip.
+
+=item B<Limits, before anything is committed.> A limit emits
+C<LimitReached>, appends a system message in C<LLM::Chat::ToolLoop>'s
+exact wording, switches tools off, and gives the model one last round to
+answer with what it has.
+
+=item B<The assistant turn is committed.> C<AssistantMessage>, appended
+to the conversation and written to the transcript with C<reasoning> and
+C<usage> as replay-visible extras.
+
+=item B<Tools.> One C<ToolCall> per call, one batch through the provider,
+one C<ToolResult> per result, one C<< role => 'tool' >> message per
+result.
+
+=item B<Grants.> If the provider C<can('grants')> — a policy does — a
+changed snapshot is written to the transcript, so a resumed session does
+not ask the human the same question again.
+
+No tool calls, or tools switched off: C<RunCompleted>, and the run ends.
+
+=head2 Failure, retry and fallback
+
+Every failure is classified by
+L<LLM::Chat::Retry|https://raku.land/zef:apogee/LLM::Chat>'s
+C<classify-error> — the same policy C<LLM::Data::Inference::Task> has run
+in production — into one of three buckets:
+
+=begin table
+
+Bucket     | What the loop does
+===========|====================================================================
+abort      | AttemptFailed, then RunFailed. A 4xx will not heal in eight seconds.
+retry-same | AttemptFailed with a backoff, sleep, same backend again
+advance    | AttemptFailed, next backend in the chain, no wait
+
+=end table
+
+C<max-retries> is the number of B<attempts per backend> (Task's
+semantics, not "extra tries"): 3 means one call and two retries before
+the chain advances. When the budget runs out, the C<AttemptFailed> says
+C<advance>, because C<disposition> reports what the loop B<does> rather
+than what the classifier said in the abstract. When every backend is
+spent, C<RunFailed> carries the full C<attempts> list.
+
+=head3 The timeout is inactivity, not duration
+
+C<round-trip-timeout> (default 120s) measures the gap since the response
+last did anything — C<< $resp.last-activity-at >> — not the total time
+the request has taken. This is a deliberate divergence from
+C<LLM::Data::Inference::Task>, which bounds total duration: Task
+generates one JSON document per item and a slow one is a stuck one, while
+an agent turn legitimately runs for minutes. What is never legitimate is
+a stream that stops producing tokens and never closes, which is what a
+dropped connection behind a proxy looks like.
+
+=head3 Mid-stream failure: the framing contract
+
+A backend can fail after streaming four hundred tokens. Those tokens were
+emitted; a Supply has no undo. So the framing events are the contract:
+
+=begin table
+
+Event            | What a consumer must do
+=================|=================================================
+AttemptStarted   | open a fresh token scope
+Token            | append to the CURRENT scope
+AttemptFailed    | B<discard> every Token since the last AttemptStarted
+AttemptSucceeded | commit the scope; the AssistantMessage that follows is authoritative
+
+=end table
+
+A consumer that ignores this renders a doubled reply the first time a
+backend 500s halfway through a sentence. Nothing a failed attempt
+streamed ever reaches the transcript: only committed messages are
+written.
+
+=head2 Cancellation
+
+C<< $run.cancel >> is idempotent, safe from any thread, and never throws.
+It asks; the loop winds down and emits C<RunCancelled>.
+
+=begin table
+
+Situation                    | On cancel
+=============================|=======================================================
+mid-stream                   | backend told to cancel; run ends promptly
+during a retry backoff       | wait ends within 0.25s; run ends
+between rounds               | no further round starts
+during a tool batch          | loop stops waiting; the calls still finish
+blocked on a permission ask  | nothing happens until the human answers
+after the run finished       | no-op; the outcome stands
+
+=end table
+
+The two "nothing happens" rows are honest limitations rather than bugs
+waiting to be fixed. A tool batch has no cancellation to forward, and an
+C<fs_write> already in flight has already happened; the loop drains the
+result and emits no C<ToolResult> for it — but it does write one
+synthetic C<tool> message per abandoned call, because an assistant turn
+carrying C<tool_calls> that nothing answers is a conversation every
+provider rejects, and the transcript has to stay resumable. An ask is a
+leaf: the policy holds a non-reentrant lock and is waiting for a human,
+and a run cannot dismiss a modal something else owns.
+
+Note also that "the backend was told to cancel" is not "the model stopped
+generating". Among the LLM::Chat backends only KoboldCpp really aborts
+upstream; the others stop reading, and the tokens you are no longer being
+shown are still being billed.
+
+=head2 The transcript
+
+One append-only JSONL file, held open on a single flushed handle-mode
+C<JSONL::Writer>, so every line is durable the moment its method returns.
+
+=begin code :lang<json>
+{"id":"6f1c...","payload":{...},"ts":"2026-08-09T13:10:08.542283Z","type":"message","v":1}
+=end code
+
+Four types: C<session-meta> (always first, the caller's own hash
+verbatim), C<message>, C<grants> (the B<whole> snapshot, last one wins)
+and C<compaction>. Unknown types are preserved on replay and skipped by
+the readers, so a file written by a newer LLM::Agent still loads.
+
+=begin code :lang<raku>
+my $session = LLM::Agent::Session.create(
+    path => $path, meta => { agent => 'sadna', cwd => $*CWD.Str },
+);
+
+# ... later, in another process ...
+my $resumed  = LLM::Agent::Session.load(path => $path);
+my @messages = $resumed.messages;     # compaction already applied
+my @grants   = $resumed.grants;       # feed straight to a Policy
+=end code
+
+Replay tolerates a malformed line B<only as the very last line> — which
+is exactly what a crash mid-write looks like; it is dropped and reported
+in C<.warnings>. A malformed line anywhere else is fatal, because
+silently skipping it would hand back a conversation with an invisible
+hole in it.
+
+What is deliberately B<not> stored: token deltas, attempt telemetry, the
+contents of permission questions (only the resulting grants), forwarded
+server logs, and any opinion about where the file should live.
+
+=head2 Compaction
+
+=begin code :lang<raku>
+my $counter   = LLM::Agent::TokenCount::Usage.new;    # shared with the loop
+my $compactor = LLM::Agent::Compactor.new(
+    backend        => @backends[0],   # a cheap model is a fine summarizer
+    counter        => $counter,
+    context-budget => 128_000,
+);
+=end code
+
+The shape is fixed: the sticky prefix (sysprompt and anything else
+C<Message.is-sticky> agrees with) stays where it is, the last
+C<keep-recent> turns stay verbatim, and everything between is replaced by
+one summary message. The recent window is extended backwards while it
+starts on a C<tool> result, so an assistant turn and the results
+answering it are never separated — splitting them is a 400 from every
+provider.
+
+When the summarizer fails, the failure is classified: an C<abort> bucket
+hard-trims immediately, anything else is retried up to C<max-attempts>
+(3) with backoff, and a still-unreachable summarizer falls back to a
+pair-aligned B<hard trim> with C<< fallback => True >>. That fallback is
+the whole point of the design — the loop always makes progress, because
+an agent that stops working when a summarizer is down is worse than an
+agent that forgot what happened an hour ago.
+
+C<LLM::Agent::Session> replays exactly the transformation the compactor
+applied, so C<$session.messages> after a resume equals the array the loop
+was working with when it stopped. C<t/11> pins that end to end.
+
+=head2 Counting tokens
+
+=begin table
+
+Implementation | Needs                        | Accuracy
+===============|==============================|=========================================
+Usage          | nothing (calibrates itself)  | exact for the billed prefix, estimated beyond
+Heuristic      | nothing                      | ±20% on English prose, worse on code/CJK
+Exact          | a tokenizer + a template     | exact, always
+
+=end table
+
+C<Usage> is the default: it remembers the prompt-token count the provider
+actually billed for the prefix it has already seen and estimates only the
+tail beyond it. The loop owns one instance and hands the B<same> one to
+its compactor, so the calibration a run accumulates is not thrown away at
+the moment it matters most.
+
+=head2 The canonical wiring
+
+The whole stack, in the order the pieces have to be built. Note the
+B<forward declarations>: the MCP client needs the policy's elicit hook at
+construction, the policy needs the loop's ask shim, and the loop needs
+the policy — so two of the three have to be named before they exist.
+
+=begin code :lang<raku>
+use LLM::Agent;
+use MCP::Client;
+use MCP::Client::Registry;
+use MCP::Client::Policy;
+
+my $loop;                       # forward-declared: the shims come from it
+my $policy;                     # forward-declared: the client's hook needs it
+
+my $session = LLM::Agent::Session.create(
+    path => $path, meta => { agent => 'myagent', cwd => $*CWD.Str },
+);
+
+my $fs = MCP::Client.connect-stdio(
+    command   => 'raku-mcp',
+    args      => ['--pack=FileSystem', '--root=' ~ $*CWD],
+    on-elicit => -> %request { $policy.elicit-hook.(%request) },
+
+    # Server logs become Log events on the run's Supply. THE log-level IS
+    # LOAD-BEARING: since the 2026-07-28 revision a modern server sends
+    # nothing at all without one, and a silent hook looks exactly like a
+    # server that had nothing to say.
+    on-log    => -> %params { $loop.log-hook.(%params) },
+    log-level => 'info',
+);
+
+my $registry = MCP::Client::Registry.new;
+$registry.add($fs, prefix => 'fs');
+
+$policy = MCP::Client::Policy.new(
+    provider => $registry,
+    rules    => [
+        |MCP::Client::Policy.default-rules,
+        { tool => 'fs_write', decision => 'allow', under => 'scratch' },
+    ],
+    roots    => { fs => $*CWD.Str },
+    grants   => $session.grants,          # last session's "always allow"s
+    on-ask   => -> %request { $loop.wrap-ask(&ask-the-human).(%request) },
+);
+
+my $counter   = LLM::Agent::TokenCount::Usage.new;
+my $compactor = LLM::Agent::Compactor.new(
+    backend => @backends[0], :$counter, context-budget => 128_000,
+);
+
+$loop = LLM::Agent::Loop.new(
+    :@backends, :$counter, :$session, :$compactor, provider => $policy,
+);
+
+my $system = LLM::Agent::Prompt::assemble(
+    identity => 'You are a coding assistant working in a checked-out repository.',
+    sections => [
+        LLM::Agent::Prompt::env-block(extra => { cwd => $*CWD.Str }),
+        LLM::Agent::Prompt::tool-docs($policy.tools-for-llm),
+        LLM::Agent::Prompt::instructions-from-files(['AGENTS.md']),
+    ],
+);
+
+my $question = LLM::Chat::Conversation::Message.new(
+    role => 'user', content => 'Make the tests pass.',
+);
+$session.append-message($question);      # the app owns the turns it originates
+
+my $run = $loop.run([$system, $question]);
+=end code
+
+C<wrap-ask> emits C<AskPending>, calls the real asker (which still blocks,
+and still holds the policy's lock), emits C<AskAnswered>, and returns the
+answer untouched. What does B<not> work is
+C<< on-ask => $loop.wrap-ask(&ask) >> with C<$loop> still undefined: that
+calls a method on a type object at construction time and dies there.
+
+=head2 The event taxonomy
+
+=begin table
+
+Class             | kind               | Payload
+==================|====================|===================================================
+RunStarted        | run-started        | run-id, message-count
+RoundStarted      | round-started      | round, tokens?
+AttemptStarted    | attempt-started    | round, attempt, backend-index, model
+Token             | token              | text, round?, attempt?
+AttemptFailed     | attempt-failed     | round, attempt, backend-index, model?, error, error-class?, error-status?, disposition, backoff?
+AttemptSucceeded  | attempt-succeeded  | round, attempt, backend-index, model-used?, finish-reason?, usage, latency-ms?
+AssistantMessage  | assistant-message  | message, reasoning?, round?
+ToolCall          | tool-call          | id, name, arguments?, round?
+ToolResult        | tool-result        | id, name?, content, is-error, round?
+AskPending        | ask-pending        | request, tool?
+AskAnswered       | ask-answered       | request, answer?
+Log               | log                | level, logger?, data
+LimitReached      | limit-reached      | limit, count?, max?
+CompactionStarted | compaction-started | tokens-before?, budget?, message-count?, round?
+CompactionDone    | compaction-done    | tokens-before?, tokens-after?, dropped?, summary?, fallback, round?
+RunCompleted      | run-completed      | final, rounds?, message-count?
+RunFailed         | run-failed         | error, attempts, round?
+RunCancelled      | run-cancelled      | stage?, round?
+
+=end table
+
+A C<?> marks a key that is absent from C<.to-hash> when it was not
+supplied. Exactly one terminal event is emitted per run and the Supply is
+then C<done>; it is B<never> C<quit>, because a failure is data, not an
+exception thrown at whoever happened to be tapping.
+
+The Supply is a C<Supplier::Preserving>, so a consumer that taps late
+still sees the whole run from the beginning — B<but the buffer is
+delivered to the first tap only>. Tap once and fan out yourself.
+
+=head2 Requirements
+
+L<LLM::Chat|https://raku.land/zef:apogee/LLM::Chat> 0.8.0+ (backends,
+messages, and the shared retry policy),
+L<MCP::Client|https://raku.land/zef:apogee/MCP::Client> 0.2.0+ (only for
+the tool-provider duck type and the integration tests),
+L<JSONL|https://raku.land/zef:apogee/JSONL> 0.1.3+ (the flushed writer
+the transcript depends on), C<JSON::Fast> and C<UUID::V4>.
+
+=head2 Testing
+
+=begin code :lang<shell>
+prove6 -Ilib -It/lib -I../LLM-Chat/lib -I../MCP-Client/lib \
+       -I../JSONL/lib -I../Template-Jinja2/lib t/
+=end code
+
+The suite needs no network, no model and no API key: C<t/lib/AgentTestKit>
+provides a C<ScriptedBackend> that replays a list of steps — including
+mid-stream failures, stalls, per-attempt usage and structured error
+classes — and a duck-typed C<ScriptedProvider> that never throws.
+C<t/11> runs the loop over a B<real> C<MCP::Client::Policy>, a real
+transcript on a temporary file and a real compactor, and checks that a
+resumed session replays exactly the conversation the loop ended with.
+
+=head2 Author
+
+Matt Doughty
+
+=head2 License
+
+Artistic-2.0
+
+=end pod

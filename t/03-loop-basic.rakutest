@@ -1,0 +1,267 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Agent::Run;
+use LLM::Agent::TokenCount;
+use LLM::Chat::Conversation::Message;
+
+# The loop with nothing else plugged into it: the shape of a run, the
+# shape of its result, and the guarantees that hold before a single tool,
+# session or compactor is involved.
+
+plan 11;
+
+my @prompt = [msg('user', 'what is the capital of France?'),];
+
+subtest 'the happy path emits exactly the sequence a consumer expects' => {
+	plan 6;
+
+	my $backend = scripted-backend(steps => [
+		{ chunks => ['Paris', ', obviously.'] },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the happy path');
+	my @events = drain-events($run);
+
+	is-deeply event-kinds(@events),
+		(
+			'run-started', 'round-started', 'attempt-started',
+			'token', 'token', 'attempt-succeeded', 'assistant-message',
+			'run-completed',
+		),
+		'one round, one attempt, two fragments, one terminal';
+
+	is events-of(@events, 'token').map({ .text }).join,
+		'Paris, obviously.',
+		'concatenating the Tokens reproduces the assistant text exactly';
+
+	my $started = events-of(@events, 'run-started').head;
+	is $started.run-id, $run.id, 'RunStarted names the run';
+	is $started.message-count, 1, 'and says what it was given';
+
+	my $succeeded = events-of(@events, 'attempt-succeeded').head;
+	is $succeeded.finish-reason, 'stop', 'the finish reason came through';
+	ok $succeeded.latency-ms >= 0, 'and a latency was measured';
+};
+
+subtest 'the result Map is complete, kept, and agrees with the events' => {
+	plan 7;
+
+	my $backend = scripted-backend(steps => [{ content => 'Paris.' },]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
+
+	my $run = $loop.run(@prompt);
+	my %outcome = await $run.result;
+
+	is $run.result.status, Kept, 'the Promise is kept, not broken';
+	is %outcome<outcome>, 'completed', 'the outcome is derived from the terminal';
+	is %outcome<final>, 'Paris.', 'the final text is the assistant turn';
+	is %outcome<messages>.elems, 2, 'the conversation came back';
+	is %outcome<messages>[1].role, 'assistant', 'with the reply appended';
+	nok %outcome<error>.defined, 'no error on a completed run';
+	is-deeply %outcome<attempts>, (), 'and an empty — not absent — attempts list';
+};
+
+subtest 'a tap that arrives after the run finished still sees all of it' => {
+	plan 3;
+
+	my $backend = scripted-backend(steps => [{ content => 'done' },]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the finished run');
+	ok $run.is-done, 'the run really had finished before anything tapped';
+
+	# Supplier::Preserving: the FIRST tap gets the buffered run. This is
+	# the pin — a plain Supplier would hand back nothing here.
+	my @events = drain-events($run);
+	is event-kinds(@events).head, 'run-started',
+		'and the first tap receives the run from its very first event';
+	is event-kinds(@events).tail, 'run-completed',
+		'through to the terminal';
+};
+
+subtest 'usage is recorded on the counter after every successful attempt' => {
+	plan 4;
+
+	my $counter = LLM::Agent::TokenCount::Usage.new;
+	my $backend = scripted-backend(steps => [
+		{ content => 'hi', usage => { prompt => 812, completion => 9 } },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$counter);
+
+	is-deeply $counter.calibration, {},
+		'nothing is calibrated before the run';
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the usage run');
+	my @events = drain-events($run);
+
+	is $counter.calibration<prompt-tokens>, 812,
+		'the provider figure was handed to the counter';
+	is $counter.calibration<message-count>, 1,
+		'against the message count the REQUEST carried, not the reply';
+
+	is-deeply events-of(@events, 'attempt-succeeded').head.usage,
+		{ prompt-tokens => 812, completion-tokens => 9 },
+		'and the same usage is on the event, with absent fields absent';
+};
+
+subtest 'with no provider it is a plain chat loop' => {
+	plan 4;
+
+	# A model that hallucinates a tool call it was never offered.
+	my $backend = scripted-backend(steps => [
+		{ content => 'I will read it.', tool-calls => [tool-call('c1', 'fs_read'),] },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the tool-less run');
+	my @events = drain-events($run);
+
+	is $backend.recorded-calls[0]<tools>.elems, 0,
+		'no tools are declared to the backend';
+	is events-of(@events, 'tool-call').elems, 0,
+		'and a tool call nobody offered is not acted on';
+	is event-kinds(@events).tail, 'run-completed', 'the run simply completes';
+	is (await $run.result)<final>, 'I will read it.',
+		'with the text the model produced';
+};
+
+subtest 'one run at a time, and the loop is reusable afterwards' => {
+	plan 4;
+
+	# A step with a delay keeps the first run in flight long enough to
+	# ask for a second one without racing it.
+	my $backend = scripted-backend(steps => [
+		{ content => 'first', delay => 0.4 },
+		{ content => 'second' },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
+
+	my $first = $loop.run(@prompt);
+	throws-like { $loop.run(@prompt) }, Exception,
+		message => /'run in flight'/,
+		'a second run while one is live is refused';
+
+	run-settled($first, 'the first run');
+	is (await $first.result)<final>, 'first', 'the first run was unaffected';
+
+	my $second = $loop.run(@prompt);
+	run-settled($second, 'the second run');
+	is (await $second.result)<final>, 'second',
+		'and the loop takes another run once that one has finished';
+	isnt $first.id, $second.id, 'each run has its own identity';
+};
+
+subtest 'a driver that dies still finishes its run' => {
+	plan 3;
+
+	# A counter that throws on the hot path is the cheapest way to blow
+	# up inside the state machine without reaching into it.
+	my class ExplodingCounter does LLM::Agent::TokenCount {
+		method count-messages(@messages --> Int) { die 'the counter exploded' }
+	}
+
+	my $backend = scripted-backend(steps => [{ content => 'hi' },]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,],
+		counter => ExplodingCounter.new,
+		context-budget => 1000,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the exploding run');
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'failed',
+		'the result Promise is kept rather than left Planned forever';
+	like %outcome<error>, /'the counter exploded'/,
+		'and says what went wrong';
+	is event-kinds(drain-events($run)).tail, 'run-failed',
+		'with a terminal event to match';
+};
+
+subtest 'RoundStarted counts tokens only when there is a budget to count against' => {
+	plan 2;
+
+	my $bare = scripted-backend(steps => [{ content => 'hi' },]);
+	my $bare-run = LLM::Agent::Loop.new(backends => [$bare,]).run(@prompt);
+	run-settled($bare-run, 'the unbudgeted run');
+	nok events-of(drain-events($bare-run), 'round-started').head.tokens.defined,
+		'no budget, no count — the key is absent from to-hash';
+
+	my $budgeted = scripted-backend(steps => [{ content => 'hi' },]);
+	my $budgeted-run = LLM::Agent::Loop.new(
+		backends => [$budgeted,], context-budget => 8_000,
+	).run(@prompt);
+	run-settled($budgeted-run, 'the budgeted run');
+	ok events-of(drain-events($budgeted-run), 'round-started').head.tokens > 0,
+		'with a budget the round says how big the conversation is';
+};
+
+subtest 'the caller’s array is never mutated' => {
+	plan 2;
+
+	my @mine = msg('user', 'hello');
+	my $backend = scripted-backend(steps => [{ content => 'hi' },]);
+	my $run = LLM::Agent::Loop.new(backends => [$backend,]).run(@mine);
+	run-settled($run, 'the copying run');
+
+	is @mine.elems, 1, 'the array the caller passed is untouched';
+	is (await $run.result)<messages>.elems, 2,
+		'while the run worked on its own copy';
+};
+
+subtest 'reasoning is reported but kept out of the message' => {
+	plan 2;
+
+	my $backend = scripted-backend(steps => [{ content => 'Paris.' },]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the reasoning run');
+
+	# The scripted backend has no reasoning to report, which is the case
+	# worth pinning: an absent trace must not become an empty string.
+	my $assistant = events-of(drain-events($run), 'assistant-message').head;
+	nok $assistant.reasoning.defined, 'no trace, no key';
+	nok $assistant.to-hash<reasoning>:exists,
+		'and nothing undefined leaks into the plain-data form';
+};
+
+subtest 'the constructor refuses what it cannot drive' => {
+	plan 5;
+
+	throws-like { LLM::Agent::Loop.new(backends => []) }, Exception,
+		message => /'backends cannot be empty'/,
+		'a loop with no backends';
+
+	throws-like { LLM::Agent::Loop.new(backends => ['not a backend',]) },
+		Exception, message => /'chat-completion-stream'/,
+		'a backend that is not one';
+
+	throws-like {
+		LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => []),],
+			provider => 'not a provider',
+		)
+	}, Exception, message => /'execute-tool-calls'/,
+		'a provider that is not one';
+
+	throws-like {
+		LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => []),],
+			round-trip-timeout => 0,
+		)
+	}, Exception, message => /'round-trip-timeout'/,
+		'a timeout of zero';
+
+	my $loop = LLM::Agent::Loop.new(backends => [scripted-backend(steps => []),]);
+	throws-like { $loop.run([]) }, Exception, message => /'nothing to send'/,
+		'and a run with no messages at all';
+};

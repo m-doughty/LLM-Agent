@@ -1,0 +1,351 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Chat::Conversation::Message;
+
+# The tool half of the loop: what reaches the provider, what comes back,
+# what the conversation looks like afterwards, and the four ways the loop
+# refuses to go round for ever.
+
+plan 10;
+
+my @prompt = [msg('user', 'what is in a.txt?'),];
+
+sub read-tool(--> Hash) {
+	tool-decl('fs_read', 'Read a file', { path => { type => 'string' } },
+		required => ['path']);
+}
+
+subtest 'a tool round: ordering, wire shapes, and the conversation it leaves' => {
+	plan 12;
+
+	my $backend = scripted-backend(steps => [
+		{ chunks => ['Let me look. '],
+		  tool-calls => [tool-call('call_1', 'fs_read', '{"path":"a.txt"}'),] },
+		{ content => 'It says hello.' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'hello' },
+	);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$provider);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the tool run');
+	my @events = drain-events($run);
+
+	is-deeply event-kinds(@events),
+		(
+			'run-started',
+			'round-started', 'attempt-started', 'token', 'attempt-succeeded',
+			'assistant-message', 'tool-call', 'tool-result',
+			'round-started', 'attempt-started', 'token', 'attempt-succeeded',
+			'assistant-message',
+			'run-completed',
+		),
+		'the call is announced before it runs and the result after it';
+
+	my $call = events-of(@events, 'tool-call').head;
+	is $call.id, 'call_1', 'the ToolCall carries the provider id';
+	is $call.name, 'fs_read', 'and the tool name';
+	is $call.arguments, '{"path":"a.txt"}',
+		'and the arguments exactly as the model sent them';
+
+	my $result = events-of(@events, 'tool-result').head;
+	is $result.id, 'call_1', 'the ToolResult matches the call by id';
+	is $result.name, 'fs_read', 'and names the tool for a renderer';
+	is $result.content, 'hello', 'with what the provider answered';
+	nok $result.is-error, 'and no error';
+
+	is $provider.recorded-calls.elems, 1, 'the provider saw one call';
+	is $backend.recorded-calls[1]<messages>.elems, 3,
+		'the second request carried the tool turn and its result';
+
+	my @messages = (await $run.result)<messages>;
+	is-deeply @messages.map({ .role }).List,
+		('user', 'assistant', 'tool', 'assistant'),
+		'and the conversation ends in the shape a provider will accept';
+	is @messages[2].tool-call-id, 'call_1',
+		'the tool message points back at the call it answers';
+};
+
+subtest 'the tool catalogue is fetched once per run, not once per round' => {
+	plan 2;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'a', tool-calls => [tool-call('c1', 'fs_read', '{"path":"1"}'),] },
+		{ content => 'b', tool-calls => [tool-call('c2', 'fs_read', '{"path":"2"}'),] },
+		{ content => 'done' },
+	]);
+	my $provider = ScriptedProvider.new(tools => [read-tool(),]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$provider);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the three-round run');
+
+	is $provider.list-calls, 1, 'one tools-for-llm call for three rounds';
+	is $backend.recorded-calls.elems, 3, 'which really were three rounds';
+};
+
+subtest 'a provider that throws becomes one is_error result per call' => {
+	plan 4;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'reading',
+		  tool-calls => [
+			tool-call('c1', 'fs_read', '{"path":"a"}'),
+			tool-call('c2', 'fs_read', '{"path":"b"}'),
+		  ] },
+		{ content => 'I could not read them.' },
+	]);
+
+	# Not the scripted provider, which never throws by design: this is
+	# the badly-behaved third-party provider the loop has to survive.
+	my class ThrowingProvider {
+		method tools-for-llm(--> List) { (read-tool(),) }
+		method execute-tool-calls(@calls --> List) { die 'the bridge fell over' }
+	}
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => ThrowingProvider.new,
+	);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the throwing-provider run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'tool-result').elems, 2,
+		'one result per call, even though the batch never returned one';
+	ok events-of(@events, 'tool-result').all.is-error,
+		'each marked as an error';
+	like events-of(@events, 'tool-result').head.content, /'the bridge fell over'/,
+		'saying what happened, in something the model can read';
+	is (await $run.result)<outcome>, 'completed',
+		'and the run carries on rather than dying';
+};
+
+subtest 'a provider that comes up short is padded, so the next request is valid' => {
+	plan 3;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'reading',
+		  tool-calls => [
+			tool-call('c1', 'fs_read', '{"path":"a"}'),
+			tool-call('c2', 'fs_read', '{"path":"b"}'),
+		  ] },
+		{ content => 'done' },
+	]);
+
+	my class ShortProvider {
+		method tools-for-llm(--> List) { (read-tool(),) }
+		method execute-tool-calls(@calls --> List) {
+			({ role => 'tool', tool_call_id => 'c1', content => 'a!' },);
+		}
+	}
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => ShortProvider.new,
+	);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the short-provider run');
+
+	my @results = events-of(drain-events($run), 'tool-result');
+	is @results.elems, 2, 'a missing result is synthesized rather than skipped';
+	ok @results[1].is-error, 'and marked as an error';
+	is @results[1].id, 'c2',
+		'under the id of the call it should have answered — which is what '
+			~ 'keeps every tool_calls entry paired in the next request';
+};
+
+subtest 'the identical-call guard stops a model repeating itself' => {
+	plan 6;
+
+	# The same call, over and over. max-identical-calls => 2 lets it
+	# through twice and stops the third.
+	# NB %( ), not { }: at statement level a brace opens a BLOCK, so a
+	# `{ key => ... }` returned from a map body is a Block that yields a
+	# list of Pairs, and the kit rejects it several frames later.
+	my @steps = (^4).map({
+		%(
+			content => "attempt $_",
+			'tool-calls' => [tool-call("c$_", 'fs_read', '{"path":"a.txt"}'),],
+		);
+	});
+	@steps.push: %( content => 'Fine, I will answer from what I have.' );
+
+	my $backend = scripted-backend(steps => @steps);
+	my $provider = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'hello' },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, max-identical-calls => 2,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the repetitive run');
+	my @events = drain-events($run);
+
+	my $limit = events-of(@events, 'limit-reached').head;
+	ok $limit.defined, 'the limit was reported';
+	is $limit.limit, 'identical-calls', 'by name';
+	is $limit.max, 2, 'with the setting that was hit';
+
+	is $provider.recorded-calls.elems, 2,
+		'only the calls under the limit were executed';
+
+	my @messages = (await $run.result)<messages>;
+	ok @messages.first({ .role eq 'system' }).defined,
+		'the model was told, as a system message';
+	is @messages.first({ .role eq 'system' }).content,
+		LLM::Agent::Loop::LIMIT-MESSAGE,
+		'in ToolLoop’s exact wording';
+};
+
+subtest 'a limit discards the assistant turn that tripped it' => {
+	plan 4;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'about to break the rules',
+		  tool-calls => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+		{ content => 'the real answer' },
+	]);
+	my $provider = ScriptedProvider.new(tools => [read-tool(),]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, max-tool-rounds => 0,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the limited run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'limit-reached').head.limit, 'tool-rounds',
+		'the round limit fired before a single tool ran';
+	is $provider.recorded-calls.elems, 0, 'so nothing was executed';
+
+	my @assistant = (await $run.result)<messages>.grep({ .role eq 'assistant' });
+	is @assistant.elems, 1,
+		'the discarded turn was never committed — an assistant message '
+			~ 'carrying tool_calls with no tool replies is a 400';
+	is @assistant[0].content, 'the real answer',
+		'and only the final round survives';
+};
+
+subtest 'the total-call limit counts across rounds' => {
+	plan 3;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'one',
+		  tool-calls => [
+			tool-call('c1', 'fs_read', '{"path":"a"}'),
+			tool-call('c2', 'fs_read', '{"path":"b"}'),
+		  ] },
+		{ content => 'two',
+		  tool-calls => [tool-call('c3', 'fs_read', '{"path":"c"}'),] },
+		{ content => 'answering' },
+	]);
+	my $provider = ScriptedProvider.new(tools => [read-tool(),]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, max-tool-calls => 2,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the call-capped run');
+
+	my $limit = events-of(drain-events($run), 'limit-reached').head;
+	is $limit.limit, 'tool-calls', 'the total-call limit fired';
+	is $limit.count, 3, 'counting the round that would have exceeded it';
+	is $provider.recorded-calls.elems, 2, 'and only two calls ever ran';
+};
+
+subtest 'a tool result flagged is_error still becomes a tool message' => {
+	plan 3;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'reading',
+		  tool-calls => [tool-call('c1', 'fs_read', '{"path":"nope"}'),] },
+		{ content => 'That file is not there.' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [read-tool(),],
+		results => { fs_read => { content => 'no such file', is_error => True } },
+	);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$provider);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the failing-tool run');
+
+	my $result = events-of(drain-events($run), 'tool-result').head;
+	ok $result.is-error, 'the event says it failed';
+	is $result.content, 'no such file', 'with the provider’s own message';
+
+	my @messages = (await $run.result)<messages>;
+	is @messages[2].content, 'no such file',
+		'and the model is told, as an ordinary tool message';
+};
+
+subtest 'grants are synchronised only when the provider has any to report' => {
+	plan 3;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'a', tool-calls => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+		{ content => 'done' },
+	]);
+
+	# The plain provider has no `grants` method at all, which is the
+	# branch `.can('grants')` exists to take.
+	my $plain = ScriptedProvider.new(tools => [read-tool(),]);
+	my $plain-run = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => $plain,
+	).run(@prompt);
+	run-settled($plain-run, 'the grantless run');
+	is (await $plain-run.result)<outcome>, 'completed',
+		'a provider with no grants is not a problem';
+
+	# The other branch: a provider whose snapshot grows while the loop is
+	# running it, exactly as a policy answering "always allow" does. The
+	# loop has to read it after every batch without tripping over it;
+	# what it then WRITES is a session's business, and t/11 pins that.
+	my $granting;
+	$granting = ScriptedProviderWithGrants.new(
+		tools => [read-tool(),],
+		responder => -> $name, $args, $id {
+			$granting.add-grant({ tool => $name, decision => 'allow' });
+			'ok';
+		},
+	);
+
+	my $granting-backend = scripted-backend(steps => [
+		{ content => 'a', tool-calls => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+		{ content => 'done' },
+	]);
+	my $granting-run = LLM::Agent::Loop.new(
+		backends => [$granting-backend,], provider => $granting,
+	).run(@prompt);
+	run-settled($granting-run, 'the granting run');
+
+	is (await $granting-run.result)<outcome>, 'completed',
+		'a provider that grows grants mid-run is read without complaint';
+	is $granting.grants.elems, 1, 'and the grant it earned is there';
+};
+
+subtest 'malformed calls from the model do not derail the loop' => {
+	plan 3;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'nonsense',
+		  tool-calls => [{ id => 'c1', type => 'function' },] },
+		{ content => 'sorry' },
+	]);
+	my $provider = ScriptedProvider.new(tools => [read-tool(),]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$provider);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the malformed-call run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'tool-call').head.name, '',
+		'a call with no function name is announced with an empty one';
+	ok events-of(@events, 'tool-result').head.is-error,
+		'and the provider refuses it rather than throwing';
+	is (await $run.result)<outcome>, 'completed', 'the run finishes normally';
+};

@@ -1,0 +1,352 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Compactor;
+use LLM::Agent::TokenCount;
+use LLM::Chat::Conversation::Message;
+
+# Compaction on its own: what it keeps, what it replaces, what it sends
+# the summarizer, and — the part that matters most — what it does when
+# the summarizer is not there.
+
+plan 12;
+
+# One token per character, no per-message overhead: every threshold in
+# this file is then plain arithmetic a reader can check.
+sub counter(--> LLM::Agent::TokenCount) {
+	LLM::Agent::TokenCount::Heuristic.new(
+		chars-per-token => 1, per-message-overhead => 0,
+	);
+}
+
+sub sysprompt(Str:D $content --> LLM::Chat::Conversation::Message) {
+	LLM::Chat::Conversation::Message.new(
+		role => 'system', :$content, sysprompt => True, sticky => True,
+	);
+}
+
+sub conversation(Int:D $turns, Int:D $chars = 200 --> Array) {
+	my @messages = sysprompt('SY');
+	for 1 .. $turns -> $i {
+		@messages.push: LLM::Chat::Conversation::Message.new(
+			role    => ($i %% 2 ?? 'assistant' !! 'user'),
+			content => ('m' ~ $i) ~ ('.' x ($chars - ('m' ~ $i).chars)),
+		);
+	}
+	@messages;
+}
+
+subtest 'the thresholds are the ratios, and needs-compaction uses them' => {
+	plan 5;
+
+	my $compactor = LLM::Agent::Compactor.new(
+		backend => scripted-backend(steps => []),
+		counter => counter(), context-budget => 1_000,
+	);
+
+	is $compactor.trigger, 800, 'trigger is trigger-ratio of the budget';
+	is $compactor.target, 400, 'and target is target-ratio of it';
+
+	nok $compactor.needs-compaction([
+		LLM::Chat::Conversation::Message.new(role => 'user', content => 'x' x 700),
+	]), 'under the trigger, nothing to do';
+	ok $compactor.needs-compaction([
+		LLM::Chat::Conversation::Message.new(role => 'user', content => 'x' x 900),
+	]), 'over it, there is';
+	nok $compactor.needs-compaction([]), 'and an empty conversation never is';
+};
+
+subtest 'a compaction keeps the sticky prefix, replaces the middle, keeps the tail' => {
+	plan 10;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'THE SUMMARY' },
+	]);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, counter => counter(), context-budget => 1_000, keep-recent => 2,
+	);
+
+	my @messages = conversation(6);        # sysprompt + m1..m6
+	my %result = $compactor.compact(@messages);
+
+	is %result<fallback>, False, 'the summarizer answered';
+	is %result<cut-index>, 4, 'the cut is one before the recent window';
+	is %result<dropped>, 4, 'four non-sticky messages were replaced';
+
+	my @after = %result<messages>.list;
+	is @after.elems, 4, 'sysprompt + summary + the last two turns';
+	is @after[0].content, 'SY', 'the sysprompt is first and untouched';
+	is @after[1].role, 'user',
+		'the summary goes in as a user turn — the one role every provider '
+			~ 'takes arbitrary text in';
+	like @after[1].content, /'earlier turns compacted'/,
+		'under a header that tells the model what it is reading';
+	like @after[1].content, /'THE SUMMARY'/, 'with the model’s own summary';
+	nok @after[1].is-sticky,
+		'and NOT sticky, so a later compaction can fold it in turn';
+	is @after[2].content.substr(0, 2), 'm5', 'the recent window is verbatim';
+};
+
+subtest 'the summary the caller gets is exactly what replays' => {
+	plan 2;
+
+	my $backend = scripted-backend(steps => [{ content => 'THE SUMMARY' },]);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, counter => counter(), context-budget => 1_000, keep-recent => 2,
+	);
+
+	my %result = $compactor.compact(conversation(6));
+	is %result<summary>, %result<messages>[1].content,
+		'the summary key is the WHOLE synthetic content, header included — '
+			~ 'so a transcript stores one string and replays it byte for byte';
+	is %result<tokens-after>, %result<messages>.map({ .content.chars }).sum,
+		'and the after-count really is the new conversation';
+};
+
+subtest 'the recent window is never opened on an orphaned tool result' => {
+	plan 4;
+
+	my $backend = scripted-backend(steps => [{ content => 'SUMMARY' },]);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, counter => counter(), context-budget => 1_000, keep-recent => 3,
+	);
+
+	my @messages = (
+		sysprompt('SY'),
+		LLM::Chat::Conversation::Message.new(role => 'user', content => 'm1'),
+		LLM::Chat::Conversation::Message.new(
+			role => 'assistant', content => 'reading',
+			tool-calls => [tool-call('c1', 'fs_read'), tool-call('c2', 'fs_read')],
+		),
+		LLM::Chat::Conversation::Message.new(
+			role => 'tool', content => 'one', tool-call-id => 'c1'),
+		LLM::Chat::Conversation::Message.new(
+			role => 'tool', content => 'two', tool-call-id => 'c2'),
+		LLM::Chat::Conversation::Message.new(role => 'assistant', content => 'done'),
+	);
+
+	# keep-recent 3 would start the window on the second tool result,
+	# leaving its assistant turn behind — which is a conversation every
+	# provider rejects. The window is extended back instead.
+	my %result = $compactor.compact(@messages);
+	is %result<cut-index>, 1, 'the cut moved back to before the assistant turn';
+
+	my @after = %result<messages>.list;
+	is @after[2].content, 'reading', 'the assistant turn survives';
+	is-deeply @after.map({ .role }).List,
+		('system', 'user', 'assistant', 'tool', 'tool', 'assistant'),
+		'with both of its results still after it';
+	is @after[3].tool-call-id, 'c1', 'and the pairing intact';
+};
+
+subtest 'nothing between the prefix and the window is a no-op, with no call' => {
+	plan 5;
+
+	my $backend = scripted-backend(steps => []);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, counter => counter(), context-budget => 1_000, keep-recent => 10,
+	);
+
+	my @messages = conversation(3);
+	my %result = $compactor.compact(@messages);
+
+	is %result<dropped>, 0, 'nothing was dropped';
+	is %result<cut-index>, -1, 'and there was no cut';
+	is %result<messages>.elems, @messages.elems, 'the conversation is unchanged';
+	is %result<fallback>, False, 'which is not a fallback';
+	is $backend.recorded-calls.elems, 0,
+		'and — the point — the summarizer was never called';
+};
+
+subtest 'the summarizer sees the middle, with tool results capped' => {
+	plan 5;
+
+	my $backend = scripted-backend(steps => [{ content => 'SUMMARY' },]);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, counter => counter(), context-budget => 100_000,
+		keep-recent => 2, tool-result-cap => 100,
+	);
+
+	my @messages = (
+		sysprompt('SYSPROMPT-TEXT'),
+		LLM::Chat::Conversation::Message.new(role => 'user', content => 'find it'),
+		LLM::Chat::Conversation::Message.new(
+			role => 'assistant', content => 'reading',
+			tool-calls => [tool-call('c1', 'fs_read', '{"path":"big"}'),]),
+		LLM::Chat::Conversation::Message.new(
+			role => 'tool', content => 'X' x 5_000, tool-call-id => 'c1'),
+		LLM::Chat::Conversation::Message.new(role => 'assistant', content => 'found it'),
+		LLM::Chat::Conversation::Message.new(role => 'user', content => 'thanks'),
+	);
+	$compactor.compact(@messages);
+
+	is $backend.recorded-calls.elems, 1, 'one blocking call';
+	is $backend.recorded-calls[0]<kind>, 'blocking',
+		'not a streamed one — a summary is wanted whole';
+
+	my @sent = $backend.recorded-calls[0]<messages>.list;
+	is @sent.elems, 2, 'a fixed instruction and the transcript';
+	my $transcript = @sent[1].content;
+
+	ok $transcript.chars < 1_000,
+		'the 5,000-character tool result did not go out as it was — a '
+			~ 'compaction triggered by one huge read must not send that '
+			~ 'same huge read to the summarizer';
+	like $transcript, /'truncated for summarization'/,
+		'and the model is told the result was cut rather than shown a lie';
+};
+
+subtest 'the sysprompt is never summarized away' => {
+	plan 2;
+
+	my $backend = scripted-backend(steps => [{ content => 'SUMMARY' },]);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, counter => counter(), context-budget => 1_000, keep-recent => 2,
+	);
+	$compactor.compact(conversation(6));
+
+	my $transcript = $backend.recorded-calls[0]<messages>[1].content;
+	unlike $transcript, /'SY'/,
+		'the sticky prefix is not even shown to the summarizer';
+	# ...because it is not going anywhere, so summarizing it is a waste
+	# of the one call compaction gets.
+	pass 'and it survives the compaction untouched (pinned above)';
+};
+
+subtest 'an abort-bucket failure hard-trims at once, without a retry' => {
+	plan 5;
+
+	my $backend = scripted-backend(steps => [
+		{ error => 'invalid api key', 'error-class' => 'http', 'error-status' => 401 },
+		{ content => 'never reached' },
+	]);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, counter => counter(), context-budget => 3_000, keep-recent => 2,
+	);
+
+	my $started = now;
+	my %result = $compactor.compact(conversation(10));
+	my $elapsed = now - $started;
+
+	is $backend.recorded-calls.elems, 1,
+		'a 4xx is not retried — it will not heal in eight seconds';
+	ok $elapsed < 1, 'and no backoff was served';
+	ok %result<fallback>, 'the compaction fell back to a hard trim';
+	ok %result<dropped> >= 1, 'which really dropped something';
+	like %result<summary>, /'could not be reached'/,
+		'and says so, in something the model can act on';
+};
+
+subtest 'a transient failure is retried, and then hard-trims' => {
+	plan 4;
+
+	my $backend = scripted-backend(steps => [
+		{ error => 'connection reset', 'error-class' => 'connection' },
+		{ error => 'connection reset again', 'error-class' => 'connection' },
+		{ content => 'never reached' },
+	]);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, counter => counter(), context-budget => 3_000,
+		keep-recent => 2, max-attempts => 2,
+	);
+
+	my %result = $compactor.compact(conversation(10));
+
+	is $backend.recorded-calls.elems, 2, 'both attempts were spent';
+	ok %result<fallback>, 'and then it hard-trimmed rather than giving up';
+	ok %result<messages>.elems < 11, 'the conversation really did shrink';
+	is LLM::Agent::Compactor.new(
+		backend => scripted-backend(steps => []),
+		counter => counter(), context-budget => 100,
+	).max-attempts, 3, 'the default budget is three attempts in total';
+};
+
+subtest 'an empty summary counts as a failure' => {
+	plan 3;
+
+	# The transport succeeded and the model said nothing. Accepting that
+	# would silently delete the middle of the conversation and put
+	# nothing in its place.
+	my $backend = scripted-backend(steps => [
+		{ content => '   ' },
+	]);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, counter => counter(), context-budget => 3_000,
+		keep-recent => 2, max-attempts => 1,
+	);
+
+	my %result = $compactor.compact(conversation(10));
+	is $backend.recorded-calls.elems, 1, 'the one attempt was made';
+	ok %result<fallback>, 'and its empty answer was not taken for a summary';
+	ok %result<summary>.chars > 20, 'the fallback note went in instead';
+};
+
+subtest 'a hard trim aims for the target, and stops at the recent window' => {
+	plan 7;
+
+	my $backend = scripted-backend(steps => [
+		{ error => 'nope', 'error-class' => 'http', 'error-status' => 403 },
+	]);
+
+	# 10 turns of 200 characters plus a sysprompt: 2,002 tokens with this
+	# counter. A 3,000 budget makes the target 1,200.
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, counter => counter(), context-budget => 3_000, keep-recent => 2,
+	);
+	my @messages = conversation(10);
+	my %result = $compactor.compact(@messages);
+
+	ok %result<fallback>, 'the trim happened';
+	ok %result<tokens-after> <= $compactor.target,
+		'and got under the target it was aiming for';
+	ok %result<tokens-after> < %result<tokens-before>,
+		'which is smaller than it started';
+	ok %result<messages>[0].is-sticky, 'the sticky prefix survived';
+	is %result<messages>.tail.content.substr(0, 3), 'm10',
+		'and so did the last turn — a trim never eats the context the '
+			~ 'next turn needs';
+	is %result<messages>[1].content, %result<summary>,
+		'the synthetic message is in the same place a summary would be, '
+			~ 'so a transcript replays both the same way';
+
+	# The floor: a target nothing can reach still makes progress rather
+	# than trimming into the recent window.
+	my $tiny = LLM::Agent::Compactor.new(
+		backend => scripted-backend(steps => [
+			{ error => 'nope', 'error-class' => 'http', 'error-status' => 403 },
+		]),
+		counter => counter(), context-budget => 10, keep-recent => 2,
+	);
+	my %floor = $tiny.compact(conversation(10));
+	is %floor<messages>.elems, 4,
+		'an unreachable target trims the whole middle and stops there';
+};
+
+subtest 'the constructor refuses a configuration that cannot work' => {
+	plan 5;
+
+	my %base = counter => counter(), backend => scripted-backend(steps => []);
+
+	throws-like { LLM::Agent::Compactor.new(|%base, context-budget => 0) },
+		Exception, message => /'context-budget'/, 'a budget of nothing';
+
+	throws-like {
+		LLM::Agent::Compactor.new(|%base, context-budget => 100, target-ratio => 0.9)
+	}, Exception, message => /'below trigger-ratio'/,
+		'a target above the trigger would compact and immediately need to '
+			~ 'compact again';
+
+	throws-like {
+		LLM::Agent::Compactor.new(|%base, context-budget => 100, tool-result-cap => 0)
+	}, Exception, message => /'tool-result-cap'/, 'a cap of nothing';
+
+	throws-like {
+		LLM::Agent::Compactor.new(|%base, context-budget => 100, keep-recent => -1)
+	}, Exception, message => /'keep-recent'/, 'a negative window';
+
+	throws-like {
+		LLM::Agent::Compactor.new(
+			counter => counter(), backend => 'not a backend', context-budget => 100,
+		)
+	}, Exception, message => /'chat-completion'/, 'a backend that is not one';
+};

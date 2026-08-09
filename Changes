@@ -1,0 +1,86 @@
+Revision history for LLM::Agent
+
+{{$NEXT}}
+
+0.1.0  2026-08-09T20:36:12+01:00
+    - Initial release: the engine behind a coding/tool-using agent — a
+      streaming loop that calls tools through a duck-typed provider,
+      survives backend failure with per-round-trip retry and fallback,
+      writes a durable JSONL transcript, and compacts the conversation
+      to stay inside a context budget.
+    - LLM::Agent::Event: the typed event taxonomy the loop publishes.
+      One Supply of events for every consumer (TUI, logger, test), with
+      a stable C<kind> string and a plain-data C<to-hash> per class, and
+      the ATTEMPT FRAMING contract that makes mid-stream retry
+      replayable: Tokens belong to the AttemptStarted that opened them,
+      an AttemptFailed retracts them, an AttemptSucceeded commits them.
+      Exactly one terminal event (RunCompleted / RunFailed /
+      RunCancelled) is emitted per run, and the Supply is then done —
+      it is never C<quit>.
+    - LLM::Agent::Run: the per-run handle. C<.events> (a
+      Supplier::Preserving Supply, so a consumer that taps late still
+      sees the whole run), C<.result> (a Promise KEPT — never broken —
+      with the outcome Map), an idempotent C<.cancel>, and C<.is-done>
+      for poll-friendly tests.
+    - LLM::Agent::TokenCount: the counting seam — a one-method role with
+      three implementations. C<::Exact> delegates to an
+      LLM::Chat::TokenCounter (real tokenizer, exact, needs one),
+      C<::Heuristic> is chars/4 plus per-message overhead (no
+      dependencies, always available), and the default C<::Usage>
+      calibrates against the prompt-token counts the provider actually
+      billed and only estimates the tail beyond them.
+    - LLM::Agent::Prompt: four pure system-prompt builders — C<env-block>
+      (platform/OS/date plus caller-supplied pairs, nothing inferred),
+      C<tool-docs> (markdown from tools-for-llm declarations),
+      C<instructions-from-files> (existing files, order preserved) and
+      C<assemble> (the sticky sysprompt Message).
+    - LLM::Agent::Loop: the state machine. A backend chain with
+      per-round-trip retry and fallback (LLM::Chat::Retry's buckets,
+      Task's max-retries-is-attempts-per-backend semantics), tools
+      through any duck-typed tools-for-llm/execute-tool-calls provider,
+      ToolLoop's limit wording and "name\0json-args" signature scheme,
+      an INACTIVITY timeout on $resp.last-activity-at (deliberately not
+      Task's total-duration bound — an agent turn legitimately runs for
+      minutes), cooperative cancellation, and the wrap-ask / log-hook
+      shims that let a policy's questions and a server's logs come out
+      of the same event Supply as the tokens. One run at a time per
+      Loop, on purpose: scheduling belongs to the layer above.
+      Two ordering rules are load-bearing and pinned by tests: a limit
+      is checked BEFORE the assistant turn is committed (so a turn
+      carrying tool_calls that nothing answers is never written), and a
+      run cancelled during a tool batch closes every abandoned call off
+      with a synthetic tool message (same reason — the transcript has
+      to stay resumable).
+    - LLM::Agent::Session: an append-only JSONL transcript held open on
+      one flushed handle-mode JSONL::Writer, so every line is durable
+      the moment its method returns. Four envelope types (session-meta /
+      message / grants / compaction) under a versioned envelope; replay
+      tolerates a malformed FINAL line (what a crash mid-write looks
+      like) and dies on one anywhere else; compactions compose, so
+      messages() after a resume equals the array the loop was working
+      with when it stopped.
+    - LLM::Agent::Compactor: summarize the middle, keep the sysprompt
+      and the recent window, never split a tool-call/tool-result pair.
+      A summarization failure is classified with classify-error — an
+      abort bucket hard-trims at once, anything else retries up to three
+      total attempts with backoff — and a still-failing summarizer falls
+      back to a pair-aligned hard trim with C<fallback => True>, so the
+      loop always makes progress.
+    - LLM::Agent: the umbrella. No wrapper class — it loads the other
+      seven modules and carries the dist's flagship Pod: the canonical
+      wiring recipe (backends, MCP client + registry + policy with the
+      forward-declaration idiom, the log-level gotcha, a shared
+      TokenCount instance), the resume recipe, and the cancellation
+      truth table.
+    - MCP::Client and JSONL pins are LOCAL-ONLY until those two dists
+      are pushed: LLM::Agent must not be released to the ecosystem
+      before MCP::Client 0.2.0 and JSONL 0.1.3 are published, or its
+      dependency resolution will fail for everybody else.
+
+# Run the suite with:
+#   prove6 -Ilib -It/lib -I../LLM-Chat/lib -I../MCP-Client/lib \
+#          -I../JSONL/lib -I../Template-Jinja2/lib t/
+#
+# `mi6 build` needs a git repository: run `git init` here and `git add`
+# the lib files BEFORE the first build, or the ReadmeFromPod step runs
+# against an unstaged tree.

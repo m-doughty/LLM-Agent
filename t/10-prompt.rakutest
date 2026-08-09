@@ -1,0 +1,308 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Prompt;
+use LLM::Chat::Conversation::Message;
+
+plan 15;
+
+# A directory of its own per subtest that needs one, cleaned up on the way
+# out — no fixtures under t/, nothing left behind on a failure.
+sub with-temp-dir(&body) {
+	my $dir = $*TMPDIR.add("llm-agent-prompt-{$*PID}-{(^2**32).pick}");
+	$dir.mkdir;
+	LEAVE {
+		try {
+			for $dir.dir -> $entry {
+				$entry.d ?? (.unlink for $entry.dir) !! $entry.unlink;
+				$entry.rmdir if $entry.d;
+			}
+			$dir.rmdir;
+		}
+	}
+	body($dir);
+}
+
+# --- env-block --------------------------------------------------------
+
+subtest 'env-block reports the platform, the OS and the date' => {
+	plan 5;
+	my $block = env-block();
+
+	like $block, /^ '## Environment' \n \n /,
+		'it is a markdown section with a blank line under the header';
+	like $block, /^^ '- platform: '/, 'platform is reported';
+	like $block, /^^ '- os: '/, 'so is the OS';
+	like $block, /^^ '- date: ' $(Date.today.Str) $$/,
+		'and today’s date, as the human’s local day';
+	is $block.lines.grep({ .starts-with('- ') }).elems, 3,
+		'and nothing else — nothing is inferred';
+};
+
+subtest 'env-block adds the caller’s pairs, sorted' => {
+	plan 3;
+	my $block = env-block(extra => {
+		zebra => 'last', apple => 'first', cwd => '/srv/project',
+	});
+
+	is $block.lines.grep({ .starts-with('- ') }).map({ .substr(2).split(':')[0] }),
+		['platform', 'os', 'date', 'apple', 'cwd', 'zebra'],
+		'built-ins first, then the extras in sorted order';
+	like $block, /^^ '- cwd: /srv/project' $$/, 'with their values';
+	is env-block(extra => { a => 1, b => 2 }),
+		env-block(extra => { b => 2, a => 1 }),
+		'so the same facts always render identically, whatever the hash order';
+};
+
+subtest 'env-block: extras override, undefined values vanish' => {
+	plan 4;
+	my $block = env-block(extra => {
+		os => 'debian 12 (in a container)', empty => Str, zero => 0,
+	});
+
+	like $block, /^^ '- os: debian 12 (in a container)' $$/,
+		'a caller who knows better than uname wins';
+	is $block.lines.grep({ .starts-with('- os:') }).elems, 1,
+		'and replaces the built-in rather than duplicating it';
+	nok $block.contains('empty'),
+		'an undefined extra is dropped, so no conditional at the call site';
+	like $block, /^^ '- zero: 0' $$/,
+		'but a defined falsy value is a fact and is kept';
+};
+
+# --- tool-docs --------------------------------------------------------
+
+my @catalogue = [
+	{
+		type => 'function',
+		function => {
+			name => 'fs_read',
+			description => 'Read a file from disk.',
+			parameters => {
+				type => 'object',
+				properties => {
+					path  => { type => 'string', description => 'Absolute path.' },
+					limit => { type => 'integer' },
+				},
+				required => ['path'],
+			},
+		},
+	},
+	{
+		type => 'function',
+		function => {
+			name => 'fs_sync',
+			parameters => { type => 'object', properties => {} },
+		},
+	},
+];
+
+subtest 'tool-docs renders the catalogue it is given' => {
+	plan 6;
+	my $docs = tool-docs(@catalogue);
+
+	like $docs, /^ '## Tools' \n \n /, 'a markdown section';
+	like $docs, /^^ '### fs_read' $$/, 'one header per tool';
+	like $docs, /^^ 'Read a file from disk.' $$/, 'the description on its own line';
+	like $docs, /^^ '- path (string, required) - Absolute path.' $$/,
+		'a required parameter with its type and description';
+	like $docs, /^^ '- limit (integer)' $$/,
+		'and an optional one with neither a "required" nor a dangling dash';
+	like $docs, /^^ '### fs_sync' \n \n 'Takes no arguments.' $$/,
+		'a tool with no properties says so rather than showing an empty list';
+};
+
+subtest 'tool-docs: required first, then alphabetical — deterministically' => {
+	plan 2;
+	my @tools = [
+		{
+			type => 'function',
+			function => {
+				name => 'ordered',
+				parameters => {
+					type => 'object',
+					properties => {
+						zebra => { type => 'string' },
+						apple => { type => 'string' },
+						mango => { type => 'string' },
+						beta  => { type => 'string' },
+					},
+					# An ordered JSON array, so this order is real...
+					required => ['zebra', 'mango'],
+				},
+			},
+		},
+	];
+
+	is tool-docs(@tools).lines.grep({ .starts-with('- ') }).map({ .words[1] }),
+		['zebra', 'mango', 'apple', 'beta'],
+		'required in the schema’s order, then the optional ones sorted';
+
+	# ...while `properties` is a Raku Hash, whose order is randomised per
+	# process. Rendering it as it comes would make the prompt differ
+	# between runs, which this pins against.
+	is tool-docs(@tools), tool-docs(@tools),
+		'and the same catalogue always renders identically';
+};
+
+subtest 'tool-docs: a type given as a union renders as one' => {
+	plan 1;
+	my $docs = tool-docs([
+		{
+			type => 'function',
+			function => {
+				name => 'nullable',
+				parameters => {
+					type => 'object',
+					properties => { note => { type => ['string', 'null'] } },
+				},
+			},
+		},
+	]);
+	like $docs, /^^ '- note (string|null)' $$/, 'joined with a pipe';
+};
+
+subtest 'tool-docs skips what it cannot render, and never throws' => {
+	plan 4;
+	is tool-docs([]), '',
+		'no tools means no section at all, so it can be passed unconditionally';
+
+	my $docs = tool-docs([
+		'not a hash',
+		{ type => 'function' },
+		{ type => 'function', function => { name => '' } },
+		{ type => 'function', function => { name => 'real', parameters => 'nonsense' } },
+	]);
+	is $docs.comb(/'###'/).elems, 1, 'only the one usable entry is rendered';
+	like $docs, /'### real'/, 'and it is the usable one';
+	like $docs, /'Takes no arguments.'/,
+		'a parameters block that is not an object is treated as none';
+};
+
+# --- instructions-from-files ------------------------------------------
+
+subtest 'instructions-from-files reads what is there, in order' => {
+	plan 4;
+	with-temp-dir -> $dir {
+		$dir.add('AGENTS.md').spurt("Run the tests.\n\n\n");
+		$dir.add('STYLE.md').spurt('Tabs, not spaces.');
+
+		my $out = instructions-from-files([
+			$dir.add('STYLE.md').Str, $dir.add('AGENTS.md').Str,
+		]);
+
+		is $out.lines.grep({ .starts-with('## ') }),
+			['## STYLE.md', '## AGENTS.md'],
+			'the caller’s order is preserved, and headers are basenames';
+		like $out, /'## STYLE.md' \n \n 'Tabs, not spaces.'/,
+			'with a blank line between header and body';
+		nok $out.ends-with("\n"), 'trailing whitespace is trimmed off';
+		like $out, /'Run the tests.'/, 'and both files are really in there';
+	};
+};
+
+subtest 'instructions-from-files skips what is not there' => {
+	plan 4;
+	with-temp-dir -> $dir {
+		$dir.add('AGENTS.md').spurt('present');
+		$dir.add('subdir').mkdir;
+
+		is instructions-from-files([$dir.add('nope.md').Str]), '',
+			'a missing file contributes nothing at all';
+		is instructions-from-files([]), '', 'nor does an empty list';
+		is instructions-from-files([$dir.add('subdir').Str]), '',
+			'a directory is not an instruction file';
+		like instructions-from-files([
+			$dir.add('nope.md').Str, $dir.add('AGENTS.md').Str,
+		]), /'## AGENTS.md'/, 'and a gap does not stop the ones that exist';
+
+		try { $dir.add('subdir').rmdir };
+	};
+};
+
+subtest 'instructions-from-files: an empty file is visibly empty' => {
+	plan 2;
+	with-temp-dir -> $dir {
+		$dir.add('EMPTY.md').spurt('');
+		my $out = instructions-from-files([$dir.add('EMPTY.md').Str]);
+		is $out, '## EMPTY.md',
+			'the header alone — it was found, and it had nothing to say';
+		nok $out.contains("\n\n"), 'with no trailing blank lines';
+	};
+};
+
+# --- assemble ---------------------------------------------------------
+
+subtest 'assemble builds the sticky system message' => {
+	plan 5;
+	my $message = assemble(identity => 'You are an agent.');
+
+	ok $message ~~ LLM::Chat::Conversation::Message, 'it is a Message';
+	is $message.role, 'system', 'a system one';
+	ok $message.sysprompt, 'marked as the system prompt';
+	ok $message.sticky, 'and sticky, so compaction can never drop it';
+	is $message.content, 'You are an agent.', 'with the identity as its text';
+};
+
+subtest 'assemble joins the sections with blank lines' => {
+	plan 2;
+	my $message = assemble(
+		identity => 'You are an agent.',
+		sections => ['## One', '## Two'],
+	);
+	is $message.content, "You are an agent.\n\n## One\n\n## Two",
+		'identity first, then each section, separated by one blank line';
+	is assemble(
+		identity => "You are an agent.\n\n\n",
+		sections => ["## One\n\n"],
+	).content, "You are an agent.\n\n## One",
+		'and trailing whitespace never doubles the separator';
+};
+
+subtest 'assemble drops the sections that have nothing in them' => {
+	plan 3;
+	my $message = assemble(
+		identity => 'You are an agent.',
+		sections => ['', Str, '   ', tool-docs([]), '## Real'],
+	);
+	is $message.content, "You are an agent.\n\n## Real",
+		'empty, undefined and whitespace-only sections leave no gaps';
+	nok $message.content.contains("\n\n\n"), 'so there are never two blank lines';
+	is assemble(identity => 'Alone', sections => []).content, 'Alone',
+		'and no sections at all is fine';
+};
+
+subtest 'assemble refuses an agent with no identity' => {
+	plan 3;
+	throws-like { assemble(identity => '') },
+		Exception, message => /'identity'/,
+		'an empty identity is a misconfiguration, not a style';
+	dies-ok { assemble(identity => "  \n ") },
+		'and whitespace is not an identity either';
+	dies-ok { assemble(sections => ['## One']) },
+		'the identity is required';
+};
+
+subtest 'the four of them compose into one real system prompt' => {
+	plan 5;
+	with-temp-dir -> $dir {
+		$dir.add('AGENTS.md').spurt('Never commit.');
+
+		my $message = assemble(
+			identity => 'You are a coding assistant.',
+			sections => [
+				env-block(extra => { cwd => $dir.Str }),
+				tool-docs(@catalogue),
+				instructions-from-files([$dir.add('AGENTS.md').Str]),
+			],
+		);
+
+		my $content = $message.content;
+		like $content, /^ 'You are a coding assistant.'/, 'identity leads';
+		like $content, /'## Environment'/, 'the environment follows';
+		like $content, /'## Tools'/, 'then the tools';
+		like $content, /'## AGENTS.md'/, 'then the project instructions';
+		is $content.lines.grep({ .starts-with('## ') }).elems, 3,
+			'three sections, in the order they were passed';
+	};
+};

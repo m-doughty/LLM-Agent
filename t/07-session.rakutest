@@ -1,0 +1,252 @@
+use Test;
+use lib 'lib', 't/lib';
+use JSON::Fast;
+use LLM::Agent::Session;
+use LLM::Chat::Conversation::Message;
+
+# The transcript as a file: what a line looks like, when it hits the disk,
+# and what the session refuses to do. Resuming one is t/08's job.
+
+plan 11;
+
+my $tmp = $*TMPDIR.add("llm-agent-t07-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+my $n = 0;
+sub fresh-path(--> IO::Path) { $tmp.add('s' ~ $n++ ~ '.jsonl') }
+
+sub msg(Str:D $role, Str:D $content = '', *%extra) {
+	LLM::Chat::Conversation::Message.new(:$role, :$content, |%extra);
+}
+
+subtest 'the meta line comes first, and is exactly what was passed' => {
+	plan 6;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(
+		path => $path, meta => { agent => 'sadna', cwd => '/srv' },
+	);
+
+	my %first = from-json($path.lines.head);
+	is %first<v>, 1, 'envelope version 1';
+	is %first<type>, 'session-meta', 'the first line is the meta line';
+	is-deeply %first<payload>, { agent => 'sadna', cwd => '/srv' },
+		'carrying the caller’s hash verbatim — nothing added';
+	ok %first<id>.chars, 'with an id';
+	like %first<ts>, /^ \d**4 '-' \d\d '-' \d\d 'T' \d\d ':' \d\d ':' \d\d '.' \d+ 'Z' $/,
+		'and an ISO-8601 UTC timestamp with sub-second precision — the '
+			~ 'same shape LLM::Agent::Event stamps its events with';
+
+	is-deeply $session.meta, { agent => 'sadna', cwd => '/srv' },
+		'and .meta reads it back';
+
+	$session.close;
+};
+
+subtest 'every line is on disk before the method returns' => {
+	plan 3;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	# A SECOND handle on the same path, with the session still open. This
+	# is the whole point of the flushed handle-mode writer: a `kill -9`
+	# one instruction after append-message returns loses nothing.
+	is $path.lines.elems, 1, 'the meta line is already visible';
+
+	$session.append-message(msg('user', 'hello'));
+	is $path.lines.elems, 2, 'and so is the message, before any close';
+
+	my %line = from-json($path.lines[1]);
+	is %line<payload><content>, 'hello', 'with its content intact';
+
+	$session.close;
+};
+
+subtest 'a message line carries the message, and the extras carry the rest' => {
+	plan 8;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my $id = $session.append-message(
+		msg('assistant', 'thinking about it',
+			tool-calls => [{ id => 'c1', function => { name => 'fs_read' } },]),
+		extra => { reasoning => 'first I will read it', usage => { 'prompt-tokens' => 12 } },
+	);
+
+	ok $id.chars, 'append-message hands back the envelope id';
+
+	my %line = from-json($path.lines.tail);
+	is %line<id>, $id, 'which is the id of the line it wrote';
+	is %line<type>, 'message', 'typed as a message';
+	is %line<payload><role>, 'assistant', 'with the role';
+	is %line<payload><tool-calls>[0]<id>, 'c1', 'and the tool calls';
+	is %line<payload><reasoning>, 'first I will read it',
+		'the extras sit alongside, replay-visible';
+	is %line<payload><usage><prompt-tokens>, 12, 'including structured ones';
+
+	# ...and are dropped when a Message is rebuilt, because a Message has
+	# nowhere to put them.
+	nok $session.messages[0].can('reasoning'),
+		'while the rebuilt Message has no idea about them';
+
+	$session.close;
+};
+
+subtest 'an extra can never overwrite the message itself' => {
+	plan 2;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	$session.append-message(
+		msg('user', 'the real content'),
+		extra => { role => 'assistant', content => 'a lie' },
+	);
+
+	is $session.messages[0].role, 'user', 'the role is the message’s own';
+	is $session.messages[0].content, 'the real content', 'and so is the content';
+
+	$session.close;
+};
+
+subtest 'grants are a whole snapshot, and the last one wins' => {
+	plan 3;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	is-deeply $session.grants, (), 'no grants to begin with';
+
+	$session.append-grants([{ tool => 'fs_read', decision => 'allow' },]);
+	$session.append-grants([
+		{ tool => 'fs_read', decision => 'allow' },
+		{ tool => 'fs_write', decision => 'allow', under => '/srv/scratch' },
+	]);
+
+	is $session.grants.elems, 2,
+		'the later, larger snapshot is what .grants answers';
+	is $session.grants[1]<under>, '/srv/scratch', 'in full';
+
+	$session.close;
+};
+
+subtest 'the escape hatch writes unknown types, and refuses the known ones' => {
+	plan 5;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	$session.append-message(msg('user', 'hi'));
+	my $id = $session.append-event(
+		type => 'app-checkpoint', payload => { step => 3 },
+	);
+
+	ok $id.chars, 'append-event returns an id like the rest';
+	is $session.events.tail<type>, 'app-checkpoint',
+		'the line is preserved in .events';
+	is $session.messages.elems, 1,
+		'and skipped by .messages, which only knows about conversations';
+
+	throws-like { $session.append-event(type => 'message', payload => {}) },
+		Exception, message => /'built-in type'/,
+		'a built-in type must go through its own appender';
+	throws-like { $session.append-event(type => '  ', payload => {}) },
+		Exception, message => /'cannot be empty'/,
+		'and a type has to be something';
+
+	$session.close;
+};
+
+subtest 'message-ids runs parallel to messages' => {
+	plan 3;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my @ids = (
+		$session.append-message(msg('user', 'one')),
+		$session.append-message(msg('assistant', 'two')),
+	);
+
+	is-deeply $session.message-ids, @ids.List,
+		'in the order they were appended';
+	is $session.messages.elems, $session.message-ids.elems,
+		'one id per message';
+	is $session.elems, 3, 'and .elems counts lines, meta included';
+
+	$session.close;
+};
+
+subtest 'create refuses a file that already has a transcript in it' => {
+	plan 3;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	$session.append-message(msg('user', 'precious'));
+	$session.close;
+
+	throws-like { LLM::Agent::Session.create(path => $path, meta => {}) },
+		Exception, message => /'append-only'/,
+		'a transcript is never opened over';
+
+	is $path.lines.elems, 2, 'and the existing one is untouched';
+
+	# An empty file is not a transcript, so creating over one is fine —
+	# that is what a `touch` or a failed previous attempt leaves.
+	my $empty = fresh-path();
+	$empty.spurt('');
+	lives-ok { LLM::Agent::Session.create(path => $empty, meta => {}).close },
+		'though an empty file is fair game';
+};
+
+subtest 'load refuses what it cannot read' => {
+	plan 2;
+
+	throws-like { LLM::Agent::Session.load(path => $tmp.add('nope.jsonl')) },
+		Exception, message => /'no transcript'/,
+		'a path with nothing at it';
+
+	throws-like { LLM::Agent::Session.new(path => fresh-path()) },
+		Exception, message => /'.create'/,
+		'and .new is not the way in — a session is created or resumed';
+};
+
+subtest 'a closed session refuses to append, but still reads' => {
+	plan 3;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	$session.append-message(msg('user', 'hello'));
+	$session.close;
+
+	throws-like { $session.append-message(msg('user', 'more')) },
+		Exception, message => /'closed'/,
+		'appending after close is refused';
+	is $session.messages.elems, 1, 'while what it replayed stays readable';
+	lives-ok { $session.close }, 'and closing twice is harmless';
+};
+
+subtest 'keys are serialised in a stable order' => {
+	plan 2;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	$session.append-message(msg('user', 'hello'));
+	$session.close;
+
+	# Sorted keys is what makes two transcripts of the same run diffable
+	# — a plain Raku Hash iterates in a per-process random order.
+	my $line = $path.lines.tail;
+	ok $line.index('"id"') < $line.index('"payload"'),
+		'id before payload';
+	ok $line.index('"type"') < $line.index('"v"'),
+		'type before v — the envelope is written in sorted key order';
+};

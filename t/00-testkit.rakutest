@@ -1,0 +1,314 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Event;
+use LLM::Agent::Run;
+use LLM::Chat::Backend;
+use LLM::Chat::Backend::Response;
+use LLM::Chat::Conversation::Message;
+
+# The test kit is the instrument every other agent test reads its results
+# off, so it gets calibrated first: a scripted step must produce exactly
+# the response it claims to, a scripted failure must look like a real one,
+# and the helpers must not hang.
+
+plan 14;
+
+my @prompt = [msg('user', 'hello'),];
+
+# Drive a scripted stream to its terminal state without awaiting a fresh
+# tap on a Supply that may already be finished (the ChatTestKit lesson).
+sub settled($resp, Str:D $what = 'the scripted stream') {
+	my $deadline = now + TIMEOUT;
+	until $resp.is-done {
+		die "Timed out after {TIMEOUT}s waiting for $what" if now > $deadline;
+		sleep 0.002;
+	}
+	$resp;
+}
+
+subtest 'ScriptedBackend is a real backend' => {
+	plan 3;
+	my $backend = scripted-backend(steps => [{ content => 'hi' },]);
+	ok $backend ~~ LLM::Chat::Backend,
+		'so anything taking a Backend takes a scripted one';
+	is $backend.model, 'scripted-model',
+		'and it answers `try { $backend.model }` like the real ones';
+	is scripted-backend(model => 'kimi-k2', steps => []).model, 'kimi-k2',
+		'with a name the test can choose';
+};
+
+subtest 'a chunks + tool-calls step produces exactly that response' => {
+	plan 6;
+	my @calls = [tool-call('c1', 'fs_read', '{"path":"a.txt"}'),];
+	my $backend = scripted-backend(steps => [
+		{ chunks => ['Let me ', 'look. '], tool-calls => @calls },
+	]);
+
+	my $resp = settled($backend.chat-completion-stream(@prompt, tools => []));
+
+	ok $resp.is-success, 'the call succeeded';
+	is $resp.latest, 'Let me look. ',
+		'the fragments arrived in order and concatenate to the text';
+	is $resp.tool-calls.elems, 1, 'the tool call came through as one call';
+	is $resp.tool-calls[0]<function><name>, 'fs_read', 'with its name';
+	is $resp.finish-reason, 'tool_calls',
+		'and a step with tool calls finishes for tool calls, unasked';
+	is $resp.msg, 'Let me look. ',
+		'a finished stream also exposes the whole text as .msg';
+};
+
+subtest 'usage is scripted onto the response the loop reads it from' => {
+	plan 4;
+	my $backend = scripted-backend(steps => [
+		{ content => 'hi', usage => { prompt => 812, completion => 9, total => 821 } },
+		{ content => 'ho' },
+	]);
+
+	my $with = settled($backend.chat-completion-stream(@prompt));
+	is $with.prompt-tokens, 812, 'prompt tokens as scripted';
+	is $with.completion-tokens, 9, 'completion tokens as scripted';
+	is $with.model-used, 'scripted-model',
+		'and the model defaults to the backend’s own name';
+
+	my $without = settled($backend.chat-completion-stream(@prompt));
+	is $without.prompt-tokens, Int,
+		'a step with no usage leaves it UNDEFINED — "unknown", not zero';
+};
+
+subtest 'an error step fails the way a backend fails' => {
+	plan 6;
+	my $backend = scripted-backend(steps => [
+		{ error => 'upstream exploded', error-class => 'http', error-status => 500 },
+	]);
+
+	my $resp = settled($backend.chat-completion-stream(@prompt));
+
+	nok $resp.is-success, 'it did not succeed';
+	ok $resp.is-done, 'but it did finish — a failed call is a finished call';
+	is $resp.err.Str, 'upstream exploded', 'the message is the scripted one';
+	is $resp.error-class, 'http', 'with the structured class beside it';
+	is $resp.error-status, 500, 'and the status classify-error needs';
+	ok $resp.is-cancelled,
+		'.is-cancelled is true for ANY failure — which is why the loop '
+		~ 'must branch on .is-success instead';
+};
+
+subtest 'an error class defaults rather than being guessed' => {
+	plan 2;
+	my $backend = scripted-backend(steps => [{ error => 'something odd' },]);
+	my $resp = settled($backend.chat-completion-stream(@prompt));
+	is $resp.error-class, 'unknown',
+		'an unclassified failure is "unknown" (which classify-error retries)';
+	is $resp.error-status, Int, 'and carries no invented status';
+};
+
+subtest 'fail-after-chunks fails in the middle of the text' => {
+	plan 4;
+	my $backend = scripted-backend(steps => [
+		{
+			chunks => ['The answer ', 'is ', 'forty'],
+			fail-after-chunks => 2,
+			error => 'connection reset by peer',
+			error-class => 'connection',
+		},
+	]);
+
+	my $resp = settled($backend.chat-completion-stream(@prompt));
+
+	is $resp.latest, 'The answer is ',
+		'the fragments before the failure really were emitted';
+	nok $resp.is-success, 'and then the call failed';
+	is $resp.error-class, 'connection', 'with the class it was given';
+	is $resp.err.Str, 'connection reset by peer', 'and the message';
+};
+
+subtest 'a stalled step never terminates, and cancel is recorded' => {
+	plan 6;
+	my $backend = scripted-backend(steps => [
+		{ chunks => ['thinking'], stall => True },
+	]);
+
+	my $resp = $backend.chat-completion-stream(@prompt);
+	sleep 0.2;
+
+	is $resp.latest, 'thinking', 'it emitted what it had';
+	nok $resp.is-done, 'and then went silent: no done, no quit';
+
+	my $quiet-since = $resp.last-activity-at;
+	sleep 0.2;
+	is $resp.last-activity-at, $quiet-since,
+		'last-activity-at stops advancing — what an inactivity timer watches';
+
+	$backend.cancel($resp);
+	is $backend.cancelled-responses.elems, 1, 'the cancel was recorded';
+	is $backend.cancelled-responses[0].id, $resp.id, 'against that response';
+	ok $resp.is-done && !$resp.is-success,
+		'and it really cancelled: the stream is finished and not successful';
+};
+
+subtest 'delays are honoured, so timing tests have something to time' => {
+	plan 2;
+	my $backend = scripted-backend(steps => [
+		{ chunks => ['a', 'b'], delay => 0.1, chunk-delay => 0.05 },
+	]);
+
+	my $started = now;
+	my $resp = settled($backend.chat-completion-stream(@prompt));
+	my $elapsed = now - $started;
+
+	ok $elapsed >= 0.15,
+		"the initial delay and both chunk delays were served ({$elapsed.Rat.round(0.01)}s)";
+	is $resp.latest, 'ab', 'and everything still arrived';
+};
+
+subtest 'running out of script is a loud failure, not a quiet empty reply' => {
+	plan 3;
+	my $backend = scripted-backend(steps => [{ content => 'only one' },]);
+
+	ok settled($backend.chat-completion-stream(@prompt)).is-success,
+		'the scripted call works';
+
+	my $extra = settled($backend.chat-completion-stream(@prompt));
+	nok $extra.is-success, 'the unscripted one fails';
+	like $extra.err.Str, /'no step scripted for call 2'/,
+		'saying which call the test forgot';
+};
+
+subtest 'blocking completions consume the same script' => {
+	plan 5;
+	my $backend = scripted-backend(steps => [
+		{ content => 'a summary of the middle', usage => { prompt => 40 } },
+		{ error => 'summarizer down', error-class => 'http', error-status => 503 },
+		{ content => 'x', stall => True },
+	]);
+
+	my $ok = $backend.chat-completion(@prompt);
+	is $ok.msg, 'a summary of the middle', 'the text comes back whole';
+	is $ok.prompt-tokens, 40, 'with its usage';
+
+	my $bad = $backend.chat-completion(@prompt);
+	nok $bad.is-success, 'a scripted failure fails here too';
+	is $bad.error-status, 503, 'with its status';
+
+	throws-like { $backend.chat-completion(@prompt) },
+		Exception, message => /'streaming-only'/,
+		'and a stalled blocking call is refused rather than hanging the suite';
+};
+
+subtest 'every call is recorded, with what it was sent' => {
+	plan 5;
+	my @tools = [tool-decl('fs_read', 'Read a file', { path => { type => 'string' } }),];
+	my $backend = scripted-backend(steps => [
+		{ content => 'one' }, { content => 'two' },
+	]);
+
+	settled($backend.chat-completion-stream(@prompt, :@tools));
+	$backend.chat-completion([msg('user', 'summarize'),]);
+
+	is $backend.recorded-calls.elems, 2, 'both calls were recorded';
+	is $backend.recorded-calls.map({ $_<kind> }), ['stream', 'blocking'],
+		'each knowing which kind it was';
+	is $backend.recorded-calls[0]<tools>.elems, 1,
+		'the tools of the streaming call were kept';
+	is $backend.recorded-calls[0]<messages>[0].content, 'hello',
+		'as were its messages';
+	is $backend.recorded-calls[1]<messages>[0].content, 'summarize',
+		'and they are per call, not shared';
+};
+
+subtest 'ScriptedProvider round-trips a batch, and never throws' => {
+	plan 9;
+	my $provider = ScriptedProvider.new(
+		tools => [
+			tool-decl('fs_read', 'Read a file', { path => { type => 'string' } }),
+			tool-decl('fs_write', 'Write a file'),
+		],
+		results => {
+			fs_read  => 'the file says hello',
+			fs_write => { content => 'permission denied', is_error => True },
+		},
+	);
+
+	is $provider.tools-for-llm.elems, 2, 'the catalogue is published';
+	is $provider.list-calls, 1, 'and asking for it is recorded';
+
+	my @batch = [
+		tool-call('c1', 'fs_read', '{"path":"a"}'),
+		tool-call('c2', 'fs_write', '{"path":"b"}'),
+		tool-call('c3', 'unscripted'),
+		'not even a hash',
+	];
+	my @results = $provider.execute-tool-calls(@batch);
+
+	is @results.elems, 4, 'exactly one result per call, however bad the call';
+	is @results.map({ $_<tool_call_id> }), ['c1', 'c2', 'c3', ''],
+		'in the caller’s order, matched by id';
+	is @results[0]<content>, 'the file says hello', 'a scripted result';
+	ok @results[1]<is_error>, 'a scripted failure comes back as is_error';
+	nok @results[0]<is_error>, 'and a success does not';
+	like @results[3]<content>, /'Malformed'/,
+		'a call that is not even a hash is answered, not thrown over';
+
+	is $provider.recorded-calls.elems, 4, 'the whole batch was recorded';
+};
+
+subtest 'the provider’s optional pieces: throwing, blocking, grants' => {
+	plan 6;
+	my $thrower = ScriptedProvider.new(
+		responder => -> $name, $arguments, $id { die "$name is on fire" },
+	);
+	my @answered = $thrower.execute-tool-calls([tool-call('c1', 'fs_read'),]);
+	is @answered.elems, 1, 'a responder that dies still answers';
+	ok @answered[0]<is_error>, 'as an error result';
+	like @answered[0]<content>, /'on fire'/, 'carrying the reason';
+
+	my $gate = Promise.new;
+	my $blocked = ScriptedProvider.new(block-on => $gate);
+	my $batch = start $blocked.execute-tool-calls([tool-call('c1', 'x'),]);
+	sleep 0.1;
+	is $batch.status, Planned, 'a blocked batch really does block';
+	$gate.keep(True);
+	await Promise.anyof($batch, Promise.in(TIMEOUT));
+	is $batch.status, Kept, 'and unblocks when its Promise is kept';
+
+	subtest 'grants exist only on the provider that has them' => {
+		plan 4;
+		my $plain = ScriptedProvider.new;
+		nok $plain.can('grants'),
+			'the loop’s .can("grants") probe is False for a plain provider';
+
+		my $granting = ScriptedProviderWithGrants.new(
+			grants => [{ tool => 'fs_read', decision => 'allow' },],
+		);
+		ok $granting.can('grants'), 'and True for one that remembers';
+		is $granting.grants.elems, 1, 'starting from what it was given';
+		$granting.add-grant({ tool => 'fs_write', decision => 'deny' });
+		is $granting.grants.elems, 2, 'and growing mid-test';
+	};
+};
+
+subtest 'run-settled and drain-events, against a hand-driven Run' => {
+	plan 5;
+	my $run = LLM::Agent::Run.new;
+
+	start {
+		sleep 0.05;
+		$run._emit: LLM::Agent::Event::RunStarted.new(
+			run-id => $run.id, message-count => 1,
+		);
+		$run._emit: LLM::Agent::Event::Token.new(text => 'hi');
+		$run._finish: LLM::Agent::Event::RunCompleted.new(final => 'hi'),
+			final => 'hi';
+	}
+
+	nok $run.is-done, 'the run has not finished yet';
+	is run-settled($run, 'the hand-driven run').id, $run.id,
+		'run-settled waits for it and hands the Run back';
+	ok $run.is-done, 'by which time it really is done';
+
+	my @events = drain-events($run);
+	is event-kinds(@events), ['run-started', 'token', 'run-completed'],
+		'drain-events collects the whole run, in order';
+	is events-of(@events, 'token').elems, 1, 'and events-of filters by kind';
+};

@@ -1,0 +1,361 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent;
+use LLM::Chat::Conversation::Message;
+use MCP::Client::Policy;
+
+# The whole stack, wired the way the umbrella Pod says to wire it: a loop
+# over a real MCP::Client::Policy over a scripted provider, writing a real
+# transcript, with a real compactor. Every other test file mocks one of
+# its neighbours; this one mocks only the network.
+
+plan 6;
+
+my $tmp = $*TMPDIR.add("llm-agent-t11-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+my $n = 0;
+sub fresh-path(--> IO::Path) { $tmp.add('i' ~ $n++ ~ '.jsonl') }
+
+sub tools(--> List) {
+	(
+		tool-decl('fs_read', 'Read a file', { path => { type => 'string' } }),
+		tool-decl('fs_write', 'Write a file', { path => { type => 'string' } }),
+	);
+}
+
+subtest 'the umbrella really is the front door' => {
+	plan 4;
+
+	# `use LLM::Agent` and nothing else: every class has to be reachable,
+	# or the module is a lie.
+	ok LLM::Agent::Loop.^name eq 'LLM::Agent::Loop', 'Loop';
+	ok LLM::Agent::Session.^name eq 'LLM::Agent::Session', 'Session';
+	ok LLM::Agent::Compactor.^name eq 'LLM::Agent::Compactor', 'Compactor';
+	ok LLM::Agent::Event::Token.^name eq 'LLM::Agent::Event::Token', 'the events';
+};
+
+subtest 'a permission prompt becomes events, a grant, and a transcript line' => {
+	plan 11;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(
+		path => $path, meta => { agent => 'test' },
+	);
+
+	my $provider = ScriptedProvider.new(
+		tools => tools(),
+		results => { fs_read => 'the contents', fs_write => 'written' },
+	);
+
+	my @asked;
+	# The construction cycle, resolved the way the Pod says: the loop is
+	# named first and the shim is deferred into a closure, because the
+	# policy needs the loop and the loop needs the policy.
+	my $loop;
+	my $policy = MCP::Client::Policy.new(
+		:$provider,
+		rules => [{ tool => 'fs_read', decision => 'allow' },],
+		on-ask => -> %request {
+			$loop.wrap-ask(-> %inner {
+				@asked.push: %inner<tool>;
+				%( action => 'always-allow', rule => %( tool => %inner<tool> ) );
+			}).(%request);
+		},
+	);
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'reading',
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a.txt"}'),] },
+		{ content => 'writing',
+		  'tool-calls' => [tool-call('c2', 'fs_write', '{"path":"b.txt"}'),] },
+		{ content => 'all done' },
+	]);
+
+	$loop = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => $policy, :$session,
+	);
+
+	my $run = $loop.run([msg('user', 'copy a.txt to b.txt'),]);
+	run-settled($run, 'the policed run');
+	my @events = drain-events($run);
+
+	is (await $run.result)<final>, 'all done', 'the run completed';
+	is-deeply @asked, ['fs_write',],
+		'only the tool no rule allowed was asked about';
+
+	my @pending = events-of(@events, 'ask-pending');
+	is @pending.elems, 1, 'one AskPending';
+	is @pending[0].tool, 'fs_write', 'naming the tool';
+	is @pending[0].request<kind>, 'permission', 'as a permission question';
+	is events-of(@events, 'ask-answered').elems, 1, 'and one AskAnswered';
+	is-deeply events-of(@events, 'ask-answered')[0].answer<action>, 'always-allow',
+		'carrying what the human really clicked';
+
+	# The ask has to be framed around the tool call it is about.
+	my @kinds = event-kinds(@events);
+	ok @kinds.first({ $_ eq 'ask-pending' }, :k)
+		> @kinds.first({ $_ eq 'tool-call' }, :k),
+		'the question comes after the call that provoked it';
+
+	is $policy.grants.elems, 1, 'the policy remembered the answer';
+
+	$session.close;
+	my $replayed = LLM::Agent::Session.load(path => $path);
+	is-deeply $replayed.grants.map({ $_<tool> }).List, ('fs_write',),
+		'and the grant reached the transcript, so a later run inherits it';
+	is-deeply $replayed.messages.map({ .role }).List,
+		('user', 'assistant', 'tool', 'assistant', 'tool', 'assistant'),
+		'with the whole conversation, in the shape a provider accepts';
+};
+
+subtest 'resuming pre-seeds the grants, and nobody is asked twice' => {
+	plan 5;
+
+	my $path = fresh-path();
+
+	# --- Day one: the human says "always". -------------------------
+	{
+		my $session = LLM::Agent::Session.create(path => $path, meta => {});
+		my $provider = ScriptedProvider.new(
+			tools => tools(), results => { fs_write => 'written' },
+		);
+		my $loop;
+		my $policy = MCP::Client::Policy.new(
+			:$provider,
+			on-ask => -> %request {
+				$loop.wrap-ask(-> %inner {
+					%( action => 'always-allow', rule => %( tool => %inner<tool> ) );
+				}).(%request);
+			},
+		);
+		my $backend = scripted-backend(steps => [
+			{ content => 'writing',
+			  'tool-calls' => [tool-call('c1', 'fs_write', '{"path":"b.txt"}'),] },
+			{ content => 'day one done' },
+		]);
+		$loop = LLM::Agent::Loop.new(
+			backends => [$backend,], provider => $policy, :$session,
+		);
+		my $run = $loop.run([msg('user', 'write b.txt'),]);
+		run-settled($run, 'day one');
+		is (await $run.result)<outcome>, 'completed', 'day one worked';
+		$session.close;
+	}
+
+	# --- Day two: a new process, a new policy, the same file. -------
+	my $session = LLM::Agent::Session.load(path => $path);
+	my @messages = $session.messages;
+	is @messages.elems, 4, 'the conversation came back';
+
+	my $asked = 0;
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { fs_write => 'written again' },
+	);
+	my $loop;
+	my $policy = MCP::Client::Policy.new(
+		:$provider,
+		grants => $session.grants,          # the whole point
+		on-ask => -> %request {
+			$loop.wrap-ask(-> %inner { $asked++; %( action => 'deny-once' ) }).(%request);
+		},
+	);
+	my $backend = scripted-backend(steps => [
+		{ content => 'writing again',
+		  'tool-calls' => [tool-call('c9', 'fs_write', '{"path":"c.txt"}'),] },
+		{ content => 'day two done' },
+	]);
+	$loop = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => $policy, :$session,
+	);
+
+	my $next = msg('user', 'now write c.txt');
+	my $run = $loop.run([|@messages, $next]);
+	run-settled($run, 'day two');
+	my @events = drain-events($run);
+
+	is $asked, 0, 'the human was not asked again';
+	is events-of(@events, 'ask-pending').elems, 0, 'so there was no question';
+	is (await $run.result)<final>, 'day two done', 'and the run finished';
+
+	$session.close;
+};
+
+subtest 'a resumed run extends the transcript rather than duplicating it' => {
+	plan 4;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $first-backend = scripted-backend(steps => [{ content => 'one' },]);
+	my $first-loop = LLM::Agent::Loop.new(
+		backends => [$first-backend,], :$session,
+	);
+	run-settled($first-loop.run([msg('user', 'a'),]), 'the first run');
+	$session.close;
+
+	my $resumed = LLM::Agent::Session.load(path => $path);
+	my @messages = $resumed.messages;
+	my $second-backend = scripted-backend(steps => [{ content => 'two' },]);
+	my $second-loop = LLM::Agent::Loop.new(
+		backends => [$second-backend,], session => $resumed,
+	);
+	my $next = msg('user', 'b');
+	run-settled($second-loop.run([|@messages, $next]), 'the second run');
+	$resumed.close;
+
+	my $final = LLM::Agent::Session.load(path => $path);
+	is-deeply $final.messages.map({ .role ~ ':' ~ .content }).List,
+		('user:a', 'assistant:one', 'user:b', 'assistant:two'),
+		'each message appears exactly once';
+	is $final.message-ids.unique.elems, 4, 'with four distinct ids';
+
+	# And the loop refuses a conversation that contradicts the transcript
+	# rather than writing a file nobody can replay.
+	my $third = LLM::Agent::Session.load(path => $path);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [scripted-backend(steps => [{ content => 'x' },]),],
+		session => $third,
+	);
+	my $bad = $loop.run([msg('user', 'something else entirely'),]);
+	run-settled($bad, 'the contradicting run');
+	my %outcome = await $bad.result;
+	is %outcome<outcome>, 'failed', 'a rewritten history is refused';
+	like %outcome<error>, /'extend'/,
+		'with an error that says what to do about it';
+
+	$third.close;
+};
+
+subtest 'compaction inside a run, replayed identically from the transcript' => {
+	plan 9;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	# One token per character: every threshold below is arithmetic.
+	my $counter = LLM::Agent::TokenCount::Heuristic.new(
+		chars-per-token => 1, per-message-overhead => 0,
+	);
+
+	# The compactor shares the loop's counter and the loop's backend, so
+	# the blocking summarization call comes out of the same script — in
+	# the order it really happens. A tool round is what makes there BE a
+	# second round for the compaction check to sit at the top of.
+	my $backend = scripted-backend(steps => [
+		{ content => 'A' x 300,                # round 1, streamed
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+		{ content => 'THE SUMMARY' },          # the compaction, blocking
+		{ content => 'the final answer' },     # round 2, streamed
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { fs_read => 'R' x 200 },
+	);
+
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, :$counter, context-budget => 1_200, keep-recent => 2,
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$counter, :$compactor, :$session,
+	);
+
+	my @start = (
+		LLM::Chat::Conversation::Message.new(
+			role => 'system', content => 'SYSPROMPT', sysprompt => True, sticky => True),
+		msg('user', 'u' x 300),
+		msg('assistant', 'a' x 300),
+		msg('user', 'v' x 300),
+	);
+
+	my $run = $loop.run(@start);
+	run-settled($run, 'the compacting run');
+	my @events = drain-events($run);
+
+	# 909 tokens at the top of round 1 is under the 960 trigger; the tool
+	# round pushes it well over, and the check at the top of round 2
+	# catches it — which is the reason the check is at the TOP.
+	is events-of(@events, 'compaction-started').elems, 1,
+		'exactly one compaction, at the top of the round that needed it';
+	my $done = events-of(@events, 'compaction-done').head;
+	nok $done.fallback, 'the summarizer answered, so it was not a hard trim';
+	is $done.dropped, 3, 'the three middle turns were replaced';
+	ok $done.tokens-after < $done.tokens-before, 'and the conversation shrank';
+
+	is $backend.recorded-calls[1]<kind>, 'blocking',
+		'the summarization really was the blocking call in the middle';
+
+	my @final = (await $run.result)<messages>;
+	is-deeply @final.map({ .role }).List,
+		('system', 'user', 'assistant', 'tool', 'assistant'),
+		'sysprompt, summary, the tool pair that survived, and the answer';
+	like @final[1].content, /'THE SUMMARY'/, 'the summary is the model’s';
+
+	$session.close;
+
+	# THE invariant: what a resumed session replays is exactly the array
+	# the loop was working with. If Compactor and Session ever disagree
+	# about what a compaction keeps, this is where it shows.
+	my $replayed = LLM::Agent::Session.load(path => $path);
+	is-deeply $replayed.messages.map({ .role ~ ':' ~ .content }).List,
+		@final.map({ .role ~ ':' ~ .content }).List,
+		'and the transcript replays that same conversation, message for '
+			~ 'message';
+	is $replayed.events.grep({ $_<type> eq 'compaction' }).elems, 1,
+		'from one compaction line';
+};
+
+subtest 'a server log notification comes out as a Log event' => {
+	plan 6;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'reading',
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+		{ content => 'done' },
+	]);
+
+	# The hook a client would have been constructed with. Forward-declared
+	# because the provider is built before the loop that owns the hook —
+	# the same cycle the wiring recipe resolves for on-ask.
+	my &log;
+
+	my $provider = ScriptedProvider.new(
+		tools => tools(),
+		responder => -> $name, $args, $id {
+			# Exactly the shape MCP::Client hands an on-log hook: the
+			# `params` of a notifications/message, as the Shell pack
+			# sends them while a command is running.
+			log(%(
+				level  => 'info',
+				logger => 'shell',
+				data   => { command => 'prove6 t/', 'exit-code' => 0 },
+			));
+			'the contents';
+		},
+	);
+
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$provider);
+	&log = $loop.log-hook;
+
+	my $run = $loop.run([msg('user', 'read a'),]);
+	run-settled($run, 'the logging run');
+	my @events = drain-events($run);
+
+	my @logs = events-of(@events, 'log');
+	is @logs.elems, 1, 'the notification became one Log event';
+	is @logs[0].level, 'info', 'with its level';
+	is @logs[0].logger, 'shell', 'and the sender';
+	is-deeply @logs[0].data, { command => 'prove6 t/', 'exit-code' => 0 },
+		'and its structured payload, unflattened';
+	is-deeply @logs[0].to-hash<data>, { command => 'prove6 t/', 'exit-code' => 0 },
+		'which survives to-hash as plain data';
+
+	my @kinds = event-kinds(@events);
+	ok @kinds.first({ $_ eq 'log' }, :k) > @kinds.first({ $_ eq 'tool-call' }, :k),
+		'and it landed inside the run, where it happened';
+};

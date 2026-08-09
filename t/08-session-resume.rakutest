@@ -1,0 +1,376 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use JSON::Fast;
+use LLM::Agent::Loop;
+use LLM::Agent::Session;
+use LLM::Chat::Conversation::Message;
+use MCP::Client::Policy;
+
+# Reading a transcript back. Every field of a Message has to survive the
+# round trip, compactions have to compose, grants have to be usable by the
+# real policy, and a damaged file has to fail loudly everywhere except the
+# one place a crash really leaves damage.
+
+plan 13;
+
+my $tmp = $*TMPDIR.add("llm-agent-t08-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+my $n = 0;
+sub fresh-path(--> IO::Path) { $tmp.add('r' ~ $n++ ~ '.jsonl') }
+
+# A transcript written straight to a file, for the damage tests: the API
+# cannot produce a broken one, which is rather the point.
+sub raw-transcript(@lines --> IO::Path) {
+	my $path = fresh-path();
+	$path.spurt(@lines.join("\n") ~ "\n");
+	$path;
+}
+
+sub envelope(Str:D $type, %payload, Str :$id = 'id-' ~ $++, Int :$v = 1 --> Str) {
+	to-json(
+		{ :$v, :$type, :$id, ts => '2026-08-09T12:00:00.000000Z', payload => %payload },
+		:!pretty, :sorted-keys,
+	);
+}
+
+subtest 'every field of a message survives the round trip' => {
+	plan 8;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	$session.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'system', content => 'be helpful', sysprompt => True, sticky => True,
+	));
+	$session.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'assistant', content => 'reading',
+		tool-calls => [tool-call('c1', 'fs_read', '{"path":"a"}'),],
+	));
+	$session.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'tool', content => 'hello', tool-call-id => 'c1',
+	));
+	$session.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'user', content => 'pinned', depth => 2,
+	));
+	$session.close;
+
+	my @messages = LLM::Agent::Session.load(path => $path).messages;
+
+	is @messages.elems, 4, 'all four came back';
+	ok @messages[0].sysprompt, 'sysprompt survives';
+	ok @messages[0].sticky, 'and sticky';
+	is @messages[1].tool-calls[0]<function><name>, 'fs_read',
+		'tool calls come back whole';
+	is @messages[2].tool-call-id, 'c1', 'and a tool message keeps its id';
+	is @messages[3].depth, 2, 'depth survives, so is-sticky still answers';
+	ok @messages[3].is-sticky, 'which it does';
+	is @messages[1].role, 'assistant', 'roles are unchanged';
+};
+
+subtest 'a compaction replays as the conversation the compactor produced' => {
+	plan 5;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my $sys = $session.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'system', content => 'be helpful', sysprompt => True,
+	));
+	$session.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'user', content => 'one'));
+	my $cut = $session.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'assistant', content => 'two'));
+	$session.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'user', content => 'three'));
+
+	my $compaction = $session.append-compaction(
+		summary => 'they talked about one and two',
+		replaces-through-id => $cut,
+		tokens-before => 900, tokens-after => 300,
+	);
+	$session.close;
+
+	my $replayed = LLM::Agent::Session.load(path => $path);
+	is-deeply $replayed.messages.map({ .role ~ ':' ~ .content }).List,
+		(
+			'system:be helpful',
+			'user:they talked about one and two',
+			'user:three',
+		),
+		'the sticky prefix is kept, the middle is one summary, the tail '
+			~ 'is untouched';
+
+	is-deeply $replayed.message-ids, ($sys, $compaction, $replayed.message-ids[2]),
+		'and the summary replays under the compaction’s own id';
+	ok $replayed.messages[1].content.chars, 'the summary has content';
+	nok $replayed.messages[1].is-sticky,
+		'and is NOT sticky, so a later compaction can fold it in turn';
+	is $replayed.events.elems, 6, 'while every line is still in .events';
+};
+
+subtest 'compactions compose: a summary can be summarized' => {
+	plan 3;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	$session.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'system', content => 'be helpful', sysprompt => True));
+	my $first-cut = $session.append-message(
+		LLM::Chat::Conversation::Message.new(role => 'user', content => 'ancient'));
+	my $first = $session.append-compaction(
+		summary => 'the ancient history', replaces-through-id => $first-cut);
+
+	$session.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'user', content => 'recent'));
+
+	# The second compaction names the FIRST compaction's summary as its
+	# cut, which is exactly what the loop does when a conversation grows
+	# past the budget for a second time.
+	my $second = $session.append-compaction(
+		summary => 'everything up to now', replaces-through-id => $first);
+	$session.close;
+
+	my $replayed = LLM::Agent::Session.load(path => $path);
+	is-deeply $replayed.messages.map({ .role ~ ':' ~ .content }).List,
+		('system:be helpful', 'user:everything up to now', 'user:recent'),
+		'the second summary replaced the first';
+	is $replayed.message-ids[1], $second, 'under the newer compaction’s id';
+	is $replayed.messages.elems, 3, 'and nothing accumulated';
+};
+
+subtest 'grants replay into a real policy, which then does not ask' => {
+	plan 4;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	$session.append-grants([
+		{ tool => 'fs_write', decision => 'allow' },
+	]);
+	$session.close;
+
+	my @grants = LLM::Agent::Session.load(path => $path).grants;
+	is @grants.elems, 1, 'the snapshot came back';
+
+	my $asked = 0;
+	my $provider = ScriptedProvider.new(
+		tools => [tool-decl('fs_write', 'Write a file'),],
+		results => { fs_write => 'written' },
+	);
+
+	# The REAL policy, fed the replayed grants. With no rules at all
+	# everything falls through to `ask`, so a grant is the only thing
+	# that can let this call through without a question.
+	my $policy = MCP::Client::Policy.new(
+		:$provider,
+		grants => @grants,
+		on-ask => -> %request { $asked++; %( action => 'deny-once' ) },
+	);
+
+	my @results = $policy.execute-tool-calls([
+		tool-call('c1', 'fs_write', '{"path":"scratch/x"}'),
+	]);
+
+	is $asked, 0, 'the human was not asked again';
+	nok @results[0]<is_error>, 'the call went through';
+	is @results[0]<content>, 'written', 'and reached the provider';
+};
+
+subtest 'a malformed FINAL line is dropped and reported' => {
+	plan 4;
+
+	my $path = raw-transcript([
+		envelope('session-meta', {}),
+		envelope('message', { role => 'user', content => 'hello' }),
+		'{"v":1,"type":"message","payload":{"role":"assis',   # killed mid-write
+	]);
+
+	my $session = LLM::Agent::Session.load(path => $path);
+	is $session.warnings.elems, 1, 'the partial line is reported';
+	is $session.warnings[0].line-number, 3, 'by line number';
+	is $session.messages.elems, 1, 'and dropped from the conversation';
+	is $session.messages[0].content, 'hello', 'leaving what did land intact';
+};
+
+subtest 'a malformed line anywhere else is fatal' => {
+	plan 2;
+
+	my $path = raw-transcript([
+		envelope('session-meta', {}),
+		'{"v":1,"type":"messa',
+		envelope('message', { role => 'user', content => 'hello' }),
+	]);
+
+	throws-like { LLM::Agent::Session.load(path => $path) },
+		Exception, message => /'malformed'/,
+		'a hole in the middle is not a crash artifact';
+
+	# ...and the reason it matters, spelled out in the message rather
+	# than left for somebody to work out from a short conversation.
+	throws-like { LLM::Agent::Session.load(path => $path) },
+		Exception, message => /'FINAL'/,
+		'and the error says which one is tolerated';
+};
+
+subtest 'an envelope this version cannot read is fatal' => {
+	plan 2;
+
+	my $future = raw-transcript([
+		envelope('session-meta', {}, v => 2),
+	]);
+	throws-like { LLM::Agent::Session.load(path => $future) },
+		Exception, message => /'envelope version'/,
+		'a newer envelope is not guessed at';
+
+	my $typeless = raw-transcript([
+		envelope('session-meta', {}),
+		'{"v":1,"id":"x","ts":"2026-08-09T12:00:00.000000Z","payload":{}}',
+	]);
+	throws-like { LLM::Agent::Session.load(path => $typeless) },
+		Exception, message => /'no type'/,
+		'and a line with no type is not a line';
+};
+
+subtest 'a transcript starts with its meta line' => {
+	plan 1;
+
+	my $path = raw-transcript([
+		envelope('message', { role => 'user', content => 'hello' }),
+	]);
+	throws-like { LLM::Agent::Session.load(path => $path) },
+		Exception, message => /'starts with session-meta'/,
+		'anything else is not a transcript this wrote';
+};
+
+subtest 'a compaction that names nothing is fatal' => {
+	plan 2;
+
+	my $dangling = raw-transcript([
+		envelope('session-meta', {}),
+		envelope('message', { role => 'user', content => 'hello' }),
+		envelope('compaction', {
+			summary => 'a summary', 'replaces-through-id' => 'no-such-id',
+		}),
+	]);
+	throws-like { LLM::Agent::Session.load(path => $dangling) },
+		Exception, message => /'not a message this transcript still has'/,
+		'a cut point that is not there would silently change the '
+			~ 'conversation, so it does not load at all';
+
+	my $idless = raw-transcript([
+		envelope('session-meta', {}),
+		envelope('compaction', { summary => 'a summary' }),
+	]);
+	throws-like { LLM::Agent::Session.load(path => $idless) },
+		Exception, message => /'no replaces-through-id'/,
+		'and so does one with no cut point at all';
+};
+
+subtest 'unknown types survive a round trip untouched' => {
+	plan 3;
+
+	my $path = raw-transcript([
+		envelope('session-meta', {}),
+		envelope('telemetry-from-the-future', { latency => 12 }),
+		envelope('message', { role => 'user', content => 'hello' }),
+	]);
+
+	my $session = LLM::Agent::Session.load(path => $path);
+	is $session.messages.elems, 1, 'the readers skip what they do not know';
+	is $session.events.elems, 3, 'while .events keeps everything';
+	is $session.events[1]<payload><latency>, 12, 'payload and all';
+};
+
+subtest 'a resumed session appends to the same file' => {
+	plan 4;
+
+	my $path = fresh-path();
+	my $first = LLM::Agent::Session.create(path => $path, meta => { run => 1 });
+	$first.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'user', content => 'day one'));
+	$first.close;
+
+	my $second = LLM::Agent::Session.load(path => $path);
+	is $second.meta<run>, 1, 'the meta came back';
+	$second.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'assistant', content => 'day two'));
+	$second.close;
+
+	is $path.lines.elems, 3, 'the file grew rather than being rewritten';
+	my $third = LLM::Agent::Session.load(path => $path);
+	is-deeply $third.messages.map({ .content }).List, ('day one', 'day two'),
+		'and both days are there, in order';
+	is $third.message-ids.elems, 2, 'with an id each';
+};
+
+subtest 'the loop writes the turns it is handed, and the app writes none' => {
+	plan 4;
+
+	# The recipe in LLM::Agent's Pod, run: a first run is handed the system
+	# prompt and the question, and appends NEITHER itself. seed-session
+	# writes both, in the order they were handed over.
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $system = msg('system', 'SYSPROMPT', :sysprompt, :sticky);
+	my $question = msg('user', 'make the tests pass');
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [scripted-backend(steps => [{ content => 'done' },]),],
+		:$session,
+	);
+	run-settled($loop.run([$system, $question]), 'the first run');
+
+	is-deeply $session.messages.map({ .role ~ ':' ~ .content }).List,
+		('system:SYSPROMPT', 'user:make the tests pass', 'assistant:done'),
+		'the loop recorded the system prompt, the question and the answer, '
+			~ 'each exactly once';
+	ok $session.messages[0].sysprompt,
+		'with the system prompt still marked as one';
+	$session.close;
+
+	# And the mistake that shape prevents: an app that appends the question
+	# ITSELF, before the loop has written the system prompt, has put the
+	# turns in the file in an order the run then contradicts.
+	my $other = fresh-path();
+	my $eager = LLM::Agent::Session.create(path => $other, meta => {});
+	my $asked = msg('user', 'make the tests pass');
+	$eager.append-message($asked);
+
+	my $second = LLM::Agent::Loop.new(
+		backends => [scripted-backend(steps => [{ content => 'done' },]),],
+		session => $eager,
+	);
+	my $run = $second.run([msg('system', 'SYSPROMPT', :sysprompt, :sticky), $asked]);
+	run-settled($run, 'the pre-appended run');
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'failed',
+		'a run whose first message is not the transcript\'s first message is '
+			~ 'refused rather than written';
+	like %outcome<error>, /'session.messages'/,
+		'and the error says where to start from instead';
+	$eager.close;
+};
+
+subtest 'blank lines are ignored wherever they are' => {
+	plan 2;
+
+	my $path = raw-transcript([
+		envelope('session-meta', {}),
+		'',
+		envelope('message', { role => 'user', content => 'hello' }),
+		'',
+	]);
+
+	my $session = LLM::Agent::Session.load(path => $path);
+	is $session.messages.elems, 1, 'a blank line is not a malformed one';
+	is $session.warnings.elems, 0, 'and is not worth warning about';
+};

@@ -1,0 +1,242 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Agent::Session;
+use LLM::Chat::Conversation::Message;
+
+# Cancellation, in each of the places a run can be when it arrives. What
+# is promised is that no event follows the terminal RunCancelled and that
+# nothing keeps running longer than it has to; what is NOT promised —
+# stopping an in-flight tool batch — is pinned here too, so the day it
+# changes somebody has to come and change this file.
+
+plan 7;
+
+my @prompt = [msg('user', 'hello'),];
+
+my $tmp = $*TMPDIR.add("llm-agent-t06-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+# Wait for a condition by POLLING, with a loud deadline. Never one sleep
+# long enough to "probably" be right: that is what makes a suite flake on
+# a loaded machine.
+sub wait-until(&condition, Str:D $what) {
+	my $deadline = now + TIMEOUT;
+	until &condition() {
+		die "Timed out after {TIMEOUT}s waiting for $what" if now > $deadline;
+		sleep 0.005;
+	}
+}
+
+subtest 'cancelling mid-stream ends the run and cancels the backend' => {
+	plan 6;
+
+	my $backend = scripted-backend(steps => [
+		# Long enough to still be streaming whenever the cancel lands.
+		{ chunks => ('a' .. 'z').List, 'chunk-delay' => 0.2 },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
+	my $run = $loop.run(@prompt);
+
+	wait-until { $backend.recorded-calls.elems >= 1 }, 'the stream to start';
+	$run.cancel;
+
+	run-settled($run, 'the cancelled stream');
+	my @events = drain-events($run);
+
+	my %outcome = await $run.result;
+	is %outcome<outcome>, 'cancelled', 'the run reports itself cancelled';
+	is %outcome<final>, '', 'with no final text — nothing was committed';
+	nok %outcome<error>.defined, 'a cancel is not an error';
+
+	is event-kinds(@events).tail, 'run-cancelled', 'the terminal is last';
+	is event-kinds(@events).grep({ $_ eq 'run-cancelled' }).elems, 1,
+		'and there is exactly one of it';
+	ok $backend.cancelled-responses.elems >= 1,
+		'the in-flight response was cancelled at its backend';
+};
+
+subtest 'cancelling during a backoff does not sit the backoff out' => {
+	plan 4;
+
+	my $backend = scripted-backend(steps => [
+		{ error => 'upstream exploded', 'error-class' => 'http', 'error-status' => 500 },
+		{ content => 'never reached' },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], max-retries => 3);
+	my $run = $loop.run(@prompt);
+
+	wait-until { $backend.recorded-calls.elems >= 1 }, 'the first attempt';
+	# The first backoff is at least a second; a third of one in is safely
+	# inside it and safely past the failure that started it.
+	sleep 0.3;
+	$run.cancel;
+
+	run-settled($run, 'the cancelled backoff');
+	my @events = drain-events($run);
+
+	is (await $run.result)<outcome>, 'cancelled', 'the run was cancelled';
+	is events-of(@events, 'run-cancelled').head.stage, 'backoff',
+		'while it was waiting to retry — which is the proof the wait was '
+			~ 'cut short: a backoff that ran to completion would have '
+			~ 'noticed the cancel at the top of the next attempt instead';
+	is $backend.recorded-calls.elems, 1, 'so the retry never happened';
+	is events-of(@events, 'attempt-started').elems, 1,
+		'and only the one attempt was ever announced';
+};
+
+subtest 'cancelling a blocked tool batch ends the run and ignores the results' => {
+	plan 8;
+
+	my $path = $tmp.add('blocked.jsonl');
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my $gate = Promise.new;
+	my $backend = scripted-backend(steps => [
+		{ content => 'reading',
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+		{ content => 'never reached' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [tool-decl('fs_read', 'Read a file'),],
+		results => { fs_read => 'the file contents' },
+		block-on => $gate,
+	);
+
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$provider, :$session);
+	my $run = $loop.run(@prompt);
+
+	wait-until { $provider.recorded-batches.elems >= 1 }, 'the tool batch to start';
+	$run.cancel;
+
+	# The run must end WITHOUT the batch finishing. That is the promise:
+	# the loop stops waiting, it does not stop the tools.
+	run-settled($run, 'the cancelled tool batch');
+	my @events = drain-events($run);
+	is (await $run.result)<outcome>, 'cancelled',
+		'the run ended while the batch was still blocked';
+	is events-of(@events, 'run-cancelled').head.stage, 'tools',
+		'and said where it was';
+	is events-of(@events, 'tool-result').elems, 0,
+		'no ToolResult was emitted — nothing came back to report';
+
+	# Now let the batch finish, and give any straggler a chance to be
+	# wrong before believing it was not.
+	$gate.keep(True);
+	sleep 0.2;
+
+	$session.close;
+	my $replayed = LLM::Agent::Session.load(path => $path);
+
+	# The assistant turn asking for the call was already committed, so
+	# the call has to be closed off: an assistant message carrying
+	# tool_calls that nothing answers is a 400 from every provider, and
+	# this transcript has to be resumable.
+	is-deeply $replayed.messages.map({ .role }).List,
+		('user', 'assistant', 'tool'),
+		'the abandoned call is closed off with a synthetic tool message';
+	like $replayed.messages[2].content, /'cancelled'/,
+		'which says what really happened rather than inventing a result';
+	is $replayed.messages[2].tool-call-id, 'c1',
+		'under the id of the call it answers, so the pairing is valid';
+	ok $replayed.events.first({
+		$_<type> eq 'message' && $_<payload><cancelled>
+	}).defined, 'and the transcript marks it as a cancellation, not a result';
+
+	is $provider.recorded-calls.elems, 1,
+		'the call itself still ran — a tool already in flight has already '
+			~ 'happened, and this loop does not pretend otherwise';
+};
+
+subtest 'cancel is idempotent and safe after the run has finished' => {
+	plan 4;
+
+	my $backend = scripted-backend(steps => [{ content => 'done' },]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the finished run');
+
+	my %before = await $run.result;
+	lives-ok { $run.cancel for ^5 }, 'cancelling a finished run is harmless';
+	my %after = await $run.result;
+
+	is %after<outcome>, 'completed', 'the outcome stands';
+	is %after<final>, %before<final>, 'and so does the answer';
+	is event-kinds(drain-events($run)).tail, 'run-completed',
+		'no second terminal was emitted';
+};
+
+subtest 'a cancelled run frees the loop for the next one' => {
+	plan 2;
+
+	my $backend = scripted-backend(steps => [
+		{ chunks => ('a' .. 'z').List, 'chunk-delay' => 0.2 },
+		{ content => 'the second run' },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
+
+	my $first = $loop.run(@prompt);
+	wait-until { $backend.recorded-calls.elems >= 1 }, 'the first stream';
+	$first.cancel;
+	run-settled($first, 'the cancelled run');
+
+	my $second = $loop.run(@prompt);
+	run-settled($second, 'the run after it');
+	is (await $second.result)<outcome>, 'completed',
+		'the loop takes another run once the cancelled one has ended';
+	is (await $second.result)<final>, 'the second run', 'and it works';
+};
+
+subtest 'the cancellation Promise is what a driver waits on' => {
+	plan 3;
+
+	my $backend = scripted-backend(steps => [
+		{ chunks => ('a' .. 'z').List, 'chunk-delay' => 0.2 },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
+	my $run = $loop.run(@prompt);
+
+	is $run.cancellation.status, Planned, 'Planned while the run is live';
+	wait-until { $backend.recorded-calls.elems >= 1 }, 'the stream';
+	$run.cancel;
+	is $run.cancellation.status, Kept, 'kept the moment cancel is called';
+
+	run-settled($run, 'the cancelled run');
+	ok $run.is-done, 'and the run itself follows';
+};
+
+subtest 'the shims drop their events once no run is live' => {
+	plan 4;
+
+	my $backend = scripted-backend(steps => [{ content => 'done' },]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
+
+	my $asked = 0;
+	my &ask = $loop.wrap-ask(-> %request { $asked++; %( action => 'allow-once' ) });
+	my &log = $loop.log-hook;
+
+	# Before any run: the shims still work, they just have nowhere to
+	# publish. A UI that wires them at construction must not blow up.
+	lives-ok { log({ level => 'info', data => 'early' }) },
+		'the log hook survives having no run';
+	is-deeply ask({ kind => 'permission', tool => 'fs_read' }),
+		{ action => 'allow-once' },
+		'and the ask shim still returns the real answer';
+	is $asked, 1, 'having really called the asker';
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the run');
+	log({ level => 'info', data => 'late' });
+
+	is events-of(drain-events($run), 'log').elems, 0,
+		'a log arriving after the terminal event is dropped, not emitted '
+			~ 'after it';
+};

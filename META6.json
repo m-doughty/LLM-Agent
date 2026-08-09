@@ -1,0 +1,46 @@
+{
+  "auth": "zef:apogee",
+  "authors": [
+    "Matt Doughty"
+  ],
+  "build-depends": [
+  ],
+  "depends": [
+    "LLM::Chat:ver<0.8.0+>:auth<zef:apogee>",
+    "MCP::Client:ver<0.2.0+>:auth<zef:apogee>",
+    "JSONL:ver<0.1.3+>:auth<zef:apogee>",
+    "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>",
+    "UUID::V4"
+  ],
+  "description": "a streaming agent loop: tools, retry, fallback, a durable",
+  "license": "Artistic-2.0",
+  "name": "LLM::Agent",
+  "perl": "6.d",
+  "provides": {
+    "LLM::Agent": "lib/LLM/Agent.rakumod",
+    "LLM::Agent::Compactor": "lib/LLM/Agent/Compactor.rakumod",
+    "LLM::Agent::Event": "lib/LLM/Agent/Event.rakumod",
+    "LLM::Agent::Loop": "lib/LLM/Agent/Loop.rakumod",
+    "LLM::Agent::Prompt": "lib/LLM/Agent/Prompt.rakumod",
+    "LLM::Agent::Run": "lib/LLM/Agent/Run.rakumod",
+    "LLM::Agent::Session": "lib/LLM/Agent/Session.rakumod",
+    "LLM::Agent::TokenCount": "lib/LLM/Agent/TokenCount.rakumod"
+  },
+  "resources": [
+  ],
+  "source-url": "https://github.com/m-doughty/LLM-Agent.git",
+  "support": {
+    "bugtracker": "https://github.com/m-doughty/LLM-Agent/issues",
+    "source": "https://github.com/m-doughty/LLM-Agent"
+  },
+  "tags": [
+    "llm",
+    "agent",
+    "tools",
+    "mcp",
+    "streaming"
+  ],
+  "test-depends": [
+  ],
+  "version": "0.1.0"
+}

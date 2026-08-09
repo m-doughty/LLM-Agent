@@ -1,0 +1,335 @@
+use Test;
+use lib 'lib', 't/lib';
+use JSON::Fast;
+use LLM::Agent::Event;
+use LLM::Agent::Run;
+use LLM::Chat::Conversation::Message;
+
+# The event taxonomy and the Run that carries it. They are tested together
+# because the contracts that matter — one terminal then done, nothing
+# after it, a result that is always kept — belong to the pair.
+
+plan 16;
+
+sub msg(Str:D $role, Str:D $content = '', *%extra) {
+	LLM::Chat::Conversation::Message.new(:$role, :$content, |%extra);
+}
+
+# Every class, with the minimum it needs, in the order a run emits them.
+sub every-event(--> List) {
+	(
+		LLM::Agent::Event::RunStarted.new(run-id => 'r', message-count => 1),
+		LLM::Agent::Event::RoundStarted.new(round => 1),
+		LLM::Agent::Event::AttemptStarted.new(
+			round => 1, attempt => 1, backend-index => 0, model => 'm',
+		),
+		LLM::Agent::Event::Token.new(text => 'hi'),
+		LLM::Agent::Event::AttemptFailed.new(
+			round => 1, attempt => 1, backend-index => 0,
+			error => 'boom', disposition => 'advance',
+		),
+		LLM::Agent::Event::AttemptSucceeded.new(
+			round => 1, attempt => 2, backend-index => 1,
+		),
+		LLM::Agent::Event::AssistantMessage.new(
+			message => msg('assistant', 'hi'),
+		),
+		LLM::Agent::Event::ToolCall.new(id => 'c1', name => 'fs_read'),
+		LLM::Agent::Event::ToolResult.new(id => 'c1', content => 'ok'),
+		LLM::Agent::Event::AskPending.new(request => { kind => 'permission' }),
+		LLM::Agent::Event::AskAnswered.new(request => { kind => 'permission' }),
+		LLM::Agent::Event::Log.new(level => 'info', data => 'hello'),
+		LLM::Agent::Event::LimitReached.new(limit => 'tool-rounds'),
+		LLM::Agent::Event::CompactionStarted.new,
+		LLM::Agent::Event::CompactionDone.new,
+		LLM::Agent::Event::RunCompleted.new,
+		LLM::Agent::Event::RunFailed.new(error => 'nope'),
+		LLM::Agent::Event::RunCancelled.new,
+	);
+}
+
+# --- the taxonomy -----------------------------------------------------
+
+subtest 'the kind strings are the ones consumers match on' => {
+	plan 2;
+	is every-event().map({ .kind }), [
+		'run-started', 'round-started', 'attempt-started', 'token',
+		'attempt-failed', 'attempt-succeeded', 'assistant-message',
+		'tool-call', 'tool-result', 'ask-pending', 'ask-answered', 'log',
+		'limit-reached', 'compaction-started', 'compaction-done',
+		'run-completed', 'run-failed', 'run-cancelled',
+	], 'every class, in run order, with its stable name';
+
+	is every-event().map({ .kind }).unique.elems, every-event().elems,
+		'and no two classes share one';
+};
+
+subtest 'every event is an Event, and the base cannot be emitted' => {
+	plan 3;
+	ok every-event().all ~~ LLM::Agent::Event,
+		'so one Supply can carry all of them';
+	throws-like { LLM::Agent::Event.new.kind }, X::StubCode,
+		'the base class has no kind of its own';
+	ok LLM::Agent::Event.new.ts ~~ Instant,
+		'though it does stamp itself with the time';
+};
+
+subtest 'exactly three kinds are terminal' => {
+	plan 4;
+	is every-event().grep({ .is-terminal }).map({ .kind }),
+		['run-completed', 'run-failed', 'run-cancelled'],
+		'completed, failed, cancelled — and nothing else';
+	is LLM::Agent::Event::TERMINAL-KINDS.keys.sort,
+		['run-cancelled', 'run-completed', 'run-failed'],
+		'the constant says the same thing for code without the classes';
+	ok every-event().grep({ .is-terminal }).all.kind
+		∈ LLM::Agent::Event::TERMINAL-KINDS,
+		'the two agree';
+	nok LLM::Agent::Event::Token.new(text => 'x').is-terminal,
+		'a token most certainly does not end a run';
+};
+
+subtest 'to-hash is plain data: it survives a JSON round trip' => {
+	plan 3;
+	my @hashes = every-event().map({ .to-hash });
+	my $json = to-json(@hashes);
+	ok $json.chars, 'the whole taxonomy encodes';
+
+	my @back = from-json($json).list;
+	is @back.elems, @hashes.elems, 'and decodes to the same number of events';
+	is @back.map({ $_<kind> }), @hashes.map({ $_<kind> }),
+		'with the kinds intact';
+};
+
+subtest 'to-hash always carries kind and an ISO-8601 UTC ts' => {
+	plan 3;
+	my %h = LLM::Agent::Event::Token.new(text => 'hi').to-hash;
+	is %h<kind>, 'token', 'kind is a key, not just a method';
+	like %h<ts>, /^ \d**4 '-' \d\d '-' \d\d 'T' \d\d ':' \d\d ':' \d\d '.' \d+ 'Z' $/,
+		'ts is the ISO-8601 UTC string a transcript stores';
+	# Pinned against a fixed Instant rather than against `now`: this is a
+	# stored format, and a change of timezone handling or precision would
+	# otherwise sail through.
+	is LLM::Agent::Event::Token.new(
+		text => 'hi', ts => Instant.from-posix(1_700_000_000),
+	).to-hash<ts>.substr(0, 19), '2023-11-14T22:13:20',
+		'and it renders the event’s own Instant, in UTC';
+};
+
+subtest 'undefined payload keys are absent, not null' => {
+	plan 4;
+	my %minimal = LLM::Agent::Event::AttemptFailed.new(
+		round => 1, attempt => 1, backend-index => 0,
+		error => 'connection reset', disposition => 'retry-same',
+	).to-hash;
+
+	nok %minimal<error-status>:exists,
+		'a connection failure has no HTTP status, so it has no key';
+	nok %minimal<backoff>:exists, 'nor a backoff it was not told about';
+	is %minimal<disposition>, 'retry-same', 'what it does have is there';
+
+	my %full = LLM::Agent::Event::AttemptFailed.new(
+		round => 1, attempt => 1, backend-index => 0, error => 'boom',
+		error-class => 'http', error-status => 500,
+		disposition => 'retry-same', backoff => 1.5e0, model => 'm',
+	).to-hash;
+	is %full<error-status>, 500, 'and a key it was told about is present';
+};
+
+subtest 'present-but-empty containers stay present' => {
+	plan 2;
+	my %succeeded = LLM::Agent::Event::AttemptSucceeded.new(
+		round => 1, attempt => 1, backend-index => 0,
+	).to-hash;
+	is %succeeded<usage>, {},
+		'"the provider reported no usage" is an empty hash, not a missing key';
+
+	my %failed = LLM::Agent::Event::RunFailed.new(error => 'x').to-hash;
+	is %failed<attempts>, [],
+		'"it never got as far as an attempt" is an empty list';
+};
+
+subtest 'AssistantMessage flattens its Message to the wire shape' => {
+	plan 4;
+	my @tool-calls = [
+		{ id => 'c1', type => 'function',
+		  function => { name => 'fs_read', arguments => '{}' } },
+	];
+	my %h = LLM::Agent::Event::AssistantMessage.new(
+		message => msg('assistant', 'thinking about it', :@tool-calls),
+		reasoning => 'first I will read the file',
+		round => 2,
+	).to-hash;
+
+	is %h<message><role>, 'assistant', 'the Message became plain data';
+	is %h<message><tool_calls>.elems, 1, 'tool calls came with it';
+	is %h<reasoning>, 'first I will read the file',
+		'the reasoning trace rides alongside, not inside';
+	ok to-json(%h).chars, 'and the whole thing still encodes';
+};
+
+subtest 'Log only accepts text or a record' => {
+	plan 4;
+	lives-ok { LLM::Agent::Event::Log.new(level => 'info', data => 'hello') },
+		'free text is a log line';
+	lives-ok {
+		LLM::Agent::Event::Log.new(level => 'info', data => { msg => 'hi' })
+	}, 'so is a structured record';
+	dies-ok { LLM::Agent::Event::Log.new(level => 'info', data => 42) },
+		'a bare number is neither, and is refused at construction';
+	dies-ok { LLM::Agent::Event::Log.new(level => 'info') },
+		'and a log line with no content is not a log line';
+};
+
+subtest 'AttemptFailed only accepts the three real dispositions' => {
+	plan 4;
+	for <retry-same advance abort> -> $disposition {
+		lives-ok {
+			LLM::Agent::Event::AttemptFailed.new(
+				round => 1, attempt => 1, backend-index => 0,
+				error => 'e', :$disposition,
+			)
+		}, "$disposition is a bucket";
+	}
+	dies-ok {
+		LLM::Agent::Event::AttemptFailed.new(
+			round => 1, attempt => 1, backend-index => 0,
+			error => 'e', disposition => 'give-up',
+		)
+	}, 'a bucket classify-error never returns is refused';
+};
+
+subtest 'AskAnswered survives a UI that answers with anything' => {
+	plan 2;
+	my %hash-answer = LLM::Agent::Event::AskAnswered.new(
+		request => { kind => 'permission' },
+		answer => { action => 'always-allow' },
+	).to-hash;
+	is %hash-answer<answer><action>, 'always-allow',
+		'a well-formed answer comes through as a record';
+
+	my %str-answer = LLM::Agent::Event::AskAnswered.new(
+		request => { kind => 'permission' }, answer => 'allow-once',
+	).to-hash;
+	is %str-answer<answer>, 'allow-once',
+		'and a badly-formed one is reported as a string, not thrown over';
+};
+
+# --- the Run ----------------------------------------------------------
+
+subtest 'a fresh Run is running, identified, and not done' => {
+	plan 4;
+	my $run = LLM::Agent::Run.new;
+	like $run.id, /^ <[0..9a..f]>**8 '-' /, 'it has a UUID of its own';
+	nok $run.is-done, 'nothing has happened yet';
+	nok $run.is-cancelled, 'and nobody has cancelled it';
+	is LLM::Agent::Run.new(id => 'fixed').id, 'fixed',
+		'a caller may supply the id instead';
+};
+
+subtest 'the events Supply replays to a late first tap' => {
+	plan 3;
+	my $run = LLM::Agent::Run.new;
+
+	# The whole run happens before anybody taps — which is the normal case
+	# for a scripted test, and the reason the Supplier preserves.
+	$run._emit: LLM::Agent::Event::RunStarted.new(
+		run-id => $run.id, message-count => 1,
+	);
+	$run._emit: LLM::Agent::Event::Token.new(text => 'hi');
+	$run._finish: LLM::Agent::Event::RunCompleted.new(final => 'hi'),
+		final => 'hi';
+
+	my @kinds;
+	my $done = Promise.new;
+	my $vow = $done.vow;
+	$run.events.tap(-> $e { @kinds.push: $e.kind }, done => { $vow.keep(True) });
+	await Promise.anyof($done, Promise.in(10));
+
+	is $done.status, Kept, 'the tap sees the done it was too late for';
+	is @kinds, ['run-started', 'token', 'run-completed'],
+		'and the whole run, in order';
+
+	# The documented caveat, pinned so it cannot regress silently into a
+	# promise the Supplier cannot keep.
+	my @second;
+	my $late = Promise.new;
+	my $late-vow = $late.vow;
+	$run.events.tap(-> $e { @second.push: $e }, done => { $late-vow.keep(True) });
+	await Promise.anyof($late, Promise.in(1));
+	is @second.elems, 0,
+		'a SECOND tap gets nothing: the buffer belongs to the first';
+};
+
+subtest 'the result Promise is kept — for every outcome' => {
+	plan 6;
+	my $completed = LLM::Agent::Run.new;
+	$completed._finish:
+		LLM::Agent::Event::RunCompleted.new(final => 'done'),
+		final => 'done', messages => [msg('user', 'hi'),];
+	my %ok = await $completed.result;
+	is %ok<outcome>, 'completed', 'a completed run says so';
+	is %ok<final>, 'done', 'and hands back the final text';
+
+	my $failed = LLM::Agent::Run.new;
+	$failed._finish:
+		LLM::Agent::Event::RunFailed.new(error => 'all backends failed'),
+		error => 'all backends failed',
+		attempts => [{ backend-index => 0, model => 'm', error => 'boom' },];
+	my %bad = await $failed.result;
+	is %bad<outcome>, 'failed',
+		'a failed run KEEPS its promise rather than breaking it';
+	is %bad<attempts>.elems, 1, 'with the attempts that got it there';
+
+	my $cancelled = LLM::Agent::Run.new;
+	$cancelled._finish: LLM::Agent::Event::RunCancelled.new;
+	my %stopped = await $cancelled.result;
+	is %stopped<outcome>, 'cancelled', 'so does a cancelled one';
+	is %stopped.keys.sort,
+		['attempts', 'error', 'final', 'messages', 'outcome'],
+		'and all five keys are always there, so a caller can index blind';
+};
+
+subtest 'the terminal contract is enforced by the Run, not by its driver' => {
+	plan 6;
+	my $run = LLM::Agent::Run.new;
+
+	throws-like {
+		$run._emit(LLM::Agent::Event::RunCompleted.new)
+	}, Exception, message => /'_finish'/,
+		'a terminal event cannot be sneaked out through _emit';
+	throws-like {
+		$run._finish(LLM::Agent::Event::Token.new(text => 'x'))
+	}, Exception, message => /'not a terminal'/,
+		'nor a token through _finish';
+
+	ok $run._emit(LLM::Agent::Event::Token.new(text => 'x')),
+		'a normal event reports that it was published';
+	ok $run._finish(LLM::Agent::Event::RunCompleted.new(final => 'x')),
+		'the first finish wins';
+	nok $run._finish(LLM::Agent::Event::RunFailed.new(error => 'too late')),
+		'a second finish is refused rather than keeping the vow twice';
+	nok $run._emit(LLM::Agent::Event::Log.new(level => 'info', data => 'late')),
+		'and a straggler after the terminal is dropped, not emitted';
+};
+
+subtest 'cancel is idempotent, hooked, and never throws' => {
+	plan 7;
+	my $pokes = 0;
+	my $run = LLM::Agent::Run.new(on-cancel => { $pokes++ });
+
+	nok $run.is-cancelled, 'not cancelled to begin with';
+	$run.cancel;
+	ok $run.is-cancelled, 'one call is enough';
+	is $run.cancellation.status, Kept,
+		'and the Promise a driver waits on is kept';
+	is $pokes, 1, 'the hook fired';
+
+	$run.cancel for ^5;
+	is $pokes, 1, 'and fires exactly once however often cancel is called';
+	nok $run.is-done, 'cancelling asks; it does not itself end the run';
+
+	my $throwing = LLM::Agent::Run.new(on-cancel => { die 'the backend died' });
+	lives-ok { $throwing.cancel },
+		'a hook that throws cannot break the caller’s cancel';
+};

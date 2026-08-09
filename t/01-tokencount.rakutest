@@ -1,0 +1,247 @@
+use Test;
+use lib 'lib', 't/lib';
+use JSON::Fast;
+use LLM::Agent::TokenCount;
+use LLM::Chat::Conversation::Message;
+
+plan 14;
+
+sub msg(Str:D $role, Str:D $content = '', :@tool-calls) {
+	LLM::Chat::Conversation::Message.new(:$role, :$content, :@tool-calls);
+}
+
+# --- Heuristic --------------------------------------------------------
+
+subtest 'Heuristic: the arithmetic, exactly' => {
+	plan 5;
+	my $h = LLM::Agent::TokenCount::Heuristic.new;
+
+	is $h.count-messages([]), 0, 'an empty conversation is zero tokens';
+	is $h.count-messages([msg('user', '12345678'),]), 10,
+		'8 chars / 4 = 2, plus 8 of overhead';
+	is $h.count-messages([msg('user', '1'),]), 9,
+		'1 char rounds UP to a whole token';
+	is $h.count-messages([msg('user', ''),]), 8,
+		'an empty message still costs its framing';
+	is $h.count-messages([msg('user', '1234'), msg('assistant', '12345'),]),
+		9 + 10, 'per-message costs add up rather than being pooled';
+};
+
+subtest 'Heuristic: the reduce is over the messages, not over a seed' => {
+	plan 1;
+	# Pins the `[+] 0, @list` trap: reducing (0, Seq) numifies the Seq to
+	# its ELEMENT COUNT, so a whole 40-message conversation would quietly
+	# count as 2. Any conversation whose real count differs from its
+	# length proves the seed is gone.
+	my @conversation = (^40).map({ msg('user', 'x' x 100) });
+	is LLM::Agent::TokenCount::Heuristic.new.count-messages(@conversation),
+		40 * (8 + 25), '40 long messages count as 40 long messages';
+};
+
+subtest 'Heuristic: tool calls are counted, ids are not' => {
+	plan 3;
+	my $h = LLM::Agent::TokenCount::Heuristic.new;
+	my @tool-calls = [
+		{ id => 'call_1', type => 'function',
+		  function => { name => 'fs_read', arguments => '{"path":"a"}' } },
+	];
+
+	my $bare = $h.count-messages([msg('assistant', ''),]);
+	my $with = $h.count-messages([msg('assistant', '', :@tool-calls),]);
+	ok $with > $bare,
+		'an assistant turn that asked for a tool is not an empty message';
+	is $with - $bare, ceiling(to-json(@tool-calls, :!pretty).chars / 4),
+		'the extra is the JSON encoding of the calls';
+
+	my @two = [|@tool-calls, |@tool-calls];
+	ok $h.count-messages([msg('assistant', '', tool-calls => @two),]) > $with,
+		'two calls cost more than one';
+};
+
+subtest 'Heuristic: both knobs are honoured' => {
+	plan 3;
+	is LLM::Agent::TokenCount::Heuristic.new(
+		chars-per-token => 2, per-message-overhead => 0,
+	).count-messages([msg('user', '1234'),]), 2, 'chars-per-token divides';
+	is LLM::Agent::TokenCount::Heuristic.new(
+		per-message-overhead => 100,
+	).count-messages([msg('user', '1234'),]), 101, 'overhead is per message';
+	dies-ok { LLM::Agent::TokenCount::Heuristic.new(chars-per-token => 0) },
+		'a zero chars-per-token is rejected, not divided by';
+};
+
+# --- Exact ------------------------------------------------------------
+
+class CountingShim {
+	has Int $.answer = 4242;
+	has @.seen;
+	method get-conversation-count(@messages) {
+		@!seen.push: @messages.elems;
+		$!answer;
+	}
+}
+
+subtest 'Exact: delegates to whatever can get-conversation-count' => {
+	plan 3;
+	my $shim = CountingShim.new;
+	my $exact = LLM::Agent::TokenCount::Exact.new(counter => $shim);
+
+	is $exact.count-messages([msg('user', 'hi'), msg('assistant', 'ho'),]),
+		4242, 'the wrapped counter has the last word';
+	is $shim.seen, [2], 'it was handed the whole conversation';
+	ok $exact ~~ LLM::Agent::TokenCount, 'and it is a TokenCount';
+};
+
+subtest 'Exact: a counter that cannot count is refused at construction' => {
+	plan 3;
+	throws-like { LLM::Agent::TokenCount::Exact.new(counter => 42) },
+		Exception, message => /'get-conversation-count'/,
+		'a counter without the method names the method it needs';
+	dies-ok { LLM::Agent::TokenCount::Exact.new(counter => CountingShim) },
+		'a type object is not a counter either';
+	dies-ok { LLM::Agent::TokenCount::Exact.new },
+		'and the counter is required';
+};
+
+subtest 'Exact: record-usage is a no-op it survives' => {
+	plan 1;
+	my $exact = LLM::Agent::TokenCount::Exact.new(counter => CountingShim.new);
+	lives-ok { $exact.record-usage(prompt-tokens => 10, message-count => 2) },
+		'the loop can tell any counter about usage without checking first';
+};
+
+# --- Usage ------------------------------------------------------------
+
+subtest 'Usage: with no calibration it is its fallback' => {
+	plan 3;
+	my $fallback = LLM::Agent::TokenCount::Heuristic.new;
+	my $usage = LLM::Agent::TokenCount::Usage.new(:$fallback);
+	my @conversation = (msg('system', 'be good'), msg('user', 'hello there'));
+
+	is $usage.calibration, {}, 'nothing recorded yet';
+	is $usage.count-messages(@conversation),
+		$fallback.count-messages(@conversation),
+		'so the answer is the fallback estimate, exactly';
+	is $usage.last-completion-tokens, Int, 'and no completion is remembered';
+};
+
+subtest 'Usage: a calibrated prefix is the provider’s own number' => {
+	plan 4;
+	my $usage = LLM::Agent::TokenCount::Usage.new;
+	my @conversation = (msg('system', 'be good'), msg('user', 'hello there'));
+
+	$usage.record-usage(
+		prompt-tokens => 812, completion-tokens => 9, message-count => 2,
+	);
+
+	is $usage.calibration,
+		{ message-count => 2, prompt-tokens => 812 }, 'the pair is remembered';
+	is $usage.last-completion-tokens, 9, 'as is the completion count';
+	is $usage.count-messages(@conversation), 812,
+		'a conversation of exactly N messages costs exactly P';
+	isnt $usage.count-messages(@conversation),
+		LLM::Agent::TokenCount::Heuristic.new.count-messages(@conversation),
+		'which is nothing like what the heuristic would have said';
+};
+
+subtest 'Usage: messages beyond the prefix are estimated on top' => {
+	plan 3;
+	my $fallback = LLM::Agent::TokenCount::Heuristic.new;
+	my $usage = LLM::Agent::TokenCount::Usage.new(:$fallback);
+	my @conversation = (msg('system', 'be good'), msg('user', 'hello there'));
+
+	$usage.record-usage(prompt-tokens => 812, message-count => 2);
+
+	my $answer = $usage.count-messages(@conversation);
+	@conversation.push: msg('assistant', 'well hello');
+	my $grown = $usage.count-messages(@conversation);
+
+	is $grown, 812 + $fallback.count-messages([@conversation[2],]),
+		'P plus the estimate of the tail, and nothing else';
+	ok $grown > $answer, 'appending to a conversation makes it bigger';
+
+	@conversation.push: msg('user', 'and again');
+	is $usage.count-messages(@conversation),
+		812 + $fallback.count-messages(@conversation[2 .. 3].List),
+		'the whole tail is estimated, not just the newest message';
+};
+
+subtest 'Usage: a shrunk conversation drops the calibration' => {
+	plan 4;
+	my $fallback = LLM::Agent::TokenCount::Heuristic.new;
+	my $usage = LLM::Agent::TokenCount::Usage.new(:$fallback);
+	my @conversation = (^10).map({ msg('user', "message $_") }).Array;
+
+	$usage.record-usage(prompt-tokens => 5_000, message-count => 10);
+	is $usage.count-messages(@conversation), 5_000, 'calibrated at 10 messages';
+
+	# Compaction: ten messages become three.
+	my @compacted = @conversation[0 .. 2].Array;
+	is $usage.count-messages(@compacted), $fallback.count-messages(@compacted),
+		'a conversation shorter than the calibration falls back entirely';
+	is $usage.calibration, {},
+		'and the stale calibration is DROPPED, not kept for later';
+
+	# The bug this prevents: growing back to 10 messages must not
+	# resurrect a P that was charged for ten different ones.
+	@compacted.push: msg('user', "post-compaction $_") for ^7;
+	is $usage.count-messages(@compacted), $fallback.count-messages(@compacted),
+		'so growing back to the old length does not resurrect the old number';
+};
+
+subtest 'Usage: a usage report it cannot use is ignored, not destructive' => {
+	plan 5;
+	my $usage = LLM::Agent::TokenCount::Usage.new;
+	my @conversation = (msg('user', 'hello there'),);
+
+	$usage.record-usage(prompt-tokens => 100, message-count => 1);
+
+	$usage.record-usage(completion-tokens => 12);
+	is $usage.calibration, { message-count => 1, prompt-tokens => 100 },
+		'a report with no prompt tokens leaves the calibration alone';
+	is $usage.last-completion-tokens, 12,
+		'though the completion count is still recorded';
+
+	$usage.record-usage(prompt-tokens => 200);
+	is $usage.calibration<prompt-tokens>, 100,
+		'prompt tokens with no message count are unusable and ignored';
+
+	$usage.record-usage(prompt-tokens => -1, message-count => 1);
+	is $usage.calibration<prompt-tokens>, 100,
+		'a negative count is nonsense and ignored';
+
+	$usage.record-usage();
+	is $usage.count-messages(@conversation), 100,
+		'and an empty report changes nothing at all';
+};
+
+subtest 'Usage: recalibrating replaces rather than accumulates' => {
+	plan 2;
+	my $usage = LLM::Agent::TokenCount::Usage.new;
+	my @conversation = (^4).map({ msg('user', "m$_") }).Array;
+
+	$usage.record-usage(prompt-tokens => 100, message-count => 2);
+	$usage.record-usage(prompt-tokens => 300, message-count => 4);
+
+	is $usage.calibration, { message-count => 4, prompt-tokens => 300 },
+		'the newest report wins outright';
+	is $usage.count-messages(@conversation), 300,
+		'and the tail is empty again, so the answer is just P';
+};
+
+subtest 'Usage: any TokenCount can be the fallback' => {
+	plan 2;
+	my $usage = LLM::Agent::TokenCount::Usage.new(
+		fallback => LLM::Agent::TokenCount::Exact.new(
+			counter => CountingShim.new(answer => 7),
+		),
+	);
+	my @conversation = (msg('user', 'hi'), msg('user', 'ho'));
+
+	is $usage.count-messages(@conversation), 7,
+		'an Exact fallback is used before there is a calibration';
+
+	$usage.record-usage(prompt-tokens => 50, message-count => 1);
+	is $usage.count-messages(@conversation), 57,
+		'and for the tail after there is one';
+};
