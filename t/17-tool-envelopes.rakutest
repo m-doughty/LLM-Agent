@@ -1,0 +1,462 @@
+use Test;
+use lib 'lib', 't/lib';
+use JSON::Fast;
+use LLM::Agent::Session;
+use LLM::Chat::Conversation::Message;
+
+# The two envelopes that make a tool call durable, and the taxonomy they
+# exist for: after a kill, "never dispatched", "was still running" and
+# "finished, and the settle never landed" have to be three different
+# things a transcript can say. Everything here is at the file level — the
+# loop writing them is t/18's job.
+
+plan 12;
+
+my $tmp = $*TMPDIR.add("llm-agent-t17-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+my $n = 0;
+sub fresh-path(--> IO::Path) { $tmp.add('t' ~ $n++ ~ '.jsonl') }
+
+sub msg(Str:D $role, Str:D $content = '', *%extra) {
+	LLM::Chat::Conversation::Message.new(:$role, :$content, |%extra);
+}
+
+# A transcript written by hand, line by line — which is how a crash is
+# simulated: the lines that landed are the lines that landed.
+sub write-lines(IO::Path:D $path, @payloads --> Nil) {
+	$path.spurt(@payloads.kv.map(-> Int $index, %line {
+		to-json(
+			%(
+				v       => 1,
+				type    => %line<type>,
+				id      => (%line<id> // "id-$index"),
+				# A fixed clock: nothing here reads the timestamps for
+				# anything but "there is one", and a fixture that moves
+				# with the wall clock is a fixture that rots.
+				ts      => '2026-08-10T00:00:' ~ ($index % 60).fmt('%02d')
+					~ '.000000Z',
+				payload => %line<payload>,
+			),
+			:sorted-keys, :!pretty,
+		);
+	}).join("\n") ~ "\n");
+	Nil;
+}
+
+subtest 'a dispatch line is a whole operation record' => {
+	plan 8;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my $op-id = $session.append-tool-dispatched(
+		call-id          => 'call_1',
+		tool             => 'fs_write',
+		arguments        => '{"path":"b.txt"}',
+		arguments-digest => 'deadbeef',
+		idempotency      => 'destructive',
+		run-id           => 'run-1',
+		round            => 2,
+	);
+
+	my %line = from-json($path.lines.tail);
+	is %line<type>, 'tool-dispatched', 'typed as a dispatch';
+	is %line<id>, $op-id,
+		'and its envelope id IS the operation id the appender returned — '
+			~ 'which is what a settle names and a UI joins on';
+	is %line<payload><call-id>, 'call_1', 'the model’s call id is kept';
+	is %line<payload><tool>, 'fs_write', 'with the tool';
+	is %line<payload><arguments>, '{"path":"b.txt"}', 'and the arguments';
+	is %line<payload><idempotency>, 'destructive',
+		'and the classification a repair will word itself with';
+	is %line<payload><round>, 2, 'and where in the run it happened';
+
+	is $session.messages.elems, 0,
+		'while the conversation is untouched: an operation is not a message';
+
+	$session.close;
+};
+
+subtest 'pending is exactly what has not been settled' => {
+	plan 7;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	is-deeply $session.pending-tool-operations, (),
+		'a fresh transcript has nothing in flight';
+
+	my $one = $session.append-tool-dispatched(
+		call-id => 'c1', tool => 'fs_read', arguments => '{}',
+	);
+	my $two = $session.append-tool-dispatched(
+		call-id => 'c2', tool => 'fs_write', arguments => '{}',
+	);
+
+	is $session.pending-tool-operations.elems, 2, 'two calls are in flight';
+	is $session.pending-tool-operations.map({ $_<call-id> }).List, ('c1', 'c2'),
+		'in the order they were dispatched';
+
+	$session.append-tool-settled(
+		op-id => $one, outcome => 'completed', duration => 1.5,
+		result-digest => 'abc',
+	);
+
+	is $session.pending-tool-operations.map({ $_<call-id> }).List, ('c2',),
+		'a settled operation drops out of pending';
+	ok $session.pending-tool-operations[0]<dispatched-at>.chars,
+		'and what is left says when it started';
+
+	$session.append-tool-settled(op-id => $two, outcome => 'outcome-unknown',
+		reason => 'deadline');
+	is-deeply $session.pending-tool-operations, (),
+		'settling the rest empties it';
+
+	is $session.messages.elems, 0,
+		'none of which was ever a conversation message';
+
+	$session.close;
+};
+
+subtest 'an operation is settled once, and only if it exists' => {
+	plan 5;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $op-id = $session.append-tool-dispatched(
+		call-id => 'c1', tool => 'fs_read', arguments => '{}',
+	);
+
+	$session.append-tool-settled(op-id => $op-id, outcome => 'completed');
+
+	throws-like {
+		$session.append-tool-settled(op-id => $op-id, outcome => 'failed')
+	}, Exception, message => /'settled already'/,
+		'a second settle is refused — one operation, one account of it';
+
+	throws-like {
+		$session.append-tool-settled(op-id => 'never-happened', outcome => 'failed')
+	}, Exception, message => /'not an operation this transcript dispatched'/,
+		'and so is a settle for an operation nothing dispatched';
+
+	throws-like {
+		$session.append-tool-settled(op-id => $op-id, outcome => 'abandoned')
+	}, Exception, message => /'outcome must be one of'/,
+		'abandoned is not a settle: a dispatched call cannot be declared '
+			~ 'never to have run';
+
+	# Refused BEFORE the write, which is the whole point of validate-then-
+	# write: a line that cannot be applied must not be left behind to be
+	# replayed into the same error on the next load.
+	is $path.lines.elems, 3,
+		'and not one of the refusals left a line in the file';
+
+	$session.close;
+	my $replayed = LLM::Agent::Session.load(path => $path);
+	is $replayed.events.grep({ $_<type> eq 'tool-settled' }).elems, 1,
+		'so the transcript still loads, with the one settle that was legal';
+	$replayed.close;
+};
+
+subtest 'resolve-tool-operation is the repair path’s way in' => {
+	plan 3;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $op-id = $session.append-tool-dispatched(
+		call-id => 'c1', tool => 'sh_run', arguments => '{}',
+	);
+
+	my $id = $session.resolve-tool-operation(
+		$op-id, outcome => 'outcome-unknown', reason => 'crash-repair',
+	);
+	ok $id.chars, 'it writes a settle line like the appender it delegates to';
+
+	my %line = from-json($path.lines.tail);
+	is %line<payload><reason>, 'crash-repair',
+		'carrying the reason the repair gave';
+	is-deeply $session.pending-tool-operations, (),
+		'and the operation is no longer pending';
+
+	$session.close;
+};
+
+subtest 'both envelopes survive a reload, in order and with their state' => {
+	plan 6;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	$session.append-message(msg('user', 'write b.txt'));
+
+	my $done = $session.append-tool-dispatched(
+		call-id => 'c1', tool => 'fs_write', arguments => '{"path":"b"}',
+		idempotency => 'destructive',
+	);
+	$session.append-message(msg('tool', 'written', tool-call-id => 'c1'));
+	$session.append-tool-settled(op-id => $done, outcome => 'completed');
+
+	my $running = $session.append-tool-dispatched(
+		call-id => 'c2', tool => 'sh_run', arguments => '{}',
+	);
+	$session.close;
+
+	my $replayed = LLM::Agent::Session.load(path => $path);
+	is $replayed.messages.elems, 2,
+		'the conversation replays as it always did';
+	is $replayed.pending-tool-operations.elems, 1,
+		'and exactly one operation is still open';
+	is $replayed.pending-tool-operations[0]<op-id>, $running,
+		'the one that never settled';
+	is $replayed.pending-tool-operations[0]<tool>, 'sh_run', 'with its tool';
+	is $replayed.pending-tool-operations[0]<call-id>, 'c2', 'and its call id';
+
+	# The settled one is gone from pending but not from the file: a
+	# transcript is a record of what happened, not a work queue.
+	is $replayed.events.grep({ $_<type> eq 'tool-settled' }).elems, 1,
+		'while the settled one is still in the transcript, as history';
+
+	$replayed.close;
+};
+
+subtest 'the SIGKILL taxonomy: never dispatched' => {
+	plan 3;
+
+	# The process died between committing an assistant turn with tool_calls
+	# and dispatching any of them. Nothing ran.
+	my $path = fresh-path();
+	write-lines($path, [
+		{ type => 'session-meta', payload => {} },
+		{ type => 'message', payload => { role => 'user', content => 'go' } },
+		{ type => 'message', payload => {
+			role => 'assistant', content => 'reading',
+			'tool-calls' => [
+				{ id => 'c1', type => 'function',
+				  function => { name => 'fs_read', arguments => '{}' } },
+			],
+		} },
+	]);
+
+	my $session = LLM::Agent::Session.load(path => $path);
+	is-deeply $session.pending-tool-operations, (),
+		'nothing is pending, because nothing was ever dispatched';
+	is $session.messages.tail.tool-calls.elems, 1,
+		'but the conversation still holds an unanswered tool call';
+	nok $session.messages.first({ .role eq 'tool' }).defined,
+		'with no tool message anywhere — which is how an app tells this '
+			~ 'case apart: a call with neither a dispatch nor an answer did '
+			~ 'not run';
+
+	$session.close;
+};
+
+subtest 'the SIGKILL taxonomy: dispatched, still running' => {
+	plan 4;
+
+	my $path = fresh-path();
+	write-lines($path, [
+		{ type => 'session-meta', payload => {} },
+		{ type => 'message', payload => { role => 'user', content => 'go' } },
+		{ type => 'message', payload => {
+			role => 'assistant', content => 'writing',
+			'tool-calls' => [
+				{ id => 'c1', type => 'function',
+				  function => { name => 'fs_write', arguments => '{}' } },
+			],
+		} },
+		{ type => 'tool-dispatched', id => 'op-1', payload => {
+			'call-id' => 'c1', tool => 'fs_write', arguments => '{}',
+			idempotency => 'destructive',
+		} },
+	]);
+
+	my $session = LLM::Agent::Session.load(path => $path);
+	my @pending = $session.pending-tool-operations;
+	is @pending.elems, 1, 'the operation is pending';
+	is @pending[0]<op-id>, 'op-1', 'named by its dispatch envelope';
+	is @pending[0]<idempotency>, 'destructive',
+		'and carrying enough for a repair to say how much it matters';
+	nok $session.messages.first({ .role eq 'tool' }).defined,
+		'with no answer in the conversation — this call was in flight when '
+			~ 'the lights went out, and whether it wrote the file is unknown';
+
+	$session.close;
+};
+
+subtest 'the SIGKILL taxonomy: completed, unpersisted' => {
+	plan 3;
+
+	# The ordering that makes this case detectable at all: the loop writes
+	# the tool MESSAGE before the settle envelope, so a crash between the
+	# two leaves a pending operation whose call already has an answer.
+	my $path = fresh-path();
+	write-lines($path, [
+		{ type => 'session-meta', payload => {} },
+		{ type => 'message', payload => { role => 'user', content => 'go' } },
+		{ type => 'message', payload => {
+			role => 'assistant', content => 'writing',
+			'tool-calls' => [
+				{ id => 'c1', type => 'function',
+				  function => { name => 'fs_write', arguments => '{}' } },
+			],
+		} },
+		{ type => 'tool-dispatched', id => 'op-1', payload => {
+			'call-id' => 'c1', tool => 'fs_write', arguments => '{}',
+		} },
+		{ type => 'message', payload => {
+			role => 'tool', content => 'written', 'tool-call-id' => 'c1',
+		} },
+	]);
+
+	my $session = LLM::Agent::Session.load(path => $path);
+	my @pending = $session.pending-tool-operations;
+	is @pending.elems, 1, 'the operation is still pending';
+
+	my $answered = $session.messages.first({
+		.role eq 'tool' && .tool-call-id eq @pending[0]<call-id>
+	});
+	ok $answered.defined,
+		'but its call already has a tool message — so it completed, and only '
+			~ 'the settle line was lost';
+	is $answered.content, 'written',
+		'and the answer the model will see is the real one';
+
+	$session.close;
+};
+
+subtest 'a settle for an operation that is not there fails the load' => {
+	plan 2;
+
+	# The same rule a compaction naming a missing message gets: an
+	# envelope that cannot be applied is damage, not something to replay
+	# past in silence.
+	my $orphan = fresh-path();
+	write-lines($orphan, [
+		{ type => 'session-meta', payload => {} },
+		{ type => 'tool-settled', payload => {
+			'op-id' => 'never-written', outcome => 'completed',
+		} },
+	]);
+	throws-like { LLM::Agent::Session.load(path => $orphan) },
+		Exception, message => /'not an operation this transcript dispatched'/,
+		'a settle with no dispatch is refused on load';
+
+	my $twice = fresh-path();
+	write-lines($twice, [
+		{ type => 'session-meta', payload => {} },
+		{ type => 'tool-dispatched', id => 'op-1', payload => {
+			'call-id' => 'c1', tool => 'fs_read', arguments => '{}',
+		} },
+		{ type => 'tool-settled', payload => {
+			'op-id' => 'op-1', outcome => 'completed',
+		} },
+		{ type => 'tool-settled', payload => {
+			'op-id' => 'op-1', outcome => 'failed',
+		} },
+	]);
+	throws-like { LLM::Agent::Session.load(path => $twice) },
+		Exception, message => /'settled already'/,
+		'and two accounts of one operation are refused too';
+};
+
+subtest 'a compaction does not disturb the operations beside it' => {
+	plan 4;
+
+	# The reason operations live outside @!entries: a compaction splices
+	# the conversation, and an operation is not part of the conversation.
+	# A side effect that happened must not be summarised away.
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my $keep = $session.append-message(
+		msg('system', 'BE GOOD', sysprompt => True, sticky => True),
+	);
+	$session.append-message(msg('user', 'go'));
+	my $op = $session.append-tool-dispatched(
+		call-id => 'c1', tool => 'fs_write', arguments => '{}',
+	);
+	my $through = $session.append-message(
+		msg('tool', 'written', tool-call-id => 'c1'),
+	);
+
+	$session.append-compaction(
+		summary => 'we wrote b.txt', replaces-through-id => $through,
+	);
+
+	is $session.pending-tool-operations.elems, 1,
+		'the operation the compaction summarised over is still pending';
+	is $session.pending-tool-operations[0]<op-id>, $op, 'and still itself';
+	is $session.messages.map({ .role }).List, ('system', 'user'),
+		'while the conversation really was compacted';
+
+	# ...and it can still be settled afterwards, which is the "settle at
+	# repair time" half of the compaction-dangle decision.
+	lives-ok {
+		$session.resolve-tool-operation(
+			$op, outcome => 'outcome-unknown', reason => 'crash-repair',
+		)
+	}, 'and settling it afterwards still works — a compaction never orphans '
+		~ 'an operation';
+
+	$session.close;
+};
+
+subtest 'the built-in types all refuse the escape hatch' => {
+	plan 3;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	# NB `run-context` joined this list in 0.3: an app that was writing a
+	# custom line of that name has to rename it or go through
+	# append-run-context, which is what keeps the payload in shape.
+	for <tool-dispatched tool-settled run-context> -> $type {
+		throws-like { $session.append-event(:$type, payload => {}) },
+			Exception, message => /'built-in type'/,
+			"$type has to go through its own appender";
+	}
+
+	$session.close;
+};
+
+subtest 'a 0.1.x transcript still loads, and has nothing pending' => {
+	plan 3;
+
+	# Backwards: an older file knows nothing about operations, and that is
+	# exactly what tells an app to fall back to whatever heuristic it used
+	# before these lines existed.
+	my $path = fresh-path();
+	write-lines($path, [
+		{ type => 'session-meta', payload => { agent => 'sadna' } },
+		{ type => 'message', payload => { role => 'user', content => 'hello' } },
+		{ type => 'message', payload => { role => 'assistant', content => 'hi' } },
+	]);
+
+	my $old = LLM::Agent::Session.load(path => $path);
+	is $old.messages.elems, 2, 'it replays as it always did';
+	is-deeply $old.pending-tool-operations, (),
+		'with nothing pending, because nothing could have been';
+	$old.close;
+
+	# Forwards: a 0.2 transcript's new lines are exactly the shape an
+	# older LLM::Agent skips — unknown types are preserved and ignored.
+	my $new = fresh-path();
+	write-lines($new, [
+		{ type => 'session-meta', payload => {} },
+		{ type => 'message', payload => { role => 'user', content => 'go' } },
+		{ type => 'tool-dispatched', id => 'op-1', payload => {
+			'call-id' => 'c1', tool => 'fs_read', arguments => '{}',
+		} },
+	]);
+	my $forward = LLM::Agent::Session.load(path => $new);
+	is $forward.events.grep({ $_<type> eq 'tool-dispatched' }).head<v>, 1,
+		'and the envelope version did not move for them, so an older reader '
+			~ 'skips them as an unknown type rather than dying';
+	$forward.close;
+};

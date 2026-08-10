@@ -7,7 +7,7 @@ use LLM::Chat::Conversation::Message;
 # The transcript as a file: what a line looks like, when it hits the disk,
 # and what the session refuses to do. Resuming one is t/08's job.
 
-plan 11;
+plan 14;
 
 my $tmp = $*TMPDIR.add("llm-agent-t07-{$*PID}-{now.Int}");
 $tmp.mkdir;
@@ -138,6 +138,48 @@ subtest 'grants are a whole snapshot, and the last one wins' => {
 	$session.close;
 };
 
+subtest 'a run context is refused before it is written, or not at all' => {
+	plan 8;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	sub append(*%args) {
+		$session.append-run-context(
+			run-id   => 'r1',
+			digest   => 'd1',
+			facts    => [date => 'today'],
+			sections => [%(name => 'identity', digest => 'ds', rendered => 'I'),],
+			|%args,
+		);
+	}
+
+	my $id = append();
+	ok $id.chars, 'a well-formed context is written and returns its id';
+	is $session.elems, 2, 'as one line';
+	is $session.messages.elems, 0,
+		'and it is not a message, here or anywhere else';
+
+	# Facts survive as ordered [key, value] rows rather than as an object,
+	# because a JSON object has no order to preserve.
+	is-deeply $session.events.tail<payload><facts>, (('date', 'today'),),
+		'the facts are rows, in render order';
+
+	throws-like { append(run-id => '  ') }, Exception, message => /'run-id'/,
+		'a context that cannot say which run it belongs to is refused';
+	throws-like { append(digest => '') }, Exception, message => /'digest'/,
+		'and one with no digest to compare';
+	throws-like { append(facts => ['date',]) }, Exception,
+		message => /'a fact is a key'/,
+		'a fact that is not a Pair (or a two-element row) is refused';
+	throws-like { append(sections => [%(name => 'x', digest => 'y'),]) },
+		Exception, message => /'has no rendered'/,
+		'and a section with no body — there would be nothing to store, and '
+			~ 'nothing for a later line to point at';
+
+	$session.close;
+};
+
 subtest 'the escape hatch writes unknown types, and refuses the known ones' => {
 	plan 5;
 
@@ -161,6 +203,29 @@ subtest 'the escape hatch writes unknown types, and refuses the known ones' => {
 	throws-like { $session.append-event(type => '  ', payload => {}) },
 		Exception, message => /'cannot be empty'/,
 		'and a type has to be something';
+
+	$session.close;
+};
+
+subtest 'events is a copy, nested payload included' => {
+	plan 2;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	$session.append-message(msg('assistant', '', tool-calls => [
+		{ id => 'c1', type => 'function',
+		  function => { name => 'fs_read', arguments => '{"path":"a"}' } },
+	]));
+
+	my @before = $session.events;
+	@before.tail<payload><tool-calls>[0]<function><name> = 'sabotage';
+
+	my @after = $session.events;
+	isnt @after.tail<payload><tool-calls>[0]<function><name>, 'sabotage',
+		'mutating a returned envelope does not reach the replayed state';
+	is @after.tail<payload><tool-calls>[0]<function><name>, 'fs_read',
+		'the payload replay actually holds is untouched';
 
 	$session.close;
 };
@@ -232,6 +297,35 @@ subtest 'a closed session refuses to append, but still reads' => {
 		'appending after close is refused';
 	is $session.messages.elems, 1, 'while what it replayed stays readable';
 	lives-ok { $session.close }, 'and closing twice is harmless';
+};
+
+subtest 'a line that cannot be written changes nothing in memory' => {
+	plan 7;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	$session.append-message(msg('user', 'landed'));
+
+	# The handle taken out from under it, which is the closest a test can
+	# portably get to a full disk — and the same shape of failure: the
+	# write throws after the session has decided to make the append.
+	$session.^attributes.first(*.name eq '$!fh').get_value($session).close;
+
+	throws-like { $session.append-message(msg('assistant', 'never')) },
+		X::IO::Closed, 'the append fails rather than pretending';
+
+	# The whole point of writing before committing: everything the session
+	# reports is still exactly what is in the file.
+	is $session.messages.elems, 1, 'the conversation did not grow';
+	is $session.message-ids.elems, 1, 'nor did its ids';
+	is $session.events.elems, 2, 'nor the envelope log';
+	is $path.lines.elems, 2, 'and the file is what it always was';
+
+	throws-like { $session.append-message(msg('assistant', 'nor this')) },
+		X::IO::Closed, 'a second attempt fails the same way';
+	is $session.messages.elems, 1, 'still without moving anything';
+
+	$session.close;
 };
 
 subtest 'keys are serialised in a stable order' => {

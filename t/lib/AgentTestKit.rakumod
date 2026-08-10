@@ -57,7 +57,7 @@ chunks              | List of fragments to emit, in order
 content             | Shorthand for a single-fragment C<chunks>
 tool-calls          | List of wire-shaped calls; also sets finish-reason to 'tool_calls'
 finish-reason       | Overrides the finish reason ('stop', or 'tool_calls' with tool-calls)
-usage               | C<< { prompt, completion, total, model } >>, any subset
+usage               | C<< { prompt, completion, total, model, cost, generation-id, provider-name } >>, any subset
 error               | Message the call fails with, AFTER emitting whatever chunks it had
 error-class         | 'http' / 'timeout' / 'connection' / 'response' (default 'unknown')
 error-status        | HTTP status, for error-class 'http'
@@ -67,6 +67,23 @@ fail-after-chunks   | Emit only this many fragments, then fail
 stall               | Emit the fragments and then go silent — no done, no quit, ever
 
 =end table
+
+The last three C<usage> keys are the B<provider-specific> ones, and a
+step that scripts any of them gets an
+C<LLM::Chat::Backend::Response::OpenRouter> (or its C<::Stream>) instead
+of a plain Response — the real subclass, set through the real
+C<_set-or-usage>, because what the loop does with them is probe with
+C<.?cost>. A step that scripts none of them gets exactly the Response
+every other test here was written against, so both sides of that probe
+are covered by ordinary use.
+
+C<model> is what C<< model-of($backend) >> answers, and it is the key a
+C<LLM::Agent::RequestBudget> profile and a
+C<LLM::Agent::TokenCount::Usage> calibration are both stored under — so a
+test that wants two backends with B<different> profiles has to give them
+different models. It defaults to C<scripted-model>, which means two
+default backends B<share> a profile, which is occasionally the thing
+being tested and occasionally a surprise.
 
 C<stall> is what an inactivity timeout is tested against: the response
 never reaches a terminal state on its own, C<last-activity-at> stops
@@ -110,12 +127,36 @@ C<block-on> is a Promise the batch waits on before returning — a blocked
 tool round (a permission prompt nobody has answered yet) without needing a
 real one.
 
+Two more knobs are B<per call> rather than per batch, which is what makes
+a per-operation loop testable at all: with one call dispatched at a time,
+"gate the first of three" is a thing a test needs to be able to say.
+
+=begin table
+
+Knob       | What it is
+===========|=========================================================
+latency    | seconds this call sleeps before answering
+block-call | a Promise this call waits on before answering
+
+=end table
+
+Both are hashes looked up by B<call id first, then tool name>, so a test
+can slow down one specific call (C<< latency => { c2 => 0.4 } >>) or every
+call of a tool (C<< latency => { fs_read => 0.4 } >>). C<block-call> is
+awaited B<inside> the per-call answer, so a batch of three with only the
+first gated returns nothing until the gate opens — which is exactly what a
+sequential dispatcher does anyway.
+
+C<latency> is how a tool deadline is tested without a clock seam: a
+deadline of 0.15s against a call that takes 0.5s fires, deterministically,
+in well under a second.
+
 C<grants> is deliberately absent from C<ScriptedProvider> and present on
 C<ScriptedProviderWithGrants>, because the loop decides whether to
 synchronise grants with C<.can('grants')>. A single class with an
 always-present method could not test both sides of that branch.
 
-=head2 run-settled / drain-events
+=head2 run-settled / drained-settled / drain-events
 
 C<run-settled> B<polls> C<is-done> rather than awaiting the result
 Promise, and C<drain-events> taps the event Supply exactly B<once>. Both
@@ -125,12 +166,21 @@ already-finished stream never receives the C<done> it is waiting for. So:
 poll for completion, tap once, and give up loudly after
 C<TIMEOUT> seconds instead of hanging the suite.
 
+C<drained-settled> is the same shape for C<$run.drained>: it waits for
+the run to stop B<producing>, which on a cancelled run is later than
+C<run-settled> — a detached tool batch keeps a run undrained long after
+its result was kept. Use it when the assertion afterwards is about what
+did B<not> happen (no stray event, no cancelled response), because
+"nothing else arrived" is only worth asserting once nothing else can.
+
 =end pod
 
 use JSON::Fast;
 
 use LLM::Chat::Backend;
 use LLM::Chat::Backend::Response;
+use LLM::Chat::Backend::Response::OpenRouter;
+use LLM::Chat::Backend::Response::OpenRouter::Stream;
 use LLM::Chat::Backend::Response::Stream;
 use LLM::Chat::Backend::Settings;
 use LLM::Chat::Conversation::Message;
@@ -168,6 +218,16 @@ my sub hashes-or-die(@items, Str:D $what --> List) {
 	}
 
 	@items.List;
+}
+
+# A per-call knob: by call id first, then by tool name. Undefined when
+# neither is set, which is what `with` at the call site tests.
+my sub per-call(%knob, Str:D $id, Str:D $name) {
+	# NB the parens: an `:exists` adverb after `&&` tries to adverb the
+	# `&&` itself, and the file stops compiling several lines from here.
+	return %knob{$id} if $id.chars && (%knob{$id}:exists);
+	return %knob{$name} if $name.chars && (%knob{$name}:exists);
+	Nil;
 }
 
 #| A Message, briefly. Extra named arguments (C<:sticky>, C<:sysprompt>,
@@ -269,6 +329,16 @@ class ScriptedBackend is LLM::Chat::Backend is export {
 		};
 	}
 
+	# The keys of a step's `usage` that only an OpenRouter-flavoured
+	# Response can carry. Their presence is what decides which Response
+	# class a step gets — see `!response-class`.
+	my constant OR-USAGE-KEYS = <cost generation-id provider-name>;
+
+	my sub scripts-or-usage(%step --> Bool:D) {
+		return False unless %step<usage> ~~ Associative;
+		so OR-USAGE-KEYS.first({ %step<usage>{$_}.defined });
+	}
+
 	# Everything a step says about a finished call, applied in the order
 	# the Response contract wants: metadata first, terminal state last.
 	method !apply-outcome($resp, %step --> Nil) {
@@ -292,6 +362,21 @@ class ScriptedBackend is LLM::Chat::Backend is export {
 			%args<total>      = %usage<total>.Int      if %usage<total>.defined;
 			%args<model>      = (%usage<model> // $!model).Str;
 			$resp._set-usage(|%args);
+
+			# The provider-specific half, through the real OpenRouter
+			# setter on the real OpenRouter Response subclass — which is
+			# what the loop probes for with `.?cost`. A step that scripts
+			# none of these gets a plain Response, so both sides of that
+			# probe are exercised by ordinary tests.
+			if scripts-or-usage(%step) && $resp.can('_set-or-usage') {
+				my %or;
+				%or<cost>          = %usage<cost>.Num if %usage<cost>.defined;
+				%or<generation-id> = %usage<generation-id>.Str
+					if %usage<generation-id>.defined;
+				%or<provider-name> = %usage<provider-name>.Str
+					if %usage<provider-name>.defined;
+				$resp._set-or-usage(|%or);
+			}
 		}
 	}
 
@@ -317,8 +402,13 @@ class ScriptedBackend is LLM::Chat::Backend is export {
 		--> LLM::Chat::Backend::Response::Stream
 	) {
 		my $id = 'scripted-stream-' ~ ($!calls + 1);
-		my $resp = LLM::Chat::Backend::Response::Stream.new(:$id);
 		my %step = self!take-step(@messages, @tools, 'stream', $id);
+		# The OpenRouter-flavoured Response only when the step needs it:
+		# a plain step must keep producing exactly the Response every
+		# other test in this suite was written against.
+		my $resp = scripts-or-usage(%step)
+			?? LLM::Chat::Backend::Response::OpenRouter::Stream.new(:$id)
+			!! LLM::Chat::Backend::Response::Stream.new(:$id);
 
 		start {
 			CATCH {
@@ -378,8 +468,10 @@ class ScriptedBackend is LLM::Chat::Backend is export {
 		--> LLM::Chat::Backend::Response
 	) {
 		my $id = 'scripted-blocking-' ~ ($!calls + 1);
-		my $resp = LLM::Chat::Backend::Response.new(:$id);
 		my %step = self!take-step(@messages, @tools, 'blocking', $id);
+		my $resp = scripts-or-usage(%step)
+			?? LLM::Chat::Backend::Response::OpenRouter.new(:$id)
+			!! LLM::Chat::Backend::Response.new(:$id);
 
 		die 'ScriptedBackend: `stall` is a streaming-only step key — a '
 			~ 'blocking call cannot stall without hanging the suite'
@@ -436,6 +528,16 @@ class ScriptedProvider is export {
 	#| something that has not happened yet.
 	has Promise $.block-on;
 
+	#|( Seconds a single call sleeps before answering, keyed by call id or
+	    tool name (id wins). A tool that takes a while, without a clock
+	    seam anywhere. )
+	has %.latency;
+
+	#|( A Promise a single call waits on before answering, keyed by call id
+	    or tool name (id wins). C<block-on> gates a batch; this gates one
+	    call inside it. )
+	has %.block-call;
+
 	#| One entry per batch, each the calls it received.
 	has @.recorded-batches;
 	#| Every call of every batch, flattened, in order.
@@ -474,7 +576,11 @@ class ScriptedProvider is export {
 
 		await $!block-on with $!block-on;
 
-		@tool-calls.map({ self!answer($_) }).List;
+		# `.eager`, deliberately: a `.map(...).List` is LAZY, and a lazy
+		# provider does its work wherever the caller happens to reify it —
+		# which for an agent loop is the one thread that was supposed to be
+		# watching the clock. The real bridges are eager; so is this.
+		@tool-calls.map({ self!answer($_) }).eager.List;
 	}
 
 	method !answer($call --> Hash:D) {
@@ -494,6 +600,17 @@ class ScriptedProvider is export {
 			content => 'Malformed tool call: no function name',
 			is_error => True,
 		} unless $name.chars;
+
+		# Per-call gate and per-call latency, in that order: a call that is
+		# blocked has not started taking its time yet. Both are looked up
+		# by id first so a test can single out one call of several that ask
+		# for the same tool.
+		with per-call(%!block-call, $id, $name) -> $gate {
+			await $gate;
+		}
+		with per-call(%!latency, $id, $name) -> $seconds {
+			sleep $seconds if $seconds > 0;
+		}
 
 		my $answer;
 		my $threw;
@@ -548,6 +665,14 @@ class ScriptedProviderWithGrants is ScriptedProvider is export {
 	method add-grant(%grant --> Nil) {
 		$!grant-lock.protect: { @!grants.push: %grant.Hash };
 	}
+
+	#|( Swap the snapshot for a different one, as a policy narrowing or
+	    replacing a rule does. The case worth having a method for is the
+	    one where the C<elems> do not change: a loop that decided whether
+	    to persist by counting would never notice it. )
+	method replace-grants(@grants --> Nil) {
+		$!grant-lock.protect: { @!grants = @grants.map({ $_.Hash }) };
+	}
 }
 
 #|( Wait for a Run to finish, by POLLING C<is-done> — never by awaiting a
@@ -557,6 +682,19 @@ sub run-settled(LLM::Agent::Run:D $run, Str:D $what = 'the run') is export {
 	my $deadline = now + TIMEOUT;
 	until $run.is-done {
 		die "Timed out after {TIMEOUT}s waiting for $what" if now > $deadline;
+		sleep 0.002;
+	}
+	$run;
+}
+
+#|( Wait for a Run to go quiet — C<$run.drained>, polled the same way and
+    for the same reason C<run-settled> polls C<is-done>. A cancelled run
+    reaches C<is-done> while a detached tool batch is still running; this
+    is what waits for that. Returns the Run. )
+sub drained-settled(LLM::Agent::Run:D $run, Str:D $what = 'the run') is export {
+	my $deadline = now + TIMEOUT;
+	until $run.drained.status === Kept {
+		die "Timed out after {TIMEOUT}s waiting for $what to drain" if now > $deadline;
 		sleep 0.002;
 	}
 	$run;

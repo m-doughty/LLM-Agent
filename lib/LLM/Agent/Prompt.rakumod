@@ -169,9 +169,31 @@ C<tool-docs(@tools)> without first checking whether there are any tools.
 An empty C<$identity> throws: an agent with no identity is a
 misconfiguration, not a style choice.
 
+=head3 What a baked prompt fossilizes
+
+C<assemble> produces a B<sticky> message, and a sticky message that
+reaches a session is written to the transcript, digest-locked by
+L<LLM::Agent::Loop>'s seed check and replayed verbatim by every resume
+afterwards. That is exactly right for identity, and exactly wrong for
+everything C<env-block> and C<instructions-from-files> put beside it: a
+transcript resumed in October opens with August's date, August's tool
+catalogue and August's C<AGENTS.md>, and nothing in the system will ever
+correct it.
+
+So: bake what is true for the life of the conversation, and pass what is
+true B<today> as a L<LLM::Agent::RunContext> instead
+(C<< $loop.run(@messages, :$context) >>) — same section strings, same
+functions, rendered into the request per run rather than into the
+conversation once. An app that has moved to a context entirely sends B<no>
+system message at all and calls C<assemble> not at all;
+C<instructions-from-files> and C<env-block> are just as useful feeding a
+context's sections and facts.
+
 =head1 SEE ALSO
 
-L<LLM::Chat::Conversation::Message>, C<LLM::Agent::Loop>.
+L<LLM::Chat::Conversation::Message>, C<LLM::Agent::Loop>,
+L<LLM::Agent::RunContext> (the refreshable half, and why a baked prompt
+cannot be it).
 
 =end pod
 

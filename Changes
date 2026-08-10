@@ -2,6 +2,192 @@ Revision history for LLM::Agent
 
 {{$NEXT}}
 
+0.4.0  2026-08-10T20:17:25+01:00
+    - New LLM::Agent::Subagents: a tool provider that delegates. It
+      stacks over another provider the way MCP::Client::Registry and
+      MCP::Client::Policy do — same duck-typed tools-for-llm /
+      execute-tool-calls pair — publishes that provider's catalogue plus
+      a `task` tool whose agent-type is an enum of the types it was
+      built with, and answers a task call with a CHILD agent run's final
+      message. How a child is built is entirely the app's: `spawn` is
+      called with { agent-id, type, prompt, label } and hands back
+      anything with `.run` (an LLM::Agent::Run, already started) and
+      `.session-path`. There is deliberately no dependency on a queue or
+      a scheduler — an app that wants one wraps the callback.
+    - The child's events are not merged into the parent's stream, they
+      are WRAPPED: one new event, LLM::Agent::Event::Subagent (kind
+      'subagent', payload agent-id / agent-type / label? / inner),
+      carrying the child event's .to-hash as `inner`. The wrapper is
+      stamped with the PARENT's run-id and seq; the inner hash keeps the
+      child's. A Subagent event is never terminal, whatever the child
+      emitted, so a child completing cannot end the parent's Supply or
+      stop a consumer that quits on a terminal.
+    - New Loop.emit-external(Event): the public seam a layer above the
+      loop publishes through. Stamps and mailboxes the event like the
+      driver's own, is safe from any thread, and answers False rather
+      than throwing when there is no live run or the run has finished —
+      a child still winding down after its parent ended is ordinary, not
+      an error. It cannot wedge `drained` (the work section it opens is
+      closed by a LEAVE, and a refused ticket opens none), and it dies
+      on a terminal event, because only _finish can keep the result
+      Promise.
+    - Two guards, both refusing in words the model can act on rather
+      than by throwing: an identical-spawn cap over the (agent-type,
+      prompt) digest — canonicalised, so key order and JSON whitespace
+      are not identity, mirroring the loop's identical-call guard — and
+      a max-live backstop that refuses while `max-live` children are
+      running and tells the model to wait. Both checks and the child's
+      slot reservation happen in one critical section, so two spawns
+      arriving at once cannot both take the last slot.
+    - Cancelling the parent cascades to every live child: the first
+      spawn of a run registers on that run's cancellation Promise. A
+      cancelled child settles its task call as an is_error rather than
+      leaving the batch hanging. cancel-children is the same thing for a
+      shutdown path; live-agents is what a UI renders while they run.
+    - Two new session envelope types on the PARENT's transcript, written
+      through append-event and therefore ignored by every older reader:
+      'subagent-spawned' { agent-id, agent-type, prompt, label,
+      child-path } and 'subagent-settled' { agent-id, outcome, result,
+      spent? }. child-path is a pointer, not a copy: replaying a parent
+      session needs none of the children's files. Both writes are
+      shielded — a transcript that cannot take an audit record never
+      fails a working tool call; the failure becomes a Log event.
+    - LLM::Agent::Subagents.new answers with a ::WithGrants subclass
+      when the inner provider has grants, so .can('grants') stays honest
+      in both directions: a composer that always had it would make the
+      loop persist grants for a stack with none, and one that never had
+      it would silently break grant persistence for a policy underneath.
+
+0.3.0  2026-08-10
+    - New LLM::Agent::RunContext: the refreshable half of a prompt —
+      identity, instruction files, and facts like the date, the working
+      directory and the git HEAD — rendered into the REQUEST per run
+      rather than baked into a sticky system message. Loop.run gains an
+      optional :$context; the wire view is [head, |@conversation, tail]
+      and is built in exactly one place. @conversation itself never
+      contains the context, so the seed check, the session appends, the
+      compactor, RunStarted.message-count and %outcome<messages> are all
+      unchanged — which is what lets a resumed session send TODAY's date
+      and today's AGENTS.md instead of replaying the ones the transcript
+      was created with. Facts are an ordered List of Pairs and a Hash is
+      refused at construction: randomised hash order would render
+      differently per process while the (sorted-key) digest stayed
+      identical. Head/tail split is for prefix caching — volatile blocks
+      near index 0 re-prefill the whole conversation every request.
+    - New session envelope type 'run-context': one line per run that had
+      a context, carrying its digest, its facts in render order, and its
+      sections. Section bodies are stored ONCE per transcript and
+      back-pointed to afterwards (rendered-in), which keeps an unchanged
+      AGENTS.md from being written a hundred times; Session.run-contexts,
+      .last-run-context and .run-context-section(digest) read them back,
+      and an unresolvable back-pointer (a crash-tail repair removed the
+      carrying line) answers with an undefined Str rather than dying. No
+      envelope version bump: an older reader skips it as an unknown type.
+      BREAKING, narrowly: 'run-context' is now a built-in type, so
+      append-event refuses it — an app that was writing a custom line of
+      that name must rename it or use append-run-context.
+    - TokenCount gains count-text (how big a lump of text is, weighed as
+      one message) and invalidate (drop what has been learned). The loop
+      weighs the rendered context as TEXT and adds it as its own term to
+      the preflight's needed AND usable and to the compaction trigger —
+      never by counting the wire view, which would make Usage throw its
+      calibration away every round. A run whose context digest differs
+      from the previous run's calls invalidate once: a calibration billed
+      against yesterday's context describes a prompt nobody is sending.
+    - RunStarted gains an optional context-digest payload key, present
+      only when the run was given a context.
+    - The preflight error string now names the context term explicitly
+      ("... + context 0 + margin ..."), so the sum stays checkable.
+    - RunContext tells a caller who wrote `facts => (date => 'x')` that
+      it was handed a single Pair — a Pair does the Associative role, so
+      it used to get the (wrong, unactionable) "was given a Hash"
+      explanation instead of "add the comma".
+    - Prompt's Pod now says outright that an `assemble`d prompt
+      fossilizes on every resume of the transcript it reaches, and points
+      at RunContext for the half that should not.
+
+0.2.0  2026-08-10T04:05:00+01:00
+    - New durable ToolOperation layer: every dispatched tool call gets a
+      tool-dispatched / tool-settled pair of session envelopes,
+      pending-tool-operations and resolve-tool-operation read the
+      surviving state back, and outcomes distinguish the three things a
+      SIGKILL can leave behind — never-dispatched, dispatched-still-
+      running and completed-unpersisted. Tool calls in one assistant
+      turn now dispatch sequentially, one at a time, rather than as an
+      atomic batch. BEHAVIOR CHANGE: side effects happen in strict model
+      order, batch atomicity is gone, and a permission ask can now
+      interleave with execution of calls either side of it. A new
+      tool-deadline yields outcome-unknown — never is_error — so a
+      human taking their time over an ask is not treated as a tool
+      failure; idempotency-rules config records what a repair may
+      honestly retry.
+    - Events v2: TurnCommitted, TurnDiscarded(reason), ToolStarted,
+      ToolProgress and ToolAbandoned(reason, dispatched) join the event
+      vocabulary, and ToolResult now carries artifact metadata when its
+      result was too big for the conversation.
+    - New LLM::Agent::RequestBudget: per-backend context-window
+      profiles, a per-attempt preflight that skips past a backend the
+      conversation will not fit without burning a retry on it, forced
+      targeted compaction (Compactor.compact gains :$target) and a
+      clean context-exhausted failure when there is no compactor to
+      try. A 400 that looks like a context overflow is best-effort
+      reclassified so the loop can advance instead of retrying the same
+      backend forever, cost is plumbed through from OpenRouter's
+      responses, and optional max-cost / max-total-tokens /
+      max-wall-clock caps end a run in RunFailed reason
+      'budget-exhausted'. The result Map gains spent.
+    - New LLM::Agent::Artifacts: a tool result too big to live in the
+      conversation is excerpted, with the full bytes written to a
+      <transcript-stem>.artifacts/ sidecar beside the session — replay
+      never needs the artifact file to exist.
+    - Grants are now persisted the moment the policy applies them, via
+      the new Policy.on-grant hook, replacing 0.1.1's snapshot watcher.
+    - Session.events returns true copies: mutating a returned envelope,
+      including its payload, can no longer reach the replayed state.
+
+0.1.1  2026-08-09T23:15:02+01:00
+    - Crash repair is now physical: a malformed final transcript line is
+      removed by an atomic byte-prefix rewrite+rename before the append
+      handle opens (was: warning-only, garbage stayed, second resume
+      died / first append after a real crash tail was silently
+      swallowed). Repair handles CRLF and mid-UTF-8-character
+      truncation; two bad tail lines still die.
+    - Session appends are validate -> write -> commit: a failed write no
+      longer leaves replayed state ahead of the file.
+    - Event publication is serialized through a per-run mailbox: every
+      event carries run-id + seq (contiguous, terminal last); nothing is
+      ever published after the terminal; a throwing subscriber loses
+      only its own event. BEHAVIOR CHANGE: the result Promise is now
+      kept BEFORE the terminal event is published (0.1.0 documented the
+      opposite order) — a terminal subscriber reading .result finds it
+      Kept.
+    - cancel on a finished run is a total no-op (no cancellation-vow
+      keep, no backend poke); the loop's active stream slot is
+      owner-tagged, so a stale handle can never cancel or clear a newer
+      run's stream. New: Run.drained Promise (producer quiescence;
+      diverges from .result under cancellation).
+    - Compaction now works sessionless (Session and Compactor
+      independently optional, tested as a matrix) and proves progress:
+      tokens-after must shrink, one tightened summarizer retry, then
+      hard-trim; an impossible-to-fit conversation ends in a clean
+      RunFailed with new reason 'context-exhausted' (RunFailed gains an
+      optional reason field, also in the result Map).
+    - Session seeding compares canonical per-message digests (role,
+      content, tool-calls, ids, sticky, sysprompt, depth) via the new
+      LLM::Agent::Canonical module — same-prose different-semantics
+      prefixes are rejected. TokenCount::Usage calibration is now
+      conversation- and backend-scoped (prefix digest + backend
+      identity; unrelated conversations and heterogeneous fallbacks no
+      longer inherit stale prefix costs).
+    - Tool sharp edges: identical-call guard canonicalizes JSON
+      arguments and counts within-batch duplicates; provider tool
+      results are forced onto the expected tool_call_id (mismatches
+      logged); always-* permission grants are persisted to the session
+      the moment the policy applies them (and on cancelled/failed
+      exits), compared by content digest rather than count; the session
+      duck-type is validated for append-compaction/append-grants at
+      construction.
+
 0.1.0  2026-08-09T20:36:12+01:00
     - Initial release: the engine behind a coding/tool-using agent — a
       streaming loop that calls tools through a duck-typed provider,
@@ -72,10 +258,6 @@ Revision history for LLM::Agent
       forward-declaration idiom, the log-level gotcha, a shared
       TokenCount instance), the resume recipe, and the cancellation
       truth table.
-    - MCP::Client and JSONL pins are LOCAL-ONLY until those two dists
-      are pushed: LLM::Agent must not be released to the ecosystem
-      before MCP::Client 0.2.0 and JSONL 0.1.3 are published, or its
-      dependency resolution will fail for everybody else.
 
 # Run the suite with:
 #   prove6 -Ilib -It/lib -I../LLM-Chat/lib -I../MCP-Client/lib \

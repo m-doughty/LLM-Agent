@@ -3,8 +3,9 @@ use lib 'lib', 't/lib';
 use JSON::Fast;
 use LLM::Agent::TokenCount;
 use LLM::Chat::Conversation::Message;
+use LLM::Agent::Canonical;
 
-plan 14;
+plan 19;
 
 sub msg(Str:D $role, Str:D $content = '', :@tool-calls) {
 	LLM::Chat::Conversation::Message.new(:$role, :$content, :@tool-calls);
@@ -108,6 +109,80 @@ subtest 'Exact: record-usage is a no-op it survives' => {
 	my $exact = LLM::Agent::TokenCount::Exact.new(counter => CountingShim.new);
 	lives-ok { $exact.record-usage(prompt-tokens => 10, message-count => 2) },
 		'the loop can tell any counter about usage without checking first';
+};
+
+# --- count-text and invalidate ----------------------------------------
+
+subtest 'count-text weighs a string as one message would weigh' => {
+	plan 4;
+
+	# What a run context is counted with: it goes into the REQUEST, not
+	# into the conversation, so it is weighed as text and never handed to
+	# count-messages.
+	my $h = LLM::Agent::TokenCount::Heuristic.new;
+	is $h.count-text('12345678'), $h.count-messages([msg('system', '12345678'),]),
+		'the heuristic agrees with itself: 8 chars / 4, plus the framing';
+	is $h.count-text(''), 8, 'an empty string still costs a message frame';
+
+	# The role's default is expressed in terms of count-messages, so any
+	# implementation gets a sensible answer without writing one.
+	my $shim = CountingShim.new;
+	is LLM::Agent::TokenCount::Exact.new(counter => $shim).count-text('hello'),
+		4242, 'an Exact counter answers through its tokenizer';
+	is $shim.seen.tail, 1, 'having been handed exactly one message';
+};
+
+subtest 'Usage: counting text does not touch the calibration' => {
+	plan 3;
+
+	# The trap this override exists for: the role's default would build a
+	# ONE-message array and count it, which on this class is "a prefix
+	# that is not the one I am calibrated against" — and that DROPS the
+	# calibration. Every run context weighed would cost a calibration.
+	my $fallback = LLM::Agent::TokenCount::Heuristic.new;
+	my $usage = LLM::Agent::TokenCount::Usage.new(:$fallback);
+	my @conversation = (msg('system', 'be good'), msg('user', 'hello there'));
+
+	$usage.record-usage(
+		prompt-tokens => 812, message-count => 2,
+		prefix-digest => messages-digest(@conversation), backend => 'm',
+	);
+
+	is $usage.count-text('some context block'),
+		$fallback.count-text('some context block'),
+		'text is weighed by the fallback';
+	is $usage.calibration<prompt-tokens>, 812,
+		'and the calibration is exactly where it was';
+	is $usage.count-messages(@conversation), 812,
+		'so the provider’s own number still answers for the conversation';
+};
+
+subtest 'invalidate drops what was learned, and nothing else has to' => {
+	plan 4;
+
+	my $usage = LLM::Agent::TokenCount::Usage.new;
+	my @conversation = (msg('system', 'be good'), msg('user', 'hello there'));
+	$usage.record-usage(
+		prompt-tokens => 812, message-count => 2,
+		prefix-digest => messages-digest(@conversation), backend => 'm',
+	);
+	is $usage.calibration<prompt-tokens>, 812, 'there is a calibration';
+
+	$usage.invalidate;
+	is $usage.calibration, {},
+		'and invalidate is what the loop calls when the run context changed '
+			~ 'under it — the number was billed for a prompt nobody is '
+			~ 'sending any more';
+	is $usage.count-messages(@conversation),
+		LLM::Agent::TokenCount::Heuristic.new.count-messages(@conversation),
+		'so the next count is an honest estimate';
+
+	# The other two learn nothing, so they have nothing to drop — and the
+	# loop must be able to call this on whatever it was handed.
+	lives-ok {
+		LLM::Agent::TokenCount::Heuristic.new.invalidate;
+		LLM::Agent::TokenCount::Exact.new(counter => CountingShim.new).invalidate;
+	}, 'the counters that never learned anything survive being told to forget';
 };
 
 # --- Usage ------------------------------------------------------------
@@ -227,6 +302,90 @@ subtest 'Usage: recalibrating replaces rather than accumulates' => {
 		'the newest report wins outright';
 	is $usage.count-messages(@conversation), 300,
 		'and the tail is empty again, so the answer is just P';
+};
+
+subtest 'Usage: a different conversation of the same length inherits nothing' => {
+	plan 5;
+
+	# The defect this pins: "at least N messages" was taken as proof that
+	# these were THOSE N messages, so a second run through a shared counter
+	# billed its preflight at the first run's prices.
+	my $fallback = LLM::Agent::TokenCount::Heuristic.new;
+	my $usage = LLM::Agent::TokenCount::Usage.new(:$fallback);
+
+	my @first = (msg('system', 'be good'), msg('user', 'hello there'));
+	$usage.record-usage(
+		prompt-tokens => 812, message-count => 2,
+		prefix-digest => messages-digest(@first),
+	);
+	is $usage.count-messages(@first), 812, 'the conversation it was billed for';
+
+	my @second = (msg('system', 'be good'), msg('user', 'something else'));
+	is $usage.count-messages(@second), $fallback.count-messages(@second),
+		'a DIFFERENT two-message conversation is estimated, not billed at 812';
+	is $usage.calibration, {},
+		'and the calibration is dropped rather than left to mislead the next '
+			~ 'call';
+
+	# Same prose, different semantics: the digest covers everything that
+	# survives a session round trip, so a grown tool_calls array counts.
+	my $usage2 = LLM::Agent::TokenCount::Usage.new(:$fallback);
+	my @plain = (msg('user', 'go on'), msg('assistant', 'right'));
+	$usage2.record-usage(
+		prompt-tokens => 500, message-count => 2,
+		prefix-digest => messages-digest(@plain),
+	);
+	my @with-calls = (
+		msg('user', 'go on'),
+		msg('assistant', 'right', tool-calls => [
+			{ id => 'c1', type => 'function',
+			  function => { name => 'fs_read', arguments => '{}' } },
+		]),
+	);
+	is $usage2.count-messages(@with-calls), $fallback.count-messages(@with-calls),
+		'an assistant turn that has grown a tool call is not the same prefix';
+
+	# And a report that says nothing about what it billed is still trusted,
+	# because there is nothing to check it against.
+	my $usage3 = LLM::Agent::TokenCount::Usage.new(:$fallback);
+	$usage3.record-usage(prompt-tokens => 700, message-count => 2);
+	is $usage3.count-messages(@second), 700,
+		'a calibration recorded without a digest is taken at its word';
+};
+
+subtest 'Usage: a fallback backend’s usage does not calibrate the primary' => {
+	plan 4;
+
+	my $fallback = LLM::Agent::TokenCount::Heuristic.new;
+	my $usage = LLM::Agent::TokenCount::Usage.new(:$fallback);
+	my @conversation = (msg('system', 'be good'), msg('user', 'hello there'));
+	my $digest = messages-digest(@conversation);
+
+	$usage.record-usage(
+		prompt-tokens => 812, message-count => 2,
+		prefix-digest => $digest, backend => 'primary-model',
+	);
+	is $usage.calibration<backend>, 'primary-model',
+		'the calibration knows which model billed for it';
+
+	# The primary went down and the fallback served the next attempt —
+	# reporting nothing, as a local model or a mock does. The primary's
+	# number is not an estimate of what the fallback will charge.
+	$usage.record-usage(backend => 'fallback-model');
+	is $usage.calibration, {},
+		'a report from another backend drops the calibration even when it '
+			~ 'brings no numbers of its own';
+	is $usage.count-messages(@conversation), $fallback.count-messages(@conversation),
+		'so the preflight is an honest estimate rather than the primary’s '
+			~ 'price list';
+
+	# And a fallback that DOES report replaces rather than merges.
+	$usage.record-usage(
+		prompt-tokens => 120, message-count => 2,
+		prefix-digest => $digest, backend => 'fallback-model',
+	);
+	is $usage.count-messages(@conversation), 120,
+		'whoever billed last is who the calibration belongs to';
 };
 
 subtest 'Usage: any TokenCount can be the fallback' => {

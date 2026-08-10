@@ -1,0 +1,1040 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Canonical;
+use LLM::Agent::Compactor;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Agent::RequestBudget;
+use LLM::Agent::RunContext;
+use LLM::Agent::Session;
+use LLM::Agent::TokenCount;
+use LLM::Chat::Conversation::Message;
+
+# What fits, and what it costs. The preflight (per backend, before any
+# attempt framing), the forced compaction when nothing fits, the 400 that
+# is really a window, and the run caps — including the part that matters
+# most about them, which is that a dispatched tool call always settles
+# before one trips.
+
+plan 21;
+
+my @prompt = [msg('user', 'do the thing'),];
+
+my $tmp = $*TMPDIR.add("llm-agent-t14-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+# One token per character, no per-message overhead: every number in this
+# file is arithmetic a reader can check.
+sub counter(--> LLM::Agent::TokenCount) {
+	LLM::Agent::TokenCount::Heuristic.new(
+		chars-per-token => 1, per-message-overhead => 0,
+	);
+}
+
+sub profile(*%args --> LLM::Agent::RequestBudget::Profile) {
+	LLM::Agent::RequestBudget::Profile.new(|%args);
+}
+
+sub tools(--> List) {
+	(tool-decl('fs_read', 'Read a file', { path => { type => 'string' } }),);
+}
+
+# The attempt records a preflight skip leaves behind.
+sub skips(@attempts --> List) {
+	@attempts.grep({ ($_<disposition> // '') eq 'advance'
+		&& ($_<error> // '').starts-with('preflight:') }).List;
+}
+
+subtest 'a backend the request does not fit is skipped, not attempted' => {
+	plan 7;
+
+	# 600 characters of conversation, one backend with a 200-token window
+	# and one with 10,000. Nothing is sent to the first one at all.
+	my $small = scripted-backend(model => 'small', steps => []);
+	my $big = scripted-backend(
+		model => 'big', steps => [{ content => 'the answer' },],
+	);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$small, $big],
+		counter  => counter(),
+		request-budget => LLM::Agent::RequestBudget.new(profiles => {
+			small => profile(context-window => 200, completion-reserve => 50),
+			big   => profile(context-window => 10_000, completion-reserve => 50),
+		}),
+	);
+
+	my $run = $loop.run([msg('user', 'x' x 600),]);
+	run-settled($run, 'the skipping run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'completed', 'the run finished on the roomy backend';
+	is $small.recorded-calls.elems, 0,
+		'and the small one was never called — a preflight that refuses does '
+			~ 'not spend a request finding out';
+	is $big.recorded-calls.elems, 1, 'the big one served it';
+
+	# The framing half: no scope was opened for a backend nothing was sent
+	# to, so a consumer has nothing to retract.
+	is events-of(@events, 'attempt-started').elems, 1,
+		'exactly one attempt was STARTED — a skipped backend opens no token '
+			~ 'scope, because the framing is about transport';
+	is events-of(@events, 'attempt-failed').elems, 0,
+		'and no attempt FAILED — nothing was tried, so nothing failed';
+	is events-of(@events, 'attempt-started').head.backend-index, 1,
+		'the one attempt is against the second backend';
+
+	my @log = events-of(@events, 'log')
+		.grep({ .data ~~ Associative && .data<message>.contains('does not fit') });
+	is @log.elems, 1, 'and the skip is said out loud, once, as a log event';
+};
+
+subtest 'the skip is in the attempts, with the arithmetic that caused it' => {
+	plan 5;
+
+	my $small = scripted-backend(model => 'small', steps => []);
+	my $big = scripted-backend(
+		model => 'big', steps => [{ content => 'ok' },],
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$small, $big],
+		counter  => counter(),
+		request-budget => LLM::Agent::RequestBudget.new(profiles => {
+			small => profile(
+				context-window => 200, completion-reserve => 50,
+				input-safety-margin => 10,
+			),
+			big => profile(context-window => 10_000, completion-reserve => 50),
+		}),
+	);
+
+	# A failing run is the only way to read the attempts list, so make the
+	# second backend fail once it has been reached.
+	$big.steps = [
+		{ error => 'nope', 'error-class' => 'http', 'error-status' => 500 },
+	];
+	my $run = $loop.run([msg('user', 'x' x 600),]);
+	run-settled($run, 'the failing run');
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'failed', 'the chain ran out';
+	is skips(%outcome<attempts>).elems, 1, 'one of the attempts is a skip';
+
+	my %skip = skips(%outcome<attempts>).head;
+	is %skip<model>, 'small', 'naming the backend it was about';
+	# 600 messages + 0 tools + 0 context + 10 margin + 50 reserve = 660,
+	# window 200. The context term is always named, even at zero: a term
+	# that only appears when it is interesting is one a reader has to know
+	# about before they can miss it.
+	like %skip<error>,
+		/'preflight: needs ~660 (messages 600 + tools 0 + context 0 + margin 10 + reserve 50), window 200'/,
+		'and showing every term of the sum, so the number is checkable';
+	is %skip<disposition>, 'advance',
+		'the record carries its own disposition — there is no AttemptFailed '
+			~ 'beside it to say what the loop did';
+};
+
+subtest 'heterogeneous windows, in both directions' => {
+	plan 4;
+
+	# Big first, small second: the primary takes it, the fallback is never
+	# consulted at all.
+	my $big = scripted-backend(
+		model => 'big', steps => [{ content => 'from the big one' },],
+	);
+	my $small = scripted-backend(model => 'small', steps => []);
+
+	my %profiles =
+		big   => profile(context-window => 10_000, completion-reserve => 50),
+		small => profile(context-window => 200, completion-reserve => 50),
+	;
+
+	my $forward = LLM::Agent::Loop.new(
+		backends => [$big, $small], counter => counter(),
+		request-budget => LLM::Agent::RequestBudget.new(profiles => %profiles),
+	);
+	my $run = $forward.run([msg('user', 'x' x 600),]);
+	run-settled($run, 'the big-first run');
+	is (await $run.result)<final>, 'from the big one', 'the primary served it';
+	is $small.recorded-calls.elems, 0, 'and the small fallback was untouched';
+
+	# Small first: skipped, and the big one behind it answers. Same
+	# conversation, same budget, opposite order.
+	my $small2 = scripted-backend(model => 'small', steps => []);
+	my $big2 = scripted-backend(
+		model => 'big', steps => [{ content => 'from the fallback' },],
+	);
+	my $reverse = LLM::Agent::Loop.new(
+		backends => [$small2, $big2], counter => counter(),
+		request-budget => LLM::Agent::RequestBudget.new(profiles => %profiles),
+	);
+	my $run2 = $reverse.run([msg('user', 'x' x 600),]);
+	run-settled($run2, 'the small-first run');
+	is (await $run2.result)<final>, 'from the fallback',
+		'the fallback answers what the primary could not take';
+	is $small2.recorded-calls.elems, 0, 'without the primary being called';
+};
+
+subtest 'a backend nothing describes is never refused' => {
+	plan 2;
+
+	# No profile, no default profile: an unknown window is not a small
+	# one, and refusing a request nobody said anything about would be
+	# worse than sending it.
+	my $backend = scripted-backend(
+		model => 'undescribed', steps => [{ content => 'sent anyway' },],
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], counter => counter(),
+		request-budget => LLM::Agent::RequestBudget.new(profiles => {
+			'somebody-else' => profile(context-window => 10),
+		}),
+	);
+
+	my $run = $loop.run([msg('user', 'x' x 5_000),]);
+	run-settled($run, 'the undescribed run');
+	is (await $run.result)<final>, 'sent anyway',
+		'an undescribed backend is preflighted against nothing';
+	is $backend.recorded-calls.elems, 1, 'and really was called';
+};
+
+subtest 'the tool declarations count, and stop counting when tools do' => {
+	plan 3;
+
+	# A window that fits the conversation but not the conversation plus a
+	# tool catalogue. The first round is refused; the limit then switches
+	# tools off, and the same conversation fits.
+	my $backend = scripted-backend(
+		model => 'tight',
+		steps => [
+			# Round 1 never happens: the preflight refuses it.
+			{ content => 'answered with no tools' },
+		],
+	);
+	my $provider = ScriptedProvider.new(tools => tools());
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, counter => counter(),
+		request-budget => LLM::Agent::RequestBudget.new(profiles => {
+			tight => profile(
+				context-window => 100, completion-reserve => 10,
+				input-safety-margin => 0,
+			),
+		}),
+	);
+
+	# 60 characters of conversation. With the tool catalogue (which is
+	# well over 30 tokens at four characters each) it does not fit; on its
+	# own it does.
+	my $run = $loop.run([msg('user', 'x' x 60),]);
+	run-settled($run, 'the tools-too-big run');
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'failed',
+		'with tools declared the request does not fit';
+	is %outcome<reason>, 'context-exhausted', 'and says why';
+
+	# The same loop, the same conversation, no provider: nothing but the
+	# messages to count, and it fits.
+	my $bare-backend = scripted-backend(
+		model => 'tight', steps => [{ content => 'fits without tools' },],
+	);
+	my $bare = LLM::Agent::Loop.new(
+		backends => [$bare-backend,], counter => counter(),
+		request-budget => LLM::Agent::RequestBudget.new(profiles => {
+			tight => profile(
+				context-window => 100, completion-reserve => 10,
+				input-safety-margin => 0,
+			),
+		}),
+	);
+	my $bare-run = $bare.run([msg('user', 'x' x 60),]);
+	run-settled($bare-run, 'the toolless run');
+	is (await $bare-run.result)<final>, 'fits without tools',
+		'the same conversation fits once the declarations are gone — which '
+			~ 'is exactly what happens when a limit switches tools off';
+};
+
+subtest 'nothing fits: compact to the roomiest window, then it does' => {
+	plan 8;
+
+	my $counter = counter();
+	# With a session, so the id bookkeeping a compaction has to keep in
+	# step is exercised on this path too: the loop DIES if the ids it
+	# splices and the messages the compactor returns disagree.
+	my $path = $tmp.add('forced.jsonl');
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	# 5 turns of 200 characters: 1,000 tokens. One backend, a 700-token
+	# window with a 100-token reserve — so the usable room is 600 and the
+	# conversation has to lose 400.
+	my @conversation = (
+		msg('system', 'SY', sticky => True, sysprompt => True),
+		|(1 .. 5).map({ msg($_ %% 2 ?? 'assistant' !! 'user', 'm' ~ ('.' x 199)) }),
+	);
+
+	my $backend = scripted-backend(
+		model => 'only',
+		steps => [
+			{ content => 'THE SUMMARY' },        # the compaction, blocking
+			{ content => 'after compacting' },   # the round that then fits
+		],
+	);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, :$counter, context-budget => 700, keep-recent => 2,
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$counter, :$compactor, :$session,
+		request-budget => LLM::Agent::RequestBudget.new(profiles => {
+			only => profile(
+				context-window => 700, completion-reserve => 100,
+				input-safety-margin => 0,
+			),
+		}),
+	);
+
+	my $run = $loop.run(@conversation);
+	run-settled($run, 'the forced-compaction run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'completed',
+		'a conversation nothing would take is compacted and then sent';
+	is %outcome<final>, 'after compacting', 'by the same backend that refused it';
+	is events-of(@events, 'compaction-done').elems, 1,
+		'one compaction happened';
+	ok events-of(@events, 'compaction-done').head.tokens-after <= 600,
+		'and it aimed at the USABLE window (600), not at the compactor’s own '
+			~ 'target — the loop handed it the number it needed';
+	is events-of(@events, 'attempt-succeeded').elems, 1,
+		'exactly one attempt succeeded';
+	is events-of(@events, 'round-started').elems, 1,
+		'all of it inside ONE round: a forced compaction is a retry of the '
+			~ 'round trip, not a new round';
+
+	# The transcript, and the resume that has to work off it.
+	is $session.events.grep({ $_<type> eq 'compaction' }).elems, 1,
+		'the compaction is in the transcript, so a resumed run starts from '
+			~ 'the smaller conversation';
+	is $session.messages.map({ .role }).List,
+		%outcome<messages>.map({ .role }).List,
+		'and what it replays is what the run ended up with — the ids the '
+			~ 'loop spliced kept step with the messages the compactor '
+			~ 'returned';
+	$session.close;
+};
+
+subtest 'nothing fits and compaction cannot fix it: context-exhausted' => {
+	plan 4;
+
+	my $counter = counter();
+
+	# The recent window alone is bigger than the usable room, and a trim
+	# never eats into it. There is nothing left to try.
+	my @conversation = (
+		msg('system', 'SY', sticky => True, sysprompt => True),
+		msg('user', 'a' x 200),
+		msg('assistant', 'b' x 200),
+		msg('user', 'C' x 900),
+		msg('assistant', 'D' x 900),
+	);
+
+	my $backend = scripted-backend(
+		model => 'only',
+		steps => [
+			# The summarizer is unreachable, so this goes straight to a
+			# hard trim — the floor of what a compactor can do.
+			{ error => 'no', 'error-class' => 'http', 'error-status' => 403 },
+			{ content => 'this must never be asked for' },
+		],
+	);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, :$counter, context-budget => 1_500, keep-recent => 2,
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$counter, :$compactor,
+		request-budget => LLM::Agent::RequestBudget.new(profiles => {
+			only => profile(
+				context-window => 1_500, completion-reserve => 100,
+				input-safety-margin => 0,
+			),
+		}),
+	);
+
+	my $run = $loop.run(@conversation);
+	run-settled($run, 'the exhausted run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'failed', 'the run ends rather than sending it';
+	is %outcome<reason>, 'context-exhausted',
+		'under the name a program branches on';
+	is events-of(@events, 'attempt-started').elems, 0,
+		'having never opened an attempt — nothing was ever sent';
+	is events-of(@events, 'turn-discarded').elems, 0,
+		'and nothing was discarded, because nothing was streamed';
+};
+
+subtest 'nothing fits and there is no compactor: still context-exhausted' => {
+	plan 4;
+
+	# THE non-decorative pin. Before the request budget, a context-budget
+	# with no compactor did nothing at all: the doomed request went out
+	# and the provider explained. Now the run ends cleanly, having sent
+	# nothing.
+	my $backend = scripted-backend(model => 'only', steps => []);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], counter => counter(),
+		context-budget => 100,
+	);
+
+	my $run = $loop.run([msg('user', 'x' x 500),]);
+	run-settled($run, 'the uncompactable run');
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'failed', 'the run ends';
+	is %outcome<reason>, 'context-exhausted', 'with the same reason';
+	like %outcome<error>, /'no compactor'/,
+		'saying that making it smaller is the missing piece';
+	is $backend.recorded-calls.elems, 0,
+		'and the backend was never called at all';
+};
+
+subtest 'a 400 that is really a window advances; a plain 400 aborts' => {
+	plan 6;
+
+	# No request budget anywhere here: this is the seatbelt for the
+	# backend nobody described.
+	my $primary = scripted-backend(model => 'primary', steps => [
+		{ error => "This model's maximum context length is 8192 tokens",
+		  'error-class' => 'http', 'error-status' => 400 },
+	]);
+	my $fallback = scripted-backend(model => 'fallback', steps => [
+		{ content => 'the fallback took it' },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$primary, $fallback]);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the reclassified run');
+	my @events = drain-events($run);
+
+	is (await $run.result)<final>, 'the fallback took it',
+		'a context-length 400 advances the chain rather than ending the run';
+	my $failed = events-of(@events, 'attempt-failed').head;
+	is $failed.disposition, 'advance',
+		'and the AttemptFailed reports what the loop DID';
+	is $failed.error-status, 400, 'without pretending it was not a 400';
+
+	# The same status, a different sentence: an abort, exactly as before.
+	my $bad-key = scripted-backend(model => 'primary', steps => [
+		{ error => 'invalid model name', 'error-class' => 'http',
+		  'error-status' => 400 },
+	]);
+	my $unused = scripted-backend(model => 'fallback', steps => [
+		{ content => 'never reached' },
+	]);
+	my $strict = LLM::Agent::Loop.new(backends => [$bad-key, $unused]);
+	my $run2 = $strict.run(@prompt);
+	run-settled($run2, 'the aborting run');
+	my @events2 = drain-events($run2);
+
+	is (await $run2.result)<outcome>, 'failed',
+		'an ordinary 400 still ends the run';
+	is events-of(@events2, 'attempt-failed').head.disposition, 'abort',
+		'as an abort';
+	is $unused.recorded-calls.elems, 0,
+		'and the fallback is not tried — a 4xx will not heal in the next '
+			~ 'backend either, unless it is about the window';
+};
+
+subtest 'cost accumulates, and the result Map says what it spent' => {
+	plan 6;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'thinking',
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),],
+		  usage => { prompt => 100, completion => 20, cost => 0.02e0,
+			  'generation-id' => 'gen-1', 'provider-name' => 'Anthropic' } },
+		{ content => 'done',
+		  usage => { prompt => 200, completion => 30, cost => 0.03e0 } },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { fs_read => 'contents' },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider,
+		request-budget => LLM::Agent::RequestBudget.new(
+			default-profile => profile(context-window => 100_000),
+		),
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the billed run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	my %usage = events-of(@events, 'attempt-succeeded').head.usage;
+	is %usage<cost>, 0.02e0, 'the per-attempt cost rides AttemptSucceeded';
+	is %usage<generation-id>, 'gen-1', 'with the generation id';
+	is %usage<provider-name>, 'Anthropic', 'and who actually served it';
+
+	ok (%outcome<spent><cost> - 0.05e0).abs < 1e-9,
+		'the run adds them up: 0.02 + 0.03';
+	is %outcome<spent><total-tokens>, 350,
+		'and the tokens too, prompt and completion of every attempt';
+	ok %outcome<spent><wall-clock> >= 0, 'with the wall clock beside them';
+};
+
+subtest 'no budget, no spend: the result Map is the six keys it was' => {
+	plan 3;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'hi', usage => { prompt => 10, completion => 2 } },
+	]);
+	my $run = LLM::Agent::Loop.new(backends => [$backend,]).run(@prompt);
+	run-settled($run, 'the uncounted run');
+	my %outcome = await $run.result;
+
+	is %outcome.keys.sort,
+		['attempts', 'error', 'final', 'messages', 'outcome', 'reason'],
+		'a loop with nothing to count against reports no spend at all — '
+			~ 'absent is not the same answer as zero';
+	nok %outcome<spent>:exists, 'the key is not there';
+	is %outcome<outcome>, 'completed', 'and the run is otherwise unchanged';
+};
+
+subtest 'a cost that nobody reported is never counted as zero' => {
+	plan 2;
+
+	# A backend that prices nothing (a local model, a mock) leaves `cost`
+	# out of `spent` entirely, so a max-cost against it never trips.
+	my $backend = scripted-backend(steps => [
+		{ content => 'free', usage => { prompt => 10, completion => 2 } },
+	]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,],
+		request-budget => LLM::Agent::RequestBudget.new(
+			default-profile => profile(context-window => 100_000),
+			max-cost        => 0.01e0,
+		),
+	);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the unpriced run');
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'completed',
+		'an unreported cost cannot trip a cost cap';
+	nok %outcome<spent><cost>:exists,
+		'and does not appear in the spend at all';
+};
+
+subtest 'each cap trips, cleanly, and starts nothing after it' => {
+	plan 10;
+
+	sub capped-run(*%caps) {
+		my $backend = scripted-backend(steps => [
+			{ content => 'round one', delay => 0.15,
+			  usage => { prompt => 100, completion => 20, cost => 0.5e0 },
+			  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+			{ content => 'round two',
+			  usage => { prompt => 100, completion => 20, cost => 0.5e0 } },
+		]);
+		my $provider = ScriptedProvider.new(
+			tools => tools(), results => { fs_read => 'contents' },
+		);
+		my $loop = LLM::Agent::Loop.new(
+			backends => [$backend,], :$provider,
+			request-budget => LLM::Agent::RequestBudget.new(
+				default-profile => profile(context-window => 100_000),
+				|%caps,
+			),
+		);
+		my $run = $loop.run(@prompt);
+		run-settled($run, 'the capped run');
+		my %outcome = await $run.result;
+		%(
+			outcome  => %outcome,
+			events   => drain-events($run),
+			provider => $provider,
+		);
+	}
+
+	# Round one alone is over every one of these, so each cap is reached
+	# at the first boundary after it — the one between the round's attempt
+	# and its tool call.
+	my %cost = capped-run(max-cost => 0.5e0);
+	is %cost<outcome><outcome>, 'failed', 'a cost cap ends the run';
+	is %cost<outcome><reason>, 'budget-exhausted', 'under its own reason';
+	like %cost<outcome><error>, /'cost' .* '0.5'/,
+		'naming the cap, what was spent and what the limit was';
+
+	my %tokens = capped-run(max-total-tokens => 100);
+	is %tokens<outcome><reason>, 'budget-exhausted', 'so does a token cap';
+	like %tokens<outcome><error>, /'total-tokens'/, 'naming that one instead';
+
+	my %clock = capped-run(max-wall-clock => 0.1);
+	is %clock<outcome><reason>, 'budget-exhausted', 'and a wall-clock cap';
+	like %clock<outcome><error>, /'wall-clock'/, 'naming that one';
+
+	# Nothing is started after a cap is reached, and the call that was
+	# still queued is settled as the thing it really is.
+	is %cost<provider>.recorded-batches.elems, 0,
+		'the tool call the round asked for was never dispatched';
+	my @abandoned = events-of(%cost<events>, 'tool-abandoned');
+	is @abandoned.head.reason, 'budget-exhausted',
+		'it is abandoned, for the cap';
+	nok @abandoned.head.dispatched,
+		'and NOT dispatched — which is the strongest thing the loop can say '
+			~ 'about a call, and only true because the cap is checked at a '
+			~ 'boundary rather than inside an operation';
+};
+
+subtest 'a cap reached mid-batch still lets the running call settle' => {
+	plan 7;
+
+	# Two calls, and a wall-clock cap the FIRST one runs past. The cap is
+	# under the limit when call one is dispatched and over it by the time
+	# call one answers — so call one settles with a real result and call
+	# two, which nothing was ever handed, is abandoned.
+	my $backend = scripted-backend(steps => [
+		{ content => 'two things',
+		  usage => { prompt => 10, completion => 2 },
+		  'tool-calls' => [
+			tool-call('c1', 'fs_read', '{"path":"a"}'),
+			tool-call('c2', 'fs_read', '{"path":"b"}'),
+		  ] },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { fs_read => 'contents' },
+		# Comfortably longer than the cap, and the cap comfortably longer
+		# than everything before it: no clock seam needed, and no race.
+		latency => { c1 => 1.5 },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider,
+		request-budget => LLM::Agent::RequestBudget.new(
+			default-profile => profile(context-window => 100_000),
+			max-wall-clock  => 1.0,
+		),
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the mid-batch cap run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<reason>, 'budget-exhausted', 'the run ends on the cap';
+	is $provider.recorded-batches.elems, 1,
+		'exactly one call reached the provider';
+	is events-of(@events, 'tool-result').elems, 1,
+		'and it settled with a REAL result — a cap is a reason to stop '
+			~ 'starting things, never a reason to stop knowing what the last '
+			~ 'one did';
+	is events-of(@events, 'tool-result').head.id, 'c1', 'the one in flight';
+
+	my @abandoned = events-of(@events, 'tool-abandoned');
+	is @abandoned.elems, 1, 'the call behind it was abandoned';
+	is @abandoned.head.id, 'c2', 'that one, and only that one';
+	nok @abandoned.head.dispatched, 'never dispatched, so it did not run';
+};
+
+subtest 'a cap reached by the last tool call stops the next round' => {
+	plan 5;
+
+	# The other checkpoint. A batch's last operation settles and the for
+	# loop ends WITHOUT another boundary check — so the run would go round
+	# again on a cap it has already passed if the top of the round did not
+	# look too. One call, slow enough to cross the cap while it runs.
+	my $backend = scripted-backend(steps => [
+		{ content => 'one thing',
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+		{ content => 'this round must never start' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { fs_read => 'contents' },
+		latency => { c1 => 1.3 },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider,
+		request-budget => LLM::Agent::RequestBudget.new(
+			default-profile => profile(context-window => 100_000),
+			max-wall-clock  => 1.0,
+		),
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the last-call cap run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<reason>, 'budget-exhausted', 'the run ends on the cap';
+	is events-of(@events, 'tool-result').elems, 1,
+		'with the call that caused it settled';
+	is events-of(@events, 'tool-abandoned').elems, 0,
+		'nothing was abandoned — there was nothing behind it';
+	is $backend.recorded-calls.elems, 1,
+		'and the second round never made its request';
+	is events-of(@events, 'run-failed').head.round, 2,
+		'the round it refused to start is the one the failure names';
+};
+
+subtest 'the constructor refuses budgets that contradict each other' => {
+	plan 7;
+
+	throws-like {
+		LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => []),],
+			context-budget => 1_000,
+			request-budget => LLM::Agent::RequestBudget.new(
+				default-profile => profile(context-window => 2_000),
+			),
+		)
+	}, Exception, message => /'describe the same window'/,
+		'a context-budget and a default profile that disagree';
+
+	lives-ok {
+		LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => []),],
+			context-budget => 2_000,
+			request-budget => LLM::Agent::RequestBudget.new(
+				default-profile => profile(context-window => 2_000),
+			),
+		)
+	}, 'and the same two agreeing is fine';
+
+	lives-ok {
+		LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => []),],
+			context-budget => 2_000,
+			request-budget => LLM::Agent::RequestBudget.new(profiles => {
+				only => profile(context-window => 8_000),
+			}),
+		)
+	}, 'a budget with no default profile says nothing about the '
+		~ 'context-budget, and is not a contradiction';
+
+	my $counter = counter();
+	throws-like {
+		LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => []),],
+			:$counter,
+			compactor => LLM::Agent::Compactor.new(
+				backend => scripted-backend(steps => []),
+				:$counter, context-budget => 9_000,
+			),
+			request-budget => LLM::Agent::RequestBudget.new(profiles => {
+				small => profile(context-window => 4_000),
+			}),
+		)
+	}, Exception, message => /'still cannot take'/,
+		'a compactor that converges above the smallest declared window';
+
+	# The shorthand really does become a budget.
+	my $shorthand = LLM::Agent::Loop.new(
+		backends => [scripted-backend(steps => []),],
+		context-budget => 4_000,
+	);
+	ok $shorthand.request-budget.defined,
+		'a context-budget on its own synthesizes a request budget';
+	is $shorthand.request-budget.windows, (4_000,),
+		'of exactly that window';
+	is $shorthand.request-budget.profile-for('anything').input-safety-margin, 0,
+		'with no margin and no reserve, because context-budget is a '
+			~ 'statement about the window and nothing else';
+};
+
+subtest 'RequestBudget and Profile refuse nonsense on their own' => {
+	plan 10;
+
+	throws-like { profile(context-window => 0) },
+		Exception, message => /'context-window must be positive'/,
+		'a window of nothing';
+	throws-like { profile(context-window => 100, completion-reserve => -1) },
+		Exception, message => /'completion-reserve'/, 'a negative reserve';
+	throws-like { profile(context-window => 100, input-safety-margin => -1) },
+		Exception, message => /'input-safety-margin'/, 'a negative margin';
+	throws-like { profile(context-window => 100, completion-reserve => 100) },
+		Exception, message => /'nothing would ever fit'/,
+		'a reserve that is the whole window';
+
+	throws-like {
+		LLM::Agent::RequestBudget.new(profiles => { x => 'not a profile' })
+	}, Exception, message => /'not an'/, 'a profile that is not one';
+	throws-like {
+		LLM::Agent::RequestBudget.new(max-observation-size => 0)
+	}, Exception, message => /'max-observation-size'/,
+		'an observation size of nothing';
+	throws-like { LLM::Agent::RequestBudget.new(max-cost => -1e0) },
+		Exception, message => /'max-cost'/, 'a negative cost cap';
+
+	# `2.50` is a Rat, and so is every decimal a JSON config parses to: a
+	# Num constraint here would refuse the obvious way to write a cap.
+	# NB the variable: a `<key>` subscript on a leading-dot continuation
+	# line parses as a new term, and the file stops compiling.
+	my %rat-cap = LLM::Agent::RequestBudget.new(max-cost => 2.50)
+		.cap-tripped({ cost => 3 });
+	is %rat-cap<cap>, 'cost',
+		'a cost cap written as a decimal literal works';
+
+	# The reserve lookup: the profile's own number, or the backend's.
+	my $budget = LLM::Agent::RequestBudget.new;
+	my $backend = scripted-backend(steps => []);
+	is $budget.reserve-for(profile(context-window => 100, completion-reserve => 7),
+		$backend), 7, 'a profile that states a reserve keeps it';
+	is $budget.reserve-for(profile(context-window => 100_000), $backend),
+		$backend.settings.max_tokens,
+		'and one that does not takes what the backend says it will generate';
+};
+
+subtest 'a window that fits the conversation but not the context' => {
+	plan 8;
+
+	# THE arithmetic pin. A naive implementation adds the context to
+	# `needed` and forgets `usable`: the preflight then refuses, the forced
+	# compaction aims at a target the context immediately overflows, and a
+	# run that should have compacted once and carried on terminates
+	# context-exhausted instead.
+	#
+	# Window 1,000, reserve 400, margin 0, one token per character:
+	#
+	#   conversation      402  (a 2-char sticky prefix + 4 x 100)
+	#   context          ~316  (the rendered head and tail)
+	#   trigger           800  (0.8 of the compactor's 1,000)
+	#
+	# Without the context: 402 + 400 = 802, fits, and 402 is under the
+	# trigger — so nothing happens at all. With it: 718 needed + 400
+	# reserve = 1,118 against a 1,000 window, while 718 is still under the
+	# trigger, so the ONLY thing that can save the run is the preflight.
+	my $context = LLM::Agent::RunContext.new(
+		head-sections => [identity => 'I' x 10],
+		facts         => [date => '2026-08-10'],
+	);
+
+	sub conversation(--> List) {
+		(
+			msg('system', 'SY', sticky => True, sysprompt => True),
+			|(1 .. 4).map({ msg($_ %% 2 ?? 'assistant' !! 'user', 'm' x 100) }),
+		);
+	}
+
+	sub budgeted-loop($backend, $counter --> LLM::Agent::Loop) {
+		LLM::Agent::Loop.new(
+			backends => [$backend,], :$counter,
+			compactor => LLM::Agent::Compactor.new(
+				:$backend, :$counter, context-budget => 1_000, keep-recent => 2,
+			),
+			request-budget => LLM::Agent::RequestBudget.new(profiles => {
+				only => profile(
+					context-window => 1_000, completion-reserve => 400,
+					input-safety-margin => 0,
+				),
+			}),
+		);
+	}
+
+	# The arithmetic, checked rather than asserted: if the boilerplate in
+	# the tail block ever changes size, this says so here instead of
+	# failing somewhere baffling below.
+	my $c = counter();
+	my Int $context-tokens = $c.count-text($context.head-message.content)
+		+ $c.count-text($context.tail-message.content);
+	my Int $messages = $c.count-messages(conversation().List);
+	ok $messages + 400 <= 1_000,
+		"the conversation alone fits ($messages + 400 reserve, window 1,000)";
+	ok $messages + $context-tokens + 400 > 1_000,
+		"the conversation plus the context does not ($context-tokens tokens "
+			~ 'of context)';
+	ok $messages + $context-tokens <= 800,
+		'and the compaction trigger is not what catches it';
+
+	# The control: no context, nothing to do.
+	my $plain = scripted-backend(
+		model => 'only', steps => [{ content => 'sent as-is' },],
+	);
+	my $plain-run = budgeted-loop($plain, counter()).run(conversation().List);
+	run-settled($plain-run, 'the contextless run');
+	my @plain-events = drain-events($plain-run);
+	is (await $plain-run.result)<final>, 'sent as-is',
+		'without a context the request goes out untouched';
+	is events-of(@plain-events, 'compaction-done').elems, 0,
+		'having compacted nothing';
+
+	# And the same conversation, with the context that does not fit.
+	my $backend = scripted-backend(
+		model => 'only',
+		steps => [
+			{ content => 'THE SUMMARY' },        # the compaction, blocking
+			{ content => 'after compacting' },   # the round that then fits
+		],
+	);
+	my $run = budgeted-loop($backend, counter()).run(
+		conversation().List, :$context,
+	);
+	run-settled($run, 'the context-forced-compaction run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'completed',
+		'the run reaches a successful forced compaction rather than '
+			~ 'terminating context-exhausted';
+	is events-of(@events, 'compaction-done').elems, 1,
+		'exactly one compaction happened';
+
+	# The point of taking the context off `usable` too: the compaction has
+	# to aim at the room left for the CONVERSATION, and the context goes
+	# out with every request whatever the compactor does.
+	ok events-of(@events, 'compaction-done').head.tokens-after
+		<= 1_000 - 400 - $context-tokens,
+		'and it aimed at the window less the reserve AND the context';
+};
+
+subtest 'the context counts towards the compaction trigger' => {
+	plan 4;
+
+	# The other half of "the context is real weight": a conversation just
+	# under the trigger, plus a context, is over it. The window is huge
+	# here, so the preflight has nothing to say and the trigger is the only
+	# thing that can fire.
+	my $context = LLM::Agent::RunContext.new(facts => [date => '2026-08-10']);
+
+	sub conversation(--> List) {
+		(
+			msg('system', 'SY', sticky => True, sysprompt => True),
+			|(1 .. 7).map({ msg($_ %% 2 ?? 'assistant' !! 'user', 'm' x 100) }),
+		);
+	}
+
+	sub roomy-loop($backend, $counter --> LLM::Agent::Loop) {
+		LLM::Agent::Loop.new(
+			backends => [$backend,], :$counter,
+			compactor => LLM::Agent::Compactor.new(
+				:$backend, :$counter, context-budget => 1_000, keep-recent => 2,
+			),
+			request-budget => LLM::Agent::RequestBudget.new(profiles => {
+				only => profile(
+					context-window => 50_000, completion-reserve => 100,
+					input-safety-margin => 0,
+				),
+			}),
+		);
+	}
+
+	my $plain = scripted-backend(
+		model => 'only', steps => [{ content => 'no need' },],
+	);
+	my $plain-run = roomy-loop($plain, counter()).run(conversation().List);
+	run-settled($plain-run, 'the contextless run');
+	is events-of(drain-events($plain-run), 'compaction-done').elems, 0,
+		'702 tokens is under the 800-token trigger, so nothing compacts';
+
+	my $backend = scripted-backend(
+		model => 'only',
+		steps => [
+			{ content => 'THE SUMMARY' },
+			{ content => 'after compacting' },
+		],
+	);
+	my $run = roomy-loop($backend, counter()).run(conversation().List, :$context);
+	run-settled($run, 'the triggered run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'compaction-done').elems, 1,
+		'the same conversation plus a context is over it, and compacts';
+	is (await $run.result)<final>, 'after compacting', 'and the run carries on';
+
+	# NOT with a reduced target: `Compactor!unchanged` reports `exhausted`
+	# against the target it was given, so handing it one here would turn a
+	# benign compaction into a context-exhausted terminal.
+	isnt (await $run.result)<reason>, 'context-exhausted',
+		'the trigger path never passes a target, so a compaction that had '
+			~ 'little to drop is not a dead run';
+};
+
+subtest 'a calibration survives a run with a context, and one change ends it' => {
+	plan 6;
+
+	# The counter is calibrated against the CONVERSATION, never against
+	# the wire view — an array with two more messages in it would be a
+	# prefix Usage does not recognise, and it would throw the provider's
+	# own number away every round.
+	#
+	# ONE loop, five runs: the digest it compares against is the one the
+	# previous run of THIS loop used, which is exactly the long-lived
+	# engine an app builds once and drives per user turn.
+	my $counter = LLM::Agent::TokenCount::Usage.new;
+	my $context = LLM::Agent::RunContext.new(facts => [date => '2026-08-10']);
+	my $tomorrow = LLM::Agent::RunContext.new(facts => [date => '2026-08-11']);
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'one', usage => { prompt => 812, completion => 9 } },
+		{ content => 'two' },
+		{ content => 'three' },
+		{ content => 'four' },
+		{ content => 'five' },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$counter);
+
+	run-settled($loop.run(@prompt, :$context), 'the first context run');
+	is $counter.calibration<prompt-tokens>, 812,
+		'the provider’s figure reached the counter';
+	is $counter.calibration<message-count>, 1,
+		'recorded against the ONE message of the conversation, not against '
+			~ 'the three that went on the wire';
+
+	# The same context again: nothing to invalidate, so what was learned
+	# is still in force when the second run starts.
+	run-settled($loop.run(@prompt, :$context), 'the second context run');
+	is $counter.calibration<prompt-tokens>, 812,
+		'an unchanged context leaves the calibration alone';
+
+	# A different context: the 812 was billed for a request carrying the
+	# OTHER one, so it describes a prompt nobody is sending any more.
+	run-settled($loop.run(@prompt, context => $tomorrow), 'the changed run');
+	is $counter.calibration, {},
+		'a changed context drops it, exactly once, at the top of the run';
+
+	# ...and so does dropping the context altogether, for the same reason.
+	$counter.record-usage(
+		prompt-tokens => 500, message-count => 1,
+		prefix-digest => messages-digest(@prompt), backend => 'scripted-model',
+	);
+	run-settled($loop.run(@prompt), 'the contextless run');
+	is $counter.calibration, {},
+		'going from a context to none is a change like any other';
+
+	# And the control: two contextless runs in a row leave it alone.
+	$counter.record-usage(
+		prompt-tokens => 500, message-count => 1,
+		prefix-digest => messages-digest(@prompt), backend => 'scripted-model',
+	);
+	run-settled($loop.run(@prompt), 'the second contextless run');
+	is $counter.calibration<prompt-tokens>, 500,
+		'a run that changes nothing invalidates nothing';
+};
+
+subtest 'RoundStarted counts tokens for a budget with no compactor' => {
+	plan 2;
+
+	my $backend = scripted-backend(steps => [{ content => 'hi' },]);
+	my $run = LLM::Agent::Loop.new(
+		backends => [$backend,],
+		request-budget => LLM::Agent::RequestBudget.new(
+			default-profile => profile(context-window => 50_000),
+		),
+	).run(@prompt);
+	run-settled($run, 'the budgeted run');
+	my @events = drain-events($run);
+
+	ok events-of(@events, 'round-started').head.tokens > 0,
+		'a request budget is a budget: the round says how big the '
+			~ 'conversation is';
+	is (await $run.result)<outcome>, 'completed', 'and the run is fine';
+};

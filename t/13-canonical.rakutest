@@ -1,0 +1,188 @@
+use Test;
+use lib 'lib', 't/lib';
+use JSON::Fast;
+use LLM::Chat::Conversation::Message;
+use LLM::Agent::Canonical;
+
+# The comparison keys everything else leans on: "is this the same message,
+# the same conversation, the same snapshot?". What matters here is that
+# two things that ARE the same always agree, and that nothing which is
+# different quietly agrees with them.
+
+plan 8;
+
+sub msg(Str:D $role, Str:D $content = '', *%extra) {
+	LLM::Chat::Conversation::Message.new(:$role, :$content, |%extra);
+}
+
+sub call(Str:D $id, Str:D $name, Str:D $arguments = '{}' --> Hash) {
+	{
+		id => $id, type => 'function',
+		function => { name => $name, arguments => $arguments },
+	};
+}
+
+subtest 'canonical-json is stable, sorted, and total' => {
+	plan 5;
+
+	is canonical-json({ b => 1, a => { d => 1, c => 2 } }),
+		'{"a":{"c":2,"d":1},"b":1}',
+		'keys are sorted at every level, and there is no whitespace to differ in';
+
+	is canonical-json({ a => 1, b => 2 }), canonical-json({ b => 2, a => 1 }),
+		'so two hashes built in different orders render identically';
+
+	is canonical-json([1, 'two', True, Nil]), '[1,"two",true,null]',
+		'a list keeps its order — that IS its meaning — and an undefined '
+			~ 'value is null';
+
+	# The rule that makes this safe on the loop's hot path: whatever a
+	# provider hands back, there is an answer rather than an exception.
+	my $rendered = canonical-json({ when => DateTime.new(2026, 8, 9, 12, 0, 0) });
+	like $rendered, /'2026-08-09'/,
+		'something JSON has no opinion about is stringified, not thrown at';
+	ok from-json(canonical-json({ a => [1, { b => 2 }] })).defined,
+		'and what comes out is always JSON that parses again';
+};
+
+subtest 'canonical-arguments compares requests, not bytes' => {
+	plan 6;
+
+	is canonical-arguments('{"b":2, "a":1}'), canonical-arguments('{ "a" : 1,"b":2 }'),
+		'key order and whitespace are not part of what a call asks for';
+	isnt canonical-arguments('{"path":"a"}'), canonical-arguments('{"path":"b"}'),
+		'but the values certainly are';
+	is canonical-arguments({ b => 2, a => 1 }), canonical-arguments('{"a":1,"b":2}'),
+		'an already-decoded Hash and the string it came from agree';
+
+	is canonical-arguments('not json at all'), 'not json at all',
+		'arguments that are not JSON are their own key, verbatim';
+	is canonical-arguments(''), '', 'and so is nothing';
+	is canonical-arguments(Str), '',
+		'while a call that takes no arguments has an empty key rather than '
+			~ 'an undefined one';
+};
+
+subtest 'message-digest covers everything a transcript keeps' => {
+	plan 7;
+
+	my $base = msg('user', 'read the file');
+	is message-digest($base), message-digest(msg('user', 'read the file')),
+		'the same message, built twice, digests the same';
+	isnt message-digest($base), message-digest(msg('assistant', 'read the file')),
+		'the role is part of it';
+	isnt message-digest($base), message-digest(msg('user', 'read the OTHER file')),
+		'and so is the content';
+
+	# The four the old role-plus-content comparison could not see, and
+	# each of them changes what the next request means.
+	isnt message-digest(msg('assistant', 'reading')),
+		message-digest(msg('assistant', 'reading', tool-calls => [call('c1', 'fs_read'),])),
+		'an assistant turn that has grown a tool call is a different message';
+	isnt message-digest(msg('tool', 'hello', tool-call-id => 'c1')),
+		message-digest(msg('tool', 'hello', tool-call-id => 'c2')),
+		'a tool result answering another call is a different message';
+	isnt message-digest(msg('system', 'BE GOOD')),
+		message-digest(msg('system', 'BE GOOD', sticky => True)),
+		'stickiness decides whether compaction may eat it, so it counts';
+	isnt message-digest(msg('user', 'note')),
+		message-digest(msg('user', 'note', depth => 2)),
+		'as does depth';
+};
+
+subtest 'message-digest is not confused by how the tool calls arrived' => {
+	plan 2;
+
+	my $reordered = msg('assistant', 'reading', tool-calls => [
+		{ type => 'function', id => 'c1',
+		  function => { arguments => '{}', name => 'fs_read' } },
+	]);
+	is message-digest($reordered),
+		message-digest(msg('assistant', 'reading', tool-calls => [call('c1', 'fs_read'),])),
+		'the same call with its keys in another order is the same call';
+
+	isnt message-digest(msg('assistant', '', tool-calls => [call('c1', 'fs_read'),])),
+		message-digest(msg('assistant', '', tool-calls => [
+			call('c1', 'fs_read'), call('c2', 'fs_read'),
+		])),
+		'two calls are not one call';
+};
+
+subtest 'message-digest ignores nothing but the extras' => {
+	plan 2;
+
+	# `reasoning` and `usage` are session extras: they are replay-visible
+	# but they are not part of the message a model is sent, and a resumed
+	# run rebuilds Messages without them. A digest that counted them would
+	# refuse every resume.
+	my $message = msg('assistant', 'the answer');
+	my $rebuilt = msg('assistant', 'the answer');
+	is message-digest($message), message-digest($rebuilt),
+		'a message rebuilt from a transcript matches the one that was written';
+
+	# The checksum Message has of its own is not this: it memoises, and it
+	# leaves out the three stickiness fields.
+	my $sticky = msg('assistant', 'the answer', sticky => True);
+	is $sticky.get-checksum, $message.get-checksum,
+		'Message.get-checksum cannot tell those two apart — which is why '
+			~ 'this module exists';
+};
+
+subtest 'messages-digest is about the sequence' => {
+	plan 5;
+
+	my @conversation = (msg('system', 'be good'), msg('user', 'hello'));
+	is messages-digest(@conversation),
+		messages-digest([msg('system', 'be good'), msg('user', 'hello')]),
+		'the same conversation digests the same';
+
+	isnt messages-digest(@conversation),
+		messages-digest([msg('user', 'hello'), msg('system', 'be good')]),
+		'order is meaning: the same messages in another order is another '
+			~ 'conversation';
+
+	isnt messages-digest(@conversation),
+		messages-digest([|@conversation, msg('assistant', 'hi')]),
+		'and a conversation that has grown is not the one that was billed for';
+
+	is messages-digest([]), messages-digest([]),
+		'an empty conversation has a digest of its own';
+	isnt messages-digest([]), messages-digest(@conversation),
+		'which is not the digest of a conversation with something in it';
+};
+
+subtest 'data-digest is the same question about plain data' => {
+	plan 3;
+
+	my @grants = ({ tool => 'fs_read', decision => 'allow' },);
+	is data-digest(@grants),
+		data-digest([{ decision => 'allow', tool => 'fs_read' },]),
+		'a snapshot rebuilt with its keys in another order is the same snapshot';
+
+	# The case a count could not see, which is the whole reason the loop
+	# compares grants this way.
+	isnt data-digest(@grants),
+		data-digest([{ tool => 'fs_read', decision => 'deny' },]),
+		'a grant that was narrowed rather than added still changes it';
+	isnt data-digest(@grants),
+		data-digest([|@grants, { tool => 'fs_write', decision => 'allow' },]),
+		'and so, of course, does one that was added';
+};
+
+subtest 'every digest is a SHA-256 in hex, and none of them throw' => {
+	plan 4;
+
+	like message-digest(msg('user', 'x')), /^ <[0..9a..f]> ** 64 $/,
+		'a message digest is 64 hex characters';
+	like messages-digest([msg('user', 'x'),]), /^ <[0..9a..f]> ** 64 $/,
+		'so is a conversation digest';
+	like data-digest({ a => 1 }), /^ <[0..9a..f]> ** 64 $/, 'and a data digest';
+
+	# Nothing here may take a run down: a message whose tool calls are
+	# whatever a badly-behaved provider felt like still has a digest.
+	lives-ok {
+		message-digest(msg('assistant', 'odd', tool-calls => [
+			{ id => 'c1', function => { name => 'x', arguments => now } },
+		]));
+	}, 'even a tool call carrying something that is not plain data at all';
+};

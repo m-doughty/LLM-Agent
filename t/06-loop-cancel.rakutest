@@ -94,7 +94,7 @@ subtest 'cancelling during a backoff does not sit the backoff out' => {
 };
 
 subtest 'cancelling a blocked tool batch ends the run and ignores the results' => {
-	plan 8;
+	plan 13;
 
 	my $path = $tmp.add('blocked.jsonl');
 	my $session = LLM::Agent::Session.create(path => $path, meta => {});
@@ -128,6 +128,15 @@ subtest 'cancelling a blocked tool batch ends the run and ignores the results' =
 	is events-of(@events, 'tool-result').elems, 0,
 		'no ToolResult was emitted — nothing came back to report';
 
+	# What IS emitted instead, and what it says. The call was dispatched,
+	# so the loop refuses to claim it did not run.
+	my @abandoned = events-of(@events, 'tool-abandoned');
+	is @abandoned.elems, 1, 'the abandonment is an event of its own';
+	ok @abandoned[0].dispatched,
+		'saying the call HAD been dispatched, so its outcome is unknown '
+			~ 'rather than absent';
+	is @abandoned[0].reason, 'cancelled', 'and why the loop stopped waiting';
+
 	# Now let the batch finish, and give any straggler a chance to be
 	# wrong before believing it was not.
 	$gate.keep(True);
@@ -147,22 +156,31 @@ subtest 'cancelling a blocked tool batch ends the run and ignores the results' =
 		'which says what really happened rather than inventing a result';
 	is $replayed.messages[2].tool-call-id, 'c1',
 		'under the id of the call it answers, so the pairing is valid';
-	ok $replayed.events.first({
-		$_<type> eq 'message' && $_<payload><cancelled>
-	}).defined, 'and the transcript marks it as a cancellation, not a result';
+	my $tool-line = $replayed.events.first({
+		$_<type> eq 'message' && ($_<payload><tool-call-id> // '') eq 'c1'
+	});
+	ok $tool-line<payload><cancelled>,
+		'and the transcript marks it as a cancellation, not a result';
+	ok $tool-line<payload><outcome-unknown>,
+		'as an outcome that is UNKNOWN — the tool may well have written the '
+			~ 'file, and the transcript refuses to say otherwise';
+	nok $tool-line<payload><is-error>,
+		'and never as an error: a model told its write failed will write '
+			~ 'it again';
 
 	is $provider.recorded-calls.elems, 1,
 		'the call itself still ran — a tool already in flight has already '
 			~ 'happened, and this loop does not pretend otherwise';
 };
 
-subtest 'cancel is idempotent and safe after the run has finished' => {
-	plan 4;
+subtest 'cancel is idempotent, and a no-op once the run has finished' => {
+	plan 7;
 
 	my $backend = scripted-backend(steps => [{ content => 'done' },]);
 	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
 	my $run = $loop.run(@prompt);
 	run-settled($run, 'the finished run');
+	drained-settled($run, 'the finished run');
 
 	my %before = await $run.result;
 	lives-ok { $run.cancel for ^5 }, 'cancelling a finished run is harmless';
@@ -170,6 +188,17 @@ subtest 'cancel is idempotent and safe after the run has finished' => {
 
 	is %after<outcome>, 'completed', 'the outcome stands';
 	is %after<final>, %before<final>, 'and so does the answer';
+
+	# Harmless in the strong sense: not "it happened but changed nothing"
+	# but "it did not happen". The hook a cancel would have fired belongs
+	# to a driver that has already let go of everything it was driving.
+	nok $run.is-cancelled,
+		'a run that finished before the cancel is not a cancelled run';
+	is $run.cancellation.status, Planned,
+		'and its cancellation Promise is never kept after the fact';
+	is $backend.cancelled-responses.elems, 0,
+		'nothing was poked at the backend on behalf of a finished run';
+
 	is event-kinds(drain-events($run)).tail, 'run-completed',
 		'no second terminal was emitted';
 };

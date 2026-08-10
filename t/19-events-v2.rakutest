@@ -1,0 +1,314 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Agent::Session;
+use LLM::Chat::Conversation::Message;
+
+# Turns: committed and discarded. AttemptSucceeded says the transport
+# worked; it does not say the model's turn is part of the conversation,
+# and the two come apart often enough that a consumer needs telling. The
+# invariant this file exists for:
+#
+#   every AttemptSucceeded that is never followed by an AssistantMessage
+#   in the same round is followed by a TurnDiscarded.
+#
+# A UI that honours it can always retract streamed text on a signal,
+# instead of leaving it on screen until the next turn paints over it.
+
+plan 8;
+
+my @prompt = [msg('user', 'hello'),];
+
+my $tmp = $*TMPDIR.add("llm-agent-t19-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+sub wait-until(&condition, Str:D $what) {
+	my $deadline = now + TIMEOUT;
+	until &condition() {
+		die "Timed out after {TIMEOUT}s waiting for $what" if now > $deadline;
+		sleep 0.005;
+	}
+}
+
+#|( Check the invariant over a whole run, round by round. Returns a list
+    of complaints — empty is the pass. Deliberately written as a sweep
+    rather than as index arithmetic per test: the point is that it holds
+    everywhere, not that it holds in the one place somebody looked. )
+sub discard-complaints(@events --> List) {
+	my @complaints;
+	my @rounds;
+	my @current;
+
+	for @events -> $event {
+		@rounds.push: [@current.List] if $event.kind eq 'round-started' && @current;
+		@current.push: $event;
+	}
+	@rounds.push: [@current.List] if @current;
+
+	for @rounds.kv -> Int $index, @round {
+		my @kinds = @round.map({ .kind });
+		next unless @kinds.grep({ $_ eq 'attempt-succeeded' });
+		next if @kinds.grep({ $_ eq 'assistant-message' });
+
+		my @discarded = @round.grep({ .kind eq 'turn-discarded' });
+		@complaints.push:
+			"round $index streamed a successful attempt, committed nothing, "
+				~ "and emitted {@discarded.elems} turn-discarded events"
+			unless @discarded.elems == 1;
+	}
+
+	@complaints.List;
+}
+
+subtest 'a committed turn carries the id the transcript wrote it under' => {
+	plan 5;
+
+	my $path = $tmp.add('committed.jsonl');
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'reading',
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+		{ content => 'the answer' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [tool-decl('fs_read', 'Read a file'),],
+		results => { fs_read => 'contents' },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$session,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the two-round run');
+	my @events = drain-events($run);
+
+	my @committed = events-of(@events, 'turn-committed');
+	is @committed.elems, 2, 'one per committed assistant turn';
+	is @committed.map({ .round }).List, (1, 2), 'each naming its round';
+
+	# The join key. The first committed turn is the one that asked for the
+	# tool, and its id is what the tool-dispatched envelope sits under in
+	# the transcript.
+	my @message-ids = $session.events
+		.grep({ $_<type> eq 'message' && $_<payload><role> eq 'assistant' })
+		.map({ $_<id> });
+	is @committed.map({ .message-id }).List, @message-ids.List,
+		'and carrying the session envelope id of the message it committed';
+
+	my @kinds = event-kinds(@events);
+	ok @kinds.first({ $_ eq 'turn-committed' }, :k)
+		> @kinds.first({ $_ eq 'assistant-message' }, :k),
+		'the identity follows the content, so a consumer has the message '
+			~ 'before it is asked to stamp an id on it';
+	ok @kinds.first({ $_ eq 'turn-committed' }, :k)
+		< @kinds.first({ $_ eq 'tool-call' }, :k),
+		'and both come before the calls the turn asked for';
+
+	$session.close;
+};
+
+subtest 'a run that commits everything discards nothing' => {
+	plan 3;
+
+	my $backend = scripted-backend(steps => [
+		{ chunks => ['Paris', ', obviously.'] },
+	]);
+	my $run = LLM::Agent::Loop.new(backends => [$backend,]).run(@prompt);
+	run-settled($run, 'the happy run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'turn-discarded').elems, 0,
+		'nothing was thrown away';
+	is events-of(@events, 'turn-committed').elems, 1,
+		'and the one turn there was is committed';
+	is-deeply discard-complaints(@events), (),
+		'so the invariant holds trivially';
+};
+
+subtest 'a limit discards the turn it stopped, and says so' => {
+	plan 4;
+
+	my $backend = scripted-backend(steps => [
+		{ chunks => ['I will ', 'read it. '],
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+		{ content => 'answering from what I have' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [tool-decl('fs_read', 'Read a file'),],
+	);
+	my $run = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, max-tool-rounds => 0,
+	).run(@prompt);
+	run-settled($run, 'the limited run');
+	my @events = drain-events($run);
+
+	my @discarded = events-of(@events, 'turn-discarded');
+	is @discarded.elems, 1, 'exactly one turn was discarded';
+	is @discarded[0].reason, 'limit', 'because a limit stopped it';
+	is @discarded[0].round, 1, 'in the round it happened in';
+	is-deeply discard-complaints(@events), (),
+		'and the invariant holds across the whole run';
+};
+
+subtest 'a backend chain that runs out discards what it streamed' => {
+	plan 4;
+
+	# The tokens are already out: the backend failed after streaming half
+	# a sentence, and nothing will ever commit them.
+	my $backend = scripted-backend(steps => [
+		{ chunks => ['The answer is ', 'forty-'],
+		  'fail-after-chunks' => 2, error => 'upstream exploded',
+		  'error-class' => 'http', 'error-status' => 500 },
+	]);
+	my $run = LLM::Agent::Loop.new(
+		backends => [$backend,], max-retries => 1,
+	).run(@prompt);
+	run-settled($run, 'the failing run');
+	my @events = drain-events($run);
+
+	is (await $run.result)<outcome>, 'failed', 'the run failed';
+	my @discarded = events-of(@events, 'turn-discarded');
+	is @discarded.elems, 1, 'and said the turn was discarded';
+	is @discarded[0].reason, 'failed', 'naming the reason a consumer can act on';
+
+	my @kinds = event-kinds(@events);
+	ok @kinds.first({ $_ eq 'turn-discarded' }, :k)
+		< @kinds.first({ $_ eq 'run-failed' }, :k),
+		'before the terminal, so a UI can clear the half-sentence and then '
+			~ 'show the failure';
+};
+
+subtest 'a cancel mid-stream discards the turn it interrupted' => {
+	plan 4;
+
+	my $backend = scripted-backend(steps => [
+		{ chunks => ('a' .. 'z').List, 'chunk-delay' => 0.2 },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
+	my $run = $loop.run(@prompt);
+
+	wait-until { $backend.recorded-calls.elems >= 1 }, 'the stream to start';
+	$run.cancel;
+	run-settled($run, 'the cancelled run');
+	my @events = drain-events($run);
+
+	my @discarded = events-of(@events, 'turn-discarded');
+	is @discarded.elems, 1, 'the interrupted turn is explicitly discarded';
+	is @discarded[0].reason, 'cancelled', 'because the run was cancelled';
+	is events-of(@events, 'turn-committed').elems, 0,
+		'and nothing was committed';
+
+	is event-kinds(@events).tail, 'run-cancelled',
+		'with the terminal still last — the discard is not an event after '
+			~ 'the end';
+};
+
+subtest 'a cancelled tool round keeps its turn: it really was committed' => {
+	plan 3;
+
+	# The opposite case, and the reason the invariant is worded around
+	# AssistantMessage rather than around cancellation: this turn WAS
+	# committed, tool calls and all, and a UI that retracted it here would
+	# be hiding a message that is in the transcript.
+	my $gate = Promise.new;
+	my $backend = scripted-backend(steps => [
+		{ content => 'reading',
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+		{ content => 'never reached' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [tool-decl('fs_read', 'Read a file'),],
+		block-on => $gate,
+	);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$provider);
+	my $run = $loop.run(@prompt);
+
+	wait-until { $provider.recorded-batches.elems >= 1 }, 'the call to start';
+	$run.cancel;
+	run-settled($run, 'the cancelled tool round');
+	$gate.keep(True);
+	drained-settled($run, 'the detached call');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'turn-committed').elems, 1,
+		'the turn that asked for the tool was committed, and stays committed';
+	is events-of(@events, 'turn-discarded').elems, 0,
+		'so nothing is discarded — the cancel happened after the commit';
+	is-deeply discard-complaints(@events), (),
+		'and the invariant holds, because it is about commitment rather '
+			~ 'than about how the run ended';
+};
+
+subtest 'the invariant holds across a run that does all of it' => {
+	plan 3;
+
+	# Retry, fallback, a limit, a tool round and a final answer, in one
+	# run: the sweep is the assertion.
+	my $primary = scripted-backend(model => 'primary', steps => [
+		{ chunks => ['half a th'], 'fail-after-chunks' => 1,
+		  error => 'gateway timeout', 'error-class' => 'http',
+		  'error-status' => 504 },
+	]);
+	my $fallback = scripted-backend(model => 'fallback', steps => [
+		{ content => 'about to break the rules',
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+		{ content => 'the real answer' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [tool-decl('fs_read', 'Read a file'),],
+	);
+	my $run = LLM::Agent::Loop.new(
+		backends => [$primary, $fallback], :$provider,
+		max-retries => 1, max-tool-rounds => 0,
+	).run(@prompt);
+	run-settled($run, 'the everything run');
+	my @events = drain-events($run);
+
+	is (await $run.result)<final>, 'the real answer', 'the run got there';
+	is events-of(@events, 'turn-discarded').map({ .reason }).List, ('limit',),
+		'with exactly one discard — the limit. A failed ATTEMPT inside a '
+			~ 'round that goes on to succeed discards no turn: that is what '
+			~ 'attempt-failed already says';
+	is-deeply discard-complaints(@events), (),
+		'and the invariant holds over the lot';
+};
+
+subtest 'the events a discarded turn is framed by are still in order' => {
+	plan 3;
+
+	my $backend = scripted-backend(steps => [
+		{ chunks => ['I will ', 'read it. '],
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+		{ content => 'answering from what I have' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [tool-decl('fs_read', 'Read a file'),],
+	);
+	my $run = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, max-tool-rounds => 0,
+	).run(@prompt);
+	run-settled($run, 'the limited run');
+	my @kinds = event-kinds(drain-events($run));
+
+	my $limit-at = @kinds.first({ $_ eq 'limit-reached' }, :k);
+	my $discard-at = @kinds.first({ $_ eq 'turn-discarded' }, :k);
+	my $opened-at = @kinds[0 ..^ $limit-at]
+		.grep({ $_ eq 'attempt-started' }, :k).tail;
+
+	ok $opened-at < $limit-at < $discard-at,
+		'the scope opens, the limit fires, and THEN the turn is discarded';
+	is @kinds[$discard-at + 1], 'round-started',
+		'and the next thing that happens is the retry round the limit '
+			~ 'exists to allow';
+	is @kinds.grep({ $_ eq 'turn-discarded' }).elems, 1,
+		'exactly once, however many rounds follow';
+};

@@ -39,6 +39,35 @@ Every event carries the moment it was created (C<.ts>, an C<Instant>), a
 stable C<.kind> string, and knows how to flatten itself into plain data
 (C<.to-hash>).
 
+=head2 The envelope: run-id and seq
+
+An event that has been published by a L<LLM::Agent::Run> also carries the
+B<envelope> the Run stamped on it:
+
+=begin table
+
+Field  | What it is
+=======|==========================================================
+run-id | the id of the Run that published it
+seq    | its position in that run's publication order, 0-based
+
+=end table
+
+Both are stamped B<at publication>, on a clone, inside the Run's one
+critical section — so C<seq> is the total order of the run's events even
+though a token stream, a tool thread, an asker and a server's log hook all
+emit from threads of their own. It is contiguous (C<0 .. N> with no gaps),
+and the terminal event is always the last one, C<N>.
+
+What it is B<not> is a promise about which event is C<seq> 0: a log
+notification from an MCP server can legitimately beat the driver's own
+C<RunStarted> into the mailbox. Order is a fact about publication, not
+about causality.
+
+An event you built yourself and never handed to a Run has neither field,
+and C<to-hash> omits both — which is why a hand-built event still
+serialises exactly as it did before there was an envelope.
+
 =head2 The attempt-framing contract
 
 This is the part worth reading twice, because it is what makes a
@@ -84,7 +113,8 @@ is the same answer for code working from C<kind> strings.
 
 =head2 to-hash: plain data only
 
-C<.to-hash> returns C<kind>, C<ts>, and the event's payload keys,
+C<.to-hash> returns C<kind>, C<ts>, the envelope (C<run-id> and C<seq>,
+when the event has been published), and the event's payload keys,
 containing nothing but C<Str> / C<Int> / C<Num> / C<Rat> / C<Bool> /
 C<Hash> / C<List> — it round-trips through C<to-json> unchanged, which is
 what the JSONL transcript and any log sink need.
@@ -118,27 +148,37 @@ else.
 
 =head1 THE TAXONOMY
 
+Every row below also carries the two envelope fields C<run-id?> and
+C<seq?> — see L</The envelope: run-id and seq> — so they are not repeated
+per class.
+
 =begin table
 
 Class             | kind               | Payload
 ==================|====================|===================================================
-RunStarted        | run-started        | run-id, message-count
+RunStarted        | run-started        | message-count, context-digest?
 RoundStarted      | round-started      | round, tokens?
 AttemptStarted    | attempt-started    | round, attempt, backend-index, model
 Token             | token              | text, round?, attempt?
 AttemptFailed     | attempt-failed     | round, attempt, backend-index, model?, error, error-class?, error-status?, disposition, backoff?
 AttemptSucceeded  | attempt-succeeded  | round, attempt, backend-index, model-used?, finish-reason?, usage, latency-ms?
 AssistantMessage  | assistant-message  | message, reasoning?, round?
+TurnCommitted     | turn-committed     | message-id?, round?
 ToolCall          | tool-call          | id, name, arguments?, round?
-ToolResult        | tool-result        | id, name?, content, is-error, round?
+ToolStarted       | tool-started       | id, name, round?
+ToolProgress      | tool-progress      | id, progress, total?, message?, round?
+ToolResult        | tool-result        | id, name?, content, is-error, artifact?, round?
+ToolAbandoned     | tool-abandoned     | id, name, reason, dispatched, round?
+Subagent          | subagent           | agent-id, agent-type, label?, inner
 AskPending        | ask-pending        | request, tool?
 AskAnswered       | ask-answered       | request, answer?
 Log               | log                | level, logger?, data
 LimitReached      | limit-reached      | limit, count?, max?
+TurnDiscarded     | turn-discarded     | reason, round?
 CompactionStarted | compaction-started | tokens-before?, budget?, message-count?, round?
 CompactionDone    | compaction-done    | tokens-before?, tokens-after?, dropped?, summary?, fallback, round?
 RunCompleted      | run-completed      | final, rounds?, message-count?
-RunFailed         | run-failed         | error, attempts, round?
+RunFailed         | run-failed         | error, attempts, round?, reason?
 RunCancelled      | run-cancelled      | stage?, round?
 
 =end table
@@ -146,10 +186,107 @@ RunCancelled      | run-cancelled      | stage?, round?
 A C<?> marks an optional attribute — one whose key is absent from
 C<to-hash> when it was not supplied.
 
+=head2 Turns: committed, and discarded
+
+C<AttemptSucceeded> says B<the transport worked>. It does not say the
+model's turn is part of the conversation, and the two really do come
+apart: a turn that asks for tools when a limit has been reached is
+discarded whole (see L<LLM::Agent::Loop>), tokens and all.
+
+So a turn ends in exactly one of two events:
+
+=item B<C<TurnCommitted>> — beside the C<AssistantMessage>, carrying the
+B<session envelope id> of the committed message. That id is the join key
+between the conversation and the C<tool-dispatched> envelopes that follow
+it, which is why it is worth an event of its own; C<AssistantMessage>
+keeps the payload and the commit role it has always had.
+
+=item B<C<TurnDiscarded>> — every streamed scope that will never be
+followed by an C<AssistantMessage>: a limit discarded it (C<reason =>
+'limit'>), the backend chain ran out (C<'failed'>), or the run was
+cancelled mid-flight (C<'cancelled'>).
+
+The invariant a consumer may rely on: B<an C<AttemptSucceeded> that is
+never followed by an C<AssistantMessage> in the same round is always
+followed by a C<TurnDiscarded>>. A UI that renders streamed text can
+therefore always retract it on a signal rather than leaving it on screen
+until the next turn overwrites it.
+
+=head2 A tool call, event by event
+
+Five events frame one tool call, and they answer five different
+questions:
+
+=begin table
+
+Event         | The question it answers
+==============|===========================================================
+ToolCall      | what did the model ask for? (it is proposed)
+ToolStarted   | it has been handed to the provider (it is dispatched)
+ToolProgress  | it is still running, and here is how far
+ToolResult    | it answered — with a result, or with an error
+ToolAbandoned | it will not answer; here is what we know about whether it ran
+
+=end table
+
+C<ToolResult>'s C<content> is B<what the model was given>, which for a
+result bigger than C<< request-budget.max-observation-size >> is an
+excerpt rather than the whole thing — the same excerpt that went into the
+conversation and the transcript, with the full bytes in the file
+C<artifact> names. A consumer rendering a tool result is therefore
+rendering exactly what the model saw, and C<artifact> is how it offers to
+show the rest. See L<LLM::Agent::Artifacts>.
+
+C<ToolAbandoned> is the one to read twice. C<< dispatched => False >>
+means the call was B<never handed to the provider> and is known not to
+have run. C<< dispatched => True >> means it was, and then the loop
+stopped waiting — the outcome is genuinely B<unknown>, not failed.
+Nothing invents a C<ToolResult> for either case: a result event would
+tell a consumer the tool answered, and it did not.
+
 C<round> is 1-based. C<attempt> is 1-based B<within a round> and counts
 across backends: attempt 3 may be the first attempt against the second
 backend. C<disposition> is one of C<retry-same>, C<advance> or C<abort> —
-the buckets of L<LLM::Chat::Retry>'s C<classify-error>.
+the buckets of L<LLM::Chat::Retry>'s C<classify-error>. C<reason> is the
+named-failure key described on C<RunFailed>, and is present only for the
+failures that have a name.
+
+=head2 Subagent: a child run's event, carried on the parent's stream
+
+A run that spawns another run (L<LLM::Agent::Subagents>) has two event
+streams to reconcile, and merging them naively would be a disaster: two
+runs' C<seq> numbers interleaved in one order, two C<RunCompleted>s on a
+Supply that promises exactly one terminal, a consumer unable to tell
+whose C<Token> it is rendering.
+
+So a child's events are not merged — they are B<wrapped>. Each one is
+flattened with C<.to-hash> and carried as the C<inner> payload of a
+C<Subagent> event published on the B<parent's> stream, which stamps it
+with the parent's C<run-id> and the next parent C<seq> like any other
+event. Nothing about the parent's envelope contract moves:
+
+=begin table
+
+Layer   | run-id / seq            | kind
+========|=========================|=====================================
+outer   | the PARENT's            | always C<subagent>, never terminal
+inner   | the CHILD's, as stamped | whatever the child emitted
+
+=end table
+
+C<inner> is plain data, not an C<Event> object — it has already been
+through C<to-hash>, so a C<Subagent> event serialises to JSON in one
+step like every other event, and a consumer reads C<< $e.inner<kind> >>
+to dispatch on what the child did.
+
+Two consequences worth stating out loud. A C<Subagent> whose
+C<< inner<kind> >> is C<run-completed> is B<not> terminal: the child
+ended, the parent did not, and C<is-terminal> stays False so a consumer
+that stops tapping on a terminal does not stop halfway through the
+parent's run. And C<agent-id> — not the inner C<run-id> — is the key to
+group by when several children are running at once: it is short, it is
+what the transcript's C<subagent-spawned> envelope records, and it is
+stable across a child that had to be restarted.
 
 =head1 SEE ALSO
 
@@ -177,6 +314,14 @@ my subset AgentLogData where { $_ ~~ Str || $_ ~~ Associative };
 #| an already-decoded Hash. Undefined for a call that takes none.
 my subset AgentToolArgs where { !.defined || $_ ~~ Str || $_ ~~ Associative };
 
+#| Why a streamed assistant turn was thrown away rather than committed.
+my subset AgentDiscardReason of Str where * eq any('limit', 'failed', 'cancelled');
+
+#| Why a tool call will never answer. See ToolAbandoned: this says why the
+#| loop stopped, and C<dispatched> says whether the call can have run.
+my subset AgentAbandonReason of Str
+	where * eq any('cancelled', 'deadline', 'budget-exhausted');
+
 #|( The base of the taxonomy. Never emitted itself: C<kind> is a stub, so
     an event class that forgot to declare one fails loudly the first time
     anybody asks. )
@@ -184,6 +329,16 @@ class LLM::Agent::Event {
 	#| When the event was created, on the emitting thread. Subtracting two
 	#| gives a Duration in seconds.
 	has Instant:D $.ts = now;
+
+	#|( The Run that published this event, stamped by it. Undefined on an
+	    event that was built by hand and never emitted. )
+	has Str $.run-id;
+
+	#|( Position in the publishing Run's total order: 0-based, contiguous,
+	    terminal last. Stamped by the Run at publication, so it orders
+	    events from every thread that emitted into the run — see the
+	    envelope section of the module Pod. Undefined until published. )
+	has Int $.seq;
 
 	#| The kinds that end a run. Exactly one of these is emitted per run,
 	#| and the Supply is done straight afterwards.
@@ -205,12 +360,15 @@ class LLM::Agent::Event {
 	#| same format the session envelope stamps its lines with.
 	method ts-iso(--> Str:D) { DateTime.new($!ts, :timezone(0)).Str }
 
-	#|( The event as plain data: C<kind>, C<ts> (ISO-8601 UTC) and the
+	#|( The event as plain data: C<kind>, C<ts> (ISO-8601 UTC), the
+	    envelope (C<run-id> / C<seq>, when it has been published) and the
 	    payload keys, with undefined values omitted. Nothing but strings,
 	    numbers, booleans, hashes and lists comes out, so the result can go
 	    straight into C<to-json>. )
 	method to-hash(--> Hash:D) {
 		my %h = kind => self.kind, ts => self.ts-iso;
+		%h<run-id> = $!run-id if $!run-id.defined;
+		%h<seq>    = $!seq    if $!seq.defined;
 		for self.payload.pairs -> $pair {
 			%h{$pair.key} = $pair.value if $pair.value.defined;
 		}
@@ -225,17 +383,41 @@ class LLM::Agent::Event {
 	}
 }
 
-#| The run has started. Emitted before anything else, always exactly once.
+#|( The run has started: the driver's own first event, emitted exactly
+    once.
+
+    It has no C<run-id> attribute of its own — that is the envelope's, on
+    the base class, and a second one here would shadow it so that
+    C<< .new(run-id => ...) >> filled one and the Run stamped the other.
+    The driver still has to supply it (a C<RunStarted> that cannot say
+    which run started is useless in a shared log), which is what the
+    TWEAK below enforces. )
 class LLM::Agent::Event::RunStarted is LLM::Agent::Event {
-	#| The id of the Run this belongs to — the only thing that tells two
-	#| interleaved runs apart in a shared log.
-	has Str:D $.run-id is required;
 	#| How many messages the caller handed in.
 	has Int:D $.message-count is required;
 
+	#|( The digest of the L<LLM::Agent::RunContext> this run was given, or
+	    an undefined Str for a run that was given none. The B<key is
+	    absent> in that case rather than present and null: a run with no
+	    context and a run whose context is empty are different facts.
+
+	    Note it is not counted in C<message-count>. The context is
+	    rendered into the request and never into the conversation, so the
+	    count is of history and the digest is of everything else. )
+	has Str $.context-digest;
+
+	submethod TWEAK {
+		die 'LLM::Agent::Event::RunStarted: run-id is required — it is the '
+			~ 'only thing that tells two interleaved runs apart in a shared '
+			~ 'log'
+			unless self.run-id.defined;
+	}
+
 	method kind(--> Str:D) { 'run-started' }
 	method payload(--> Hash:D) {
-		{ run-id => $!run-id, message-count => $!message-count };
+		my %payload = message-count => $!message-count;
+		%payload<context-digest> = $!context-digest if $!context-digest.defined;
+		%payload;
 	}
 }
 
@@ -377,6 +559,44 @@ class LLM::Agent::Event::AssistantMessage is LLM::Agent::Event {
 	}
 }
 
+#|( The assistant turn is B<part of the conversation now>: it has been
+    appended and, when there is a session, written to it.
+
+    The identity-only complement to C<AssistantMessage>, which carries the
+    content. What this adds is C<message-id> — the session envelope's id —
+    which is the key that joins the committed turn to the
+    C<tool-dispatched> envelopes of the calls it asked for. A sessionless
+    run has no such id, and the key is simply absent. )
+class LLM::Agent::Event::TurnCommitted is LLM::Agent::Event {
+	#| The session envelope id of the committed assistant message.
+	#| Undefined — and absent from C<to-hash> — on a sessionless run.
+	has Str $.message-id;
+	has Int $.round;
+
+	method kind(--> Str:D) { 'turn-committed' }
+	method payload(--> Hash:D) {
+		{ message-id => $!message-id, round => $!round };
+	}
+}
+
+#|( The assistant turn that was streamed in this round B<is not> part of
+    the conversation: nothing was committed, nothing was written to the
+    session, and no C<AssistantMessage> is coming.
+
+    A consumer that renders live tokens must retract them here. See the
+    module Pod: every C<AttemptSucceeded> with no C<AssistantMessage>
+    after it in the same round is followed by one of these. )
+class LLM::Agent::Event::TurnDiscarded is LLM::Agent::Event {
+	#| Why the turn was thrown away: C<limit> (it asked for tools a limit
+	#| had already stopped), C<failed> (the backend chain ran out) or
+	#| C<cancelled> (the run was cancelled before it could be committed).
+	has AgentDiscardReason:D $.reason is required;
+	has Int $.round;
+
+	method kind(--> Str:D) { 'turn-discarded' }
+	method payload(--> Hash:D) { { reason => $!reason, round => $!round } }
+}
+
 #| A tool call the model asked for, emitted before it is executed.
 class LLM::Agent::Event::ToolCall is LLM::Agent::Event {
 	#| The provider's call id; the matching ToolResult carries the same one.
@@ -394,6 +614,57 @@ class LLM::Agent::Event::ToolCall is LLM::Agent::Event {
 	}
 }
 
+#|( The call has been B<handed to the provider> and is running: the
+    dispatch boundary, one per call, emitted immediately after the
+    C<tool-dispatched> envelope is written and before the provider is
+    called.
+
+    C<ToolCall> stays "the model asked for this"; this is "and now it is
+    really happening". A UI that shows a spinner starts it here — a call
+    that is queued behind three others has not started yet, and saying it
+    has is how a hung tool becomes indistinguishable from a busy one. )
+class LLM::Agent::Event::ToolStarted is LLM::Agent::Event {
+	#| Matches the ToolCall's id.
+	has Str:D $.id is required;
+	has Str:D $.name is required;
+	has Int $.round;
+
+	method kind(--> Str:D) { 'tool-started' }
+	method payload(--> Hash:D) {
+		{ id => $!id, name => $!name, round => $!round };
+	}
+}
+
+#|( A running tool said how far it has got: an MCP C<notifications/progress>
+    forwarded through the loop's C<progress-hook>, correlated to the call
+    it belongs to.
+
+    C<progress> and C<total> are the protocol's own numbers — C<total> is
+    optional there and optional here, so a server that reports "17 files"
+    with no idea how many there are in total is representable. Progress
+    for a call that is B<not> the one in flight is dropped rather than
+    reported: a late notification from a previous call would move the
+    wrong bar. )
+class LLM::Agent::Event::ToolProgress is LLM::Agent::Event {
+	#| Matches the ToolCall's id.
+	has Str:D $.id is required;
+	#| How far it has got, in whatever unit the server chose.
+	has Num:D $.progress is required;
+	#| What it is counting towards, when the server knows.
+	has Num $.total;
+	#| A human-readable note from the server.
+	has Str $.message;
+	has Int $.round;
+
+	method kind(--> Str:D) { 'tool-progress' }
+	method payload(--> Hash:D) {
+		{
+			id => $!id, progress => $!progress, total => $!total,
+			message => $!message, round => $!round,
+		};
+	}
+}
+
 #|( What a tool call came back with. Always emitted for an executed call,
     including a refused or failed one — the provider stack never throws,
     it answers with C<is-error>. )
@@ -401,9 +672,18 @@ class LLM::Agent::Event::ToolResult is LLM::Agent::Event {
 	#| Matches the ToolCall's id.
 	has Str:D $.id is required;
 	has Str $.name;
-	#| What the model will see as the tool message's content.
+	#|( What the model will see as the tool message's content — which for
+	    an oversized result is the B<excerpt>, not the whole thing. See
+	    C<artifact>. )
 	has Str:D $.content is required;
 	has Bool:D $.is-error = False;
+	#|( Present only when the result was too big to live in the
+	    conversation and was spilled to a file:
+	    C<< { file, digest, bytes, chars, elided-chars } >>, where C<file>
+	    is a basename in the transcript's C<.artifacts> directory. Empty —
+	    and dropped from C<to-hash> — for the ordinary result, which is
+	    almost all of them. See L<LLM::Agent::Artifacts>. )
+	has %.artifact;
 	has Int $.round;
 
 	method kind(--> Str:D) { 'tool-result' }
@@ -411,6 +691,72 @@ class LLM::Agent::Event::ToolResult is LLM::Agent::Event {
 		{
 			id => $!id, name => $!name, content => $!content,
 			is-error => $!is-error, round => $!round,
+			artifact => (%!artifact.elems ?? %!artifact.Hash !! Any),
+		};
+	}
+}
+
+#|( A tool call will never answer, and this is what is known about whether
+    it ran. B<Not> a C<ToolResult>: nothing came back, and inventing one
+    would tell a consumer the tool answered.
+
+    C<dispatched> is the whole message. B<False> means it was never handed
+    to the provider: it did not run, which is the strongest thing the loop
+    can say about a tool call and is only ever true of one that was still
+    queued. B<True> means it was handed over and the loop then stopped
+    waiting (the deadline passed, or the run was cancelled), so whether it
+    took effect is B<unknown> — and a consumer that renders that as a
+    failure is inviting somebody to retry a write that already landed.
+
+    The matching conversation message says the same thing in words, so the
+    model is not told a tool failed either. )
+class LLM::Agent::Event::ToolAbandoned is LLM::Agent::Event {
+	#| Matches the ToolCall's id.
+	has Str:D $.id is required;
+	has Str:D $.name is required;
+	#| C<cancelled> (the run was cancelled), C<deadline> (it outlived
+	#| C<Loop.tool-deadline>) or C<budget-exhausted> (a run cap tripped
+	#| before this call was dispatched).
+	has AgentAbandonReason:D $.reason is required;
+	#| False: never dispatched, so it did not run. True: dispatched and
+	#| detached, so the outcome is unknown.
+	has Bool:D $.dispatched is required;
+	has Int $.round;
+
+	method kind(--> Str:D) { 'tool-abandoned' }
+	method payload(--> Hash:D) {
+		{
+			id => $!id, name => $!name, reason => $!reason,
+			dispatched => $!dispatched, round => $!round,
+		};
+	}
+}
+
+#|( One event of a B<child> run, carried on its parent's stream. NOT
+    terminal, whatever the child's event was: the child ending is not the
+    parent ending. See the module Pod for the two-layer envelope.
+
+    C<inner> is the child event's C<to-hash> — plain data, carrying the
+    B<child's> C<run-id>, C<seq> and C<kind> — and the wrapper itself is
+    stamped with the parent's when the parent Run publishes it. )
+class LLM::Agent::Event::Subagent is LLM::Agent::Event {
+	#| The spawning composer's short handle for this child, and the key to
+	#| group by: the same one its C<subagent-spawned> envelope records.
+	has Str:D $.agent-id is required;
+	#| Which agent from the composer's table this is: 'reviewer', 'tester'.
+	has Str:D $.agent-type is required;
+	#| What the model called this particular child, when it named one.
+	has Str $.label;
+	#|( The child event, flattened. Required, and required to be a Hash: a
+	    wrapper with nothing inside says a child emitted something without
+	    saying what, which is worse than no event at all. )
+	has %.inner is required;
+
+	method kind(--> Str:D) { 'subagent' }
+	method payload(--> Hash:D) {
+		{
+			agent-id => $!agent-id, agent-type => $!agent-type,
+			label => $!label, inner => %!inner.Hash,
 		};
 	}
 }
@@ -563,12 +909,26 @@ class LLM::Agent::Event::RunFailed is LLM::Agent::Event {
 	#| calling a backend.
 	has @.attempts;
 	has Int $.round;
+	#|( The machine-readable half of C<error>, for the failures a program
+	    can do something about. Absent for the ordinary ones — a caller
+	    branching on it is branching on a case somebody deliberately named.
+
+	    Two are named so far. C<context-exhausted>: the conversation will
+	    not fit the context window — either compaction ran out of things
+	    to drop, or every backend's preflight refused it and compacting to
+	    the roomiest one's window did not help. C<budget-exhausted>: a run
+	    cap (cost, total tokens or wall clock) was reached; C<error> names
+	    which one, what was spent and what the cap was. Both are the loop
+	    stopping B<cleanly> rather than sending a request it knows will
+	    fail or spending money somebody said not to. )
+	has Str $.reason;
 
 	method kind(--> Str:D) { 'run-failed' }
 	method is-terminal(--> Bool:D) { True }
 	method payload(--> Hash:D) {
 		{
 			error => $!error, attempts => @!attempts.List, round => $!round,
+			reason => $!reason,
 		};
 	}
 }

@@ -1,0 +1,289 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use JSON::Fast;
+use LLM::Agent::Canonical;
+use LLM::Agent::Loop;
+use LLM::Agent::ToolOperation;
+
+# The state machine one tool call moves through, on its own — no loop, no
+# provider, no session. What is being pinned here is the one rule the
+# whole thing exists for: a call whose outcome is unknown must never be
+# recordable as one that failed, and a call that WAS dispatched must never
+# be recordable as one that did not run.
+
+plan 12;
+
+sub op(*%args --> LLM::Agent::ToolOperation) {
+	LLM::Agent::ToolOperation.new(
+		call-id => 'c1', tool => 'fs_write', |%args,
+	);
+}
+
+subtest 'a fresh operation is proposed, identified and canonical' => {
+	plan 6;
+
+	my $op = op(arguments => canonical-arguments('{"b":2,"a":1}'));
+
+	is $op.state, 'proposed', 'nothing has been sent anywhere yet';
+	nok $op.outcome.defined, 'so there is no outcome to report';
+	nok $op.is-terminal, 'and it is not finished';
+	ok $op.op-id.chars, 'it has an id from the moment it exists';
+	is $op.arguments, '{"a":1,"b":2}',
+		'the arguments it holds are the canonical ones — key order is not '
+			~ 'semantics';
+	is $op.arguments-digest, data-digest('{"a":1,"b":2}'),
+		'and the digest is over exactly those';
+};
+
+subtest 'the identical-call signature is the loop’s, computed from the op' => {
+	plan 2;
+
+	my $a = op(tool => 'fs_read', arguments => canonical-arguments('{"path":"a","mode":"r"}'));
+	my $b = op(tool => 'fs_read', arguments => canonical-arguments('{ "mode":"r" , "path":"a" }'));
+	is $a.signature, $b.signature,
+		'the same request spelled two ways is one signature';
+
+	my $c = op(tool => 'fs_read', arguments => canonical-arguments('{"path":"b"}'));
+	isnt $a.signature, $c.signature, 'and a different request is not';
+};
+
+subtest 'dispatch takes the session envelope’s id, and only happens once' => {
+	plan 7;
+
+	my $op = op();
+
+	ok $op.dispatch(op-id => 'envelope-7'), 'the first dispatch wins';
+	is $op.state, 'dispatched', 'and moves the state';
+	is $op.op-id, 'envelope-7',
+		'the operation IS its dispatch envelope from here on — that id is '
+			~ 'what the settle line names';
+	ok $op.dispatched-at.defined, 'and the clock started';
+
+	nok $op.dispatch(op-id => 'envelope-9'), 'a second dispatch loses';
+	is $op.op-id, 'envelope-7', 'without moving the id under anybody';
+
+	# The sessionless case: nothing to replace the id with, so the uuid it
+	# was born with is the one it keeps.
+	my $bare = op();
+	my $uuid = $bare.op-id;
+	$bare.dispatch(op-id => Str);
+	is $bare.op-id, $uuid,
+		'a sessionless dispatch keeps the uuid it was born with';
+};
+
+subtest 'settle is once, and only from dispatched' => {
+	plan 7;
+
+	my $op = op();
+	throws-like { $op.settle(outcome => 'completed') },
+		Exception, message => /'has not been dispatched'/,
+		'settling a call nothing was handed is a driver bug, and says so';
+
+	$op.dispatch;
+	ok $op.settle(outcome => 'completed', result-digest => 'abc'),
+		'the first settle wins';
+	is $op.state, 'completed', 'the state IS the outcome';
+	is $op.outcome, 'completed', 'and the outcome says the same';
+	is $op.result-digest, 'abc', 'with what it settled on';
+
+	nok $op.settle(outcome => 'outcome-unknown', reason => 'deadline'),
+		'a deadline arriving one instant late LOSES, quietly — that race is '
+			~ 'one the loop is allowed to lose';
+	is $op.state, 'completed', 'and the first answer stands';
+};
+
+subtest 'the three settled outcomes, and nothing else' => {
+	plan 4;
+
+	for <completed failed outcome-unknown> -> $outcome {
+		my $op = op();
+		$op.dispatch;
+		ok $op.settle(:$outcome), "$outcome is an outcome";
+	}
+
+	my $op = op();
+	$op.dispatch;
+	throws-like { $op.settle(outcome => 'abandoned') },
+		Exception, message => /'outcome must be one of'/,
+		'abandoned is NOT a settle: a dispatched call cannot be declared '
+			~ 'never to have run';
+};
+
+subtest 'abandoned is only ever true of a call that was never dispatched' => {
+	plan 6;
+
+	my $op = op();
+	ok $op.abandon, 'a proposed call can be abandoned';
+	is $op.state, 'abandoned', 'which is a terminal';
+	is $op.outcome, 'abandoned', 'and an outcome';
+	is $op.reason, 'cancelled', 'with a default reason';
+	nok $op.abandon, 'abandoning twice loses';
+
+	my $running = op();
+	$running.dispatch;
+	nok $running.abandon,
+		'and a DISPATCHED call cannot be abandoned at all — it may have '
+			~ 'taken effect, and this class exists to stop anybody saying '
+			~ 'otherwise';
+};
+
+subtest 'the deadline clock stops while a human is being asked' => {
+	plan 5;
+
+	my $op = op();
+	$op.dispatch;
+
+	# A closed span: the operation was not working for any of it.
+	$op.ask-begin;
+	nok $op.working-seconds > 0.05,
+		'time inside an open question is not time spent working';
+	sleep 0.12;
+	ok $op.asking, 'the question is still open';
+	$op.ask-end;
+
+	ok $op.ask-seconds >= 0.1, 'the span was recorded';
+	nok $op.asking, 'and closed';
+	# The whole elapsed time was the question, so the working clock is
+	# still near zero — which is what keeps a 0.1s deadline from firing
+	# during a slow answer.
+	ok $op.working-seconds < 0.05,
+		'so a deadline measured on working time has barely moved';
+};
+
+subtest 'nested asks close on the outer answer, not the inner one' => {
+	plan 3;
+
+	my $op = op();
+	$op.dispatch;
+
+	# A policy that elicits from a server while its own permission prompt
+	# is open. A span that closed on the inner answer would start charging
+	# the operation for the time the outer question is still taking.
+	$op.ask-begin;
+	$op.ask-begin;
+	sleep 0.05;
+	$op.ask-end;
+	ok $op.asking, 'the outer question is still open after the inner answer';
+	is $op.ask-seconds, 0, 'and nothing has been banked yet';
+
+	sleep 0.05;
+	$op.ask-end;
+	ok $op.ask-seconds >= 0.09,
+		'the whole span lands when the last question is answered';
+};
+
+subtest 'a settle with a question still open closes the span' => {
+	plan 2;
+
+	# A cancel while the modal is on screen. Nothing keeps the span open
+	# afterwards, and working-seconds stops moving at the settle.
+	my $op = op();
+	$op.dispatch;
+	$op.ask-begin;
+	sleep 0.05;
+	$op.settle(outcome => 'outcome-unknown', reason => 'cancelled');
+
+	ok $op.ask-seconds > 0, 'the open span was banked at the settle';
+	my $frozen = $op.working-seconds;
+	sleep 0.05;
+	is $op.working-seconds, $frozen,
+		'and a settled operation’s clock has stopped for good';
+};
+
+subtest 'to-hash is plain data, and says what state it is in' => {
+	plan 5;
+
+	my $op = op(
+		run-id => 'r1', round => 2, idempotency => 'destructive',
+		arguments => '{"path":"b.txt"}',
+	);
+	$op.dispatch(op-id => 'env-1');
+	$op.settle(
+		outcome => 'failed', reason => 'refused', error-text => 'permission denied',
+	);
+
+	my %h = $op.to-hash;
+	is %h<op-id>, 'env-1', 'the id a transcript joins on';
+	is %h<state>, 'failed', 'the state it ended in';
+	is %h<idempotency>, 'destructive',
+		'the classification a repair words itself with';
+	is %h<error-text>, 'permission denied', 'and what went wrong';
+	ok to-json(%h).chars, 'and the whole thing is JSON, like every other '
+		~ 'plain-data view in this dist';
+};
+
+subtest 'transitions are won by exactly one thread' => {
+	plan 3;
+
+	# The real race: a deadline task, a cancel and a result all reaching
+	# the same operation at once. Exactly one of them may decide what
+	# happened.
+	my $op = op();
+	$op.dispatch;
+
+	my @winners = await (^20).map(-> $i {
+		start {
+			$op.settle(
+				outcome => ($i %% 2 ?? 'completed' !! 'outcome-unknown'),
+			);
+		}
+	});
+
+	is @winners.grep({ $_ }).elems, 1,
+		'exactly one settle returned True, however many raced';
+	ok $op.is-terminal, 'the operation is settled';
+	ok $op.outcome eq 'completed' || $op.outcome eq 'outcome-unknown',
+		'with the outcome of whichever one won, and no mixture of the two';
+};
+
+subtest 'idempotency is configuration, validated where it is configured' => {
+	plan 8;
+
+	throws-like {
+		LLM::Agent::ToolOperation.new(
+			call-id => 'c', tool => 't', idempotency => 'sort-of',
+		)
+	}, Exception, message => /'idempotency must be one of'/,
+		'a class nothing recognises is refused at construction';
+
+	my $backend = scripted-backend(steps => []);
+
+	throws-like {
+		LLM::Agent::Loop.new(
+			backends => [$backend,],
+			idempotency-rules => [{ tool => 'fs_*', idempotency => 'read-onlyy' },],
+		)
+	}, Exception, message => /'idempotency rule 0'/,
+		'and so is a typo in a rule — while somebody is looking at the config';
+
+	throws-like {
+		LLM::Agent::Loop.new(
+			backends => [$backend,],
+			idempotency-rules => [{ idempotency => 'read-only' },],
+		)
+	}, Exception, message => /'no tool pattern'/,
+		'a rule that names no tool is not a rule';
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,],
+		idempotency-rules => [
+			{ tool => 'fs_read', idempotency => 'read-only' },
+			{ tool => 'fs_*', idempotency => 'destructive' },
+			{ tool => 'sh_*', idempotency => 'unknown' },
+		],
+	);
+	my &classify = $loop.^find_private_method('idempotency-of').assuming($loop);
+
+	is classify('fs_read'), 'read-only',
+		'an exact rule matches its tool — and beats the glob below it, '
+			~ 'because the FIRST match wins';
+	is classify('fs_write'), 'destructive', 'a trailing-* rule matches a prefix';
+	is classify('fs_readdir'), 'destructive',
+		'while a name that only LOOKS like the exact rule falls through to '
+			~ 'the glob';
+	is classify('sh_run'), 'unknown', 'a rule may say unknown out loud';
+	is classify('user_ask'), 'unknown',
+		'and anything unmatched is unknown, which is what every tool is '
+			~ 'until an application says otherwise';
+};

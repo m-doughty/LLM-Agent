@@ -9,7 +9,7 @@ use LLM::Chat::Conversation::Message;
 # the summarizer, and — the part that matters most — what it does when
 # the summarizer is not there.
 
-plan 12;
+plan 16;
 
 # One token per character, no per-message overhead: every threshold in
 # this file is then plain arithmetic a reader can check.
@@ -320,6 +320,184 @@ subtest 'a hard trim aims for the target, and stops at the recent window' => {
 	my %floor = $tiny.compact(conversation(10));
 	is %floor<messages>.elems, 4,
 		'an unreachable target trims the whole middle and stops there';
+};
+
+subtest 'a summary no smaller than the conversation is retried, then trimmed' => {
+	plan 6;
+
+	# The summarizer answers — at length. Accepting it would mean the next
+	# round asks for a compaction again over a conversation that has not
+	# moved, forever.
+	my $backend = scripted-backend(steps => [
+		{ content => 'Z' x 5_000 },      # longer than what it replaces
+		{ content => 'Y' x 4_000 },      # the retry: shorter, still useless
+		{ content => 'never reached' },
+	]);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, counter => counter(), context-budget => 3_000, keep-recent => 2,
+	);
+
+	my %result = $compactor.compact(conversation(10));
+
+	is $backend.recorded-calls.elems, 2,
+		'one summarization and exactly one retry — not the whole retry '
+			~ 'budget, which is for failures';
+	like $backend.recorded-calls[1]<messages>[0].content, /'TOO LONG'/,
+		'and the retry says why it is a retry';
+	is $backend.recorded-calls[1]<messages>[1].content,
+		$backend.recorded-calls[0]<messages>[1].content,
+		'over the same transcript, so it is a second attempt at one job '
+			~ 'rather than a different job';
+
+	ok %result<fallback>,
+		'neither answer was smaller, so it hard-trimmed instead';
+	ok %result<tokens-after> < %result<tokens-before>,
+		'and the postcondition holds by arithmetic rather than by hope';
+	nok %result<exhausted>,
+		'the conversation fits the window, so nothing is exhausted';
+};
+
+subtest 'a retry that really is shorter is taken' => {
+	plan 4;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'Z' x 5_000 },      # too long
+		{ content => 'THE SHORT SUMMARY' },
+		{ content => 'never reached' },
+	]);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, counter => counter(), context-budget => 3_000, keep-recent => 2,
+	);
+
+	my %result = $compactor.compact(conversation(10));
+
+	is $backend.recorded-calls.elems, 2, 'the retry was made';
+	nok %result<fallback>,
+		'and its answer was taken — a hard trim is the LAST resort, not the '
+			~ 'second';
+	like %result<summary>, /'THE SHORT SUMMARY'/, 'the summary is the retry’s';
+	ok %result<tokens-after> < %result<tokens-before>, 'and it really is smaller';
+};
+
+subtest 'a conversation that cannot be made to fit says so' => {
+	plan 7;
+
+	# One tool result bigger than the whole window, in the recent turns —
+	# which is exactly the part a trim is not allowed to eat.
+	my @messages = (
+		sysprompt('SY'),
+		LLM::Chat::Conversation::Message.new(role => 'user', content => 'm1' ~ ('.' x 198)),
+		LLM::Chat::Conversation::Message.new(role => 'assistant', content => 'm2' ~ ('.' x 198)),
+		LLM::Chat::Conversation::Message.new(
+			role => 'assistant', content => 'reading',
+			tool-calls => [tool-call('c1', 'fs_read', '{"path":"big"}'),]),
+		LLM::Chat::Conversation::Message.new(
+			role => 'tool', content => 'X' x 5_000, tool-call-id => 'c1'),
+	);
+
+	my $backend = scripted-backend(steps => [
+		{ error => 'nope', 'error-class' => 'http', 'error-status' => 403 },
+	]);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, counter => counter(), context-budget => 1_000, keep-recent => 2,
+	);
+
+	my %result = $compactor.compact(@messages);
+
+	ok %result<fallback>, 'the hard trim was reached';
+	ok %result<dropped> >= 1, 'and it dropped what it was allowed to drop';
+	ok %result<tokens-after> < %result<tokens-before>,
+		'making real progress, for what it is worth';
+	ok %result<tokens-after> > $compactor.context-budget,
+		'which is not enough: the recent window alone is over the budget';
+	ok %result<exhausted>,
+		'so the result says so rather than handing back a conversation whose '
+			~ 'next request cannot succeed';
+
+	# Nothing to summarize AND already past the budget is the same answer
+	# by a different route.
+	my $roomy = LLM::Agent::Compactor.new(
+		backend => scripted-backend(steps => []),
+		counter => counter(), context-budget => 1_000, keep-recent => 10,
+	);
+	my %noop = $roomy.compact(@messages);
+	is %noop<dropped>, 0, 'a window bigger than the conversation compacts nothing';
+	ok %noop<exhausted>,
+		'and when that conversation is already over the budget, there is '
+			~ 'nothing left to try';
+};
+
+subtest 'compacting to a target the caller supplies' => {
+	plan 9;
+
+	# :$target is how LLM::Agent::Loop's preflight asks for a compaction
+	# against a number this class does not own: the biggest conversation
+	# the backends it is about to try would actually take.
+
+	# --- the hard trim aims at it. -------------------------------------
+	my $trimmer = LLM::Agent::Compactor.new(
+		backend => scripted-backend(steps => [
+			{ error => 'nope', 'error-class' => 'http', 'error-status' => 403 },
+		]),
+		counter => counter(), context-budget => 3_000, keep-recent => 2,
+	);
+	my @messages = conversation(10);   # 2,002 tokens with this counter
+
+	my %trimmed = $trimmer.compact(@messages, target => 800);
+	ok %trimmed<fallback>, 'the summarizer was unreachable, so it trimmed';
+	ok %trimmed<tokens-after> <= 800,
+		'to the target it was HANDED (800), not to its own (1,200)';
+	nok %trimmed<exhausted>, 'and reaching it is not exhaustion';
+
+	# --- and the exhausted verdict is judged against it. ---------------
+	my $tiny = LLM::Agent::Compactor.new(
+		backend => scripted-backend(steps => [
+			{ error => 'nope', 'error-class' => 'http', 'error-status' => 403 },
+		]),
+		counter => counter(), context-budget => 3_000, keep-recent => 2,
+	);
+	my %impossible = $tiny.compact(@messages, target => 100);
+	ok %impossible<tokens-after> < %impossible<tokens-before>,
+		'a target nothing can reach still makes what progress it can';
+	ok %impossible<exhausted>,
+		'and says it could not get there — the caller asked for 100 and '
+			~ 'got more, which is the fact that matters to it';
+
+	# --- a summary that shrinks but misses the target is not enough. ---
+	# 320 tokens of summary over a 2,002-token conversation: smaller, and
+	# nowhere near 200.
+	my $summarizer = LLM::Agent::Compactor.new(
+		backend => scripted-backend(steps => [
+			{ content => 'S' x 320 },
+		]),
+		counter => counter(), context-budget => 3_000, keep-recent => 2,
+	);
+	my %missed = $summarizer.compact(@messages, target => 200);
+	ok %missed<fallback>,
+		'a summary that shrank the conversation but left it over the target '
+			~ 'falls through to the trim that would have fitted';
+
+	# The same summary with no target: accepted, exactly as before.
+	my $unbounded = LLM::Agent::Compactor.new(
+		backend => scripted-backend(steps => [
+			{ content => 'S' x 320 },
+		]),
+		counter => counter(), context-budget => 3_000, keep-recent => 2,
+	);
+	my %accepted = $unbounded.compact(@messages);
+	nok %accepted<fallback>,
+		'because without a target, smaller than before is the whole test';
+
+	# --- a no-op over a conversation past the target is exhausted. -----
+	my $roomy = LLM::Agent::Compactor.new(
+		backend => scripted-backend(steps => []),
+		counter => counter(), context-budget => 100_000, keep-recent => 20,
+	);
+	my %noop = $roomy.compact(@messages, target => 500);
+	is %noop<dropped>, 0, 'a keep-recent bigger than the conversation drops nothing';
+	ok %noop<exhausted>,
+		'and with nothing to summarize and a target it is already over, '
+			~ 'there is nothing left to try';
 };
 
 subtest 'the constructor refuses a configuration that cannot work' => {

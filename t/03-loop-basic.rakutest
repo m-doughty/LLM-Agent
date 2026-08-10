@@ -1,19 +1,53 @@
 use Test;
 use lib 'lib', 't/lib';
 use AgentTestKit;
+use LLM::Agent::Compactor;
 use LLM::Agent::Event;
 use LLM::Agent::Loop;
 use LLM::Agent::Run;
+use LLM::Agent::RunContext;
+use LLM::Agent::Session;
 use LLM::Agent::TokenCount;
 use LLM::Chat::Conversation::Message;
 
 # The loop with nothing else plugged into it: the shape of a run, the
 # shape of its result, and the guarantees that hold before a single tool,
 # session or compactor is involved.
+#
+# The two exceptions are deliberate and live at the end: which of the
+# loop's optional parts may be plugged in WITHOUT the others (a compactor
+# needs no session, and vice versa), and what happens when even a
+# compactor cannot make the next request fit.
 
-plan 11;
+plan 17;
 
 my @prompt = [msg('user', 'what is the capital of France?'),];
+
+my $tmp = $*TMPDIR.add("llm-agent-t03-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+my $n = 0;
+sub fresh-path(--> IO::Path) { $tmp.add('b' ~ $n++ ~ '.jsonl') }
+
+# One token per character, no per-message overhead: every threshold in
+# the compaction subtests below is arithmetic a reader can check.
+sub char-counter(--> LLM::Agent::TokenCount) {
+	LLM::Agent::TokenCount::Heuristic.new(
+		chars-per-token => 1, per-message-overhead => 0,
+	);
+}
+
+sub sysprompt(Str:D $content --> LLM::Chat::Conversation::Message) {
+	LLM::Chat::Conversation::Message.new(
+		role => 'system', :$content, sysprompt => True, sticky => True,
+	);
+}
 
 subtest 'the happy path emits exactly the sequence a consumer expects' => {
 	plan 6;
@@ -31,9 +65,10 @@ subtest 'the happy path emits exactly the sequence a consumer expects' => {
 		(
 			'run-started', 'round-started', 'attempt-started',
 			'token', 'token', 'attempt-succeeded', 'assistant-message',
-			'run-completed',
+			'turn-committed', 'run-completed',
 		),
-		'one round, one attempt, two fragments, one terminal';
+		'one round, one attempt, two fragments, one committed turn, one '
+			~ 'terminal';
 
 	is events-of(@events, 'token').map({ .text }).join,
 		'Paris, obviously.',
@@ -234,8 +269,342 @@ subtest 'reasoning is reported but kept out of the message' => {
 		'and nothing undefined leaks into the plain-data form';
 };
 
+subtest 'session and compactor are independent: all four combinations run' => {
+	plan 10;
+
+	# 902 tokens at the top of round 1 against a trigger of 800, so the
+	# compaction happens before the first request rather than after some
+	# tool round — which keeps every quadrant below one blocking
+	# summarization call plus one streamed answer.
+	sub start-conversation(--> List) {
+		(
+			sysprompt('SY'),
+			msg('user', 'u' x 300),
+			msg('assistant', 'a' x 300),
+			msg('user', 'v' x 300),
+		);
+	}
+
+	sub compacting-loop(:$session, :$with-compactor = True --> LLM::Agent::Loop) {
+		my $counter = char-counter();
+		my $backend = scripted-backend(steps => [
+			{ content => 'THE SUMMARY' },      # the compaction, blocking
+			{ content => 'the answer' },       # the round, streamed
+		]);
+		# A loop with no compactor never makes the blocking call, so its
+		# script starts at the streamed answer instead.
+		$backend.steps.shift unless $with-compactor;
+
+		LLM::Agent::Loop.new(
+			backends => [$backend,],
+			:$counter,
+			|($with-compactor
+				?? (compactor => LLM::Agent::Compactor.new(
+						:$backend, :$counter, context-budget => 1_000,
+						keep-recent => 2,
+					))
+				!! ()),
+			|($session.defined ?? (:$session) !! ()),
+		);
+	}
+
+	# --- compactor, NO session: the acceptance row. --------------------
+	my $loose = compacting-loop(with-compactor => True);
+	my $loose-run = $loose.run(start-conversation().Array);
+	run-settled($loose-run, 'the sessionless compacting run');
+	my @loose-events = drain-events($loose-run);
+
+	is (await $loose-run.result)<outcome>, 'completed',
+		'a compactor with no session drives a compaction end to end — the '
+			~ 'id bookkeeping a session needs is not a tax on runs that '
+			~ 'have no session';
+	is events-of(@loose-events, 'compaction-done').elems, 1,
+		'and the compaction really happened';
+	is (await $loose-run.result)<messages>.map({ .role }).List,
+		('system', 'user', 'assistant', 'user', 'assistant'),
+		'leaving the sysprompt, the summary, the two recent turns it is not '
+			~ 'allowed to eat, and the answer';
+
+	# --- session AND compactor. ----------------------------------------
+	my $both-path = fresh-path();
+	my $both-session = LLM::Agent::Session.create(path => $both-path, meta => {});
+	my $both = compacting-loop(session => $both-session);
+	my $both-run = $both.run(start-conversation().Array);
+	run-settled($both-run, 'the compacting run with a session');
+	my @both-events = drain-events($both-run);
+
+	is (await $both-run.result)<outcome>, 'completed', 'the pair works too';
+	is events-of(@both-events, 'compaction-done').elems, 1,
+		'with the same one compaction';
+
+	my @live = (await $both-run.result)<messages>;
+	$both-session.close;
+	my $replayed = LLM::Agent::Session.load(path => $both-path);
+	is-deeply $replayed.messages.map({ .role ~ ':' ~ .content }).List,
+		@live.map({ .role ~ ':' ~ .content }).List,
+		'and the transcript replays exactly the conversation the run ended '
+			~ 'with — which is what the id bookkeeping is FOR';
+
+	# --- session, no compactor. ----------------------------------------
+	my $session-path = fresh-path();
+	my $session-only = LLM::Agent::Session.create(path => $session-path, meta => {});
+	my $plain-loop = compacting-loop(
+		session => $session-only, with-compactor => False,
+	);
+	my $session-run = $plain-loop.run(start-conversation().Array);
+	run-settled($session-run, 'the session-only run');
+	is (await $session-run.result)<outcome>, 'completed',
+		'a session with no compactor never compacts';
+	is events-of(drain-events($session-run), 'compaction-started').elems, 0,
+		'and says nothing about compaction';
+	$session-only.close;
+
+	# --- neither. -------------------------------------------------------
+	my $bare = compacting-loop(with-compactor => False);
+	my $bare-run = $bare.run(start-conversation().Array);
+	run-settled($bare-run, 'the bare run');
+	is (await $bare-run.result)<outcome>, 'completed',
+		'and neither is the ordinary case';
+	is (await $bare-run.result)<messages>.elems, 5,
+		'with the whole conversation still there, unsummarized';
+};
+
+subtest 'a conversation that cannot be made to fit ends the run cleanly' => {
+	plan 9;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $counter = char-counter();
+
+	# The last two turns are 900 characters each and the window is 1,000.
+	# Nothing a compactor is allowed to touch can fix that: the recent
+	# window is never trimmed, because trimming it removes the very
+	# context the next turn needs.
+	my @conversation = (
+		sysprompt('SY'),
+		msg('user', 'x' x 300),
+		msg('assistant', 'y' x 300),
+		msg('user', 'B' x 900),
+		msg('assistant', 'C' x 900),
+	);
+
+	# A 403 on the summarizer sends it straight to the hard trim, which is
+	# the floor of what a compactor can do — and still not enough.
+	my $backend = scripted-backend(steps => [
+		{ error => 'no', 'error-class' => 'http', 'error-status' => 403 },
+		{ content => 'this must never be asked for' },
+	]);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, :$counter, context-budget => 1_000, keep-recent => 2,
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$counter, :$compactor, :$session,
+	);
+
+	my $run = $loop.run(@conversation);
+	run-settled($run, 'the exhausted run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'failed', 'the run ends rather than going round again';
+	is %outcome<reason>, 'context-exhausted',
+		'under a name a program can branch on';
+	like %outcome<error>, /'does not fit the context budget'/,
+		'and a sentence a human can act on';
+
+	my $failed = events-of(@events, 'run-failed').head;
+	is $failed.reason, 'context-exhausted', 'the event says the same';
+	is $failed.attempts.elems, 0,
+		'with an empty attempts list — no backend ever refused anything';
+
+	is event-kinds(@events).tail, 'run-failed', 'it is the terminal';
+	ok event-kinds(@events).first({ $_ eq 'compaction-done' }, :k)
+		< event-kinds(@events).first({ $_ eq 'run-failed' }, :k),
+		'and the compaction that gave up is framed before it, so a consumer '
+			~ 'sees what was tried';
+
+	is $backend.recorded-calls.elems, 1,
+		'exactly one call was made — the summarizer’s. The doomed request '
+			~ 'the old loop would have sent, and resent, was never sent';
+
+	$session.close;
+	my $replayed = LLM::Agent::Session.load(path => $path);
+	is $replayed.events.grep({ $_<type> eq 'compaction' }).elems, 1,
+		'and the compaction it did manage is in the transcript, so a resumed '
+			~ 'run starts from the smaller conversation';
+};
+
+subtest 'the request carries the context; the conversation never does' => {
+	plan 10;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $backend = scripted-backend(steps => [{ content => 'Paris.' },]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$session);
+
+	my $context = LLM::Agent::RunContext.new(
+		head-sections => [identity => 'IDENTITY'],
+		facts         => [date => '2026-08-10'],
+	);
+
+	my $run = $loop.run(@prompt, :$context);
+	run-settled($run, 'the context run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	# What went out: the head, the one message the caller handed over, and
+	# the tail. Three, from a conversation of one.
+	my @sent = $backend.recorded-calls[0]<messages>.list;
+	is @sent.elems, 3, 'the request carried two more messages than the run was '
+		~ 'given';
+	is @sent[0].content, 'IDENTITY', 'the head is at index 0';
+	ok @sent[1].content.contains('capital of France'),
+		'the conversation is in the middle, untouched';
+	ok @sent[2].content.contains('- date: 2026-08-10'),
+		'and the tail is last, closest to generation';
+
+	# ...and what nothing else saw. All four of these are what the seed
+	# check, a resume and a compaction work from.
+	is $session.messages.map({ .role }).List, ('user', 'assistant'),
+		'the transcript holds the conversation and nothing else';
+	is %outcome<messages>.elems, 2, 'and so does the result';
+	is events-of(@events, 'run-started').head.message-count, 1,
+		'RunStarted counts what the caller handed in, not what went on the wire';
+	nok $session.events.grep({ $_<type> eq 'message' })
+		.first({ $_<payload><content>.contains('Current context') }).defined,
+		'no context text reached a message line';
+
+	# The audit half: one run-context envelope, naming this run.
+	is $session.run-contexts.elems, 1, 'one run-context line was written';
+	is $session.run-contexts[0]<digest>, $context.digest,
+		'carrying the digest RunStarted announced';
+
+	$session.close;
+};
+
+subtest 'a second run may say something completely different' => {
+	plan 6;
+
+	# THE point of the whole mechanism: yesterday's context is not in the
+	# transcript, so today's run is not contradicting it. Before this,
+	# every refreshable fact fossilised at index 0 and the seed check
+	# guarded the fossil.
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my $monday = LLM::Agent::RunContext.new(facts => [date => 'Monday']);
+	my $friday = LLM::Agent::RunContext.new(facts => [date => 'Friday']);
+
+	my $first = scripted-backend(steps => [{ content => 'on Monday' },]);
+	my $run = LLM::Agent::Loop.new(backends => [$first,], :$session)
+		.run([msg('user', 'what day is it?')], context => $monday);
+	run-settled($run, 'Monday’s run');
+	is (await $run.result)<outcome>, 'completed', 'the first run finished';
+
+	# The resume: start from the transcript, exactly as the Pod says, and
+	# hand over a context that says something else entirely.
+	my $second = scripted-backend(steps => [{ content => 'on Friday' },]);
+	my $next = msg('user', 'and now?');
+	$session.append-message($next);
+
+	my $run2 = LLM::Agent::Loop.new(backends => [$second,], :$session)
+		.run([|$session.messages], context => $friday);
+	run-settled($run2, 'Friday’s run');
+	my %outcome = await $run2.result;
+
+	is %outcome<outcome>, 'completed',
+		'the second run is NOT refused by the seed check, though its context '
+			~ 'is nothing like the first one’s';
+	my $sent = $second.recorded-calls[0]<messages>.tail;
+	ok $sent.content.contains('- date: Friday'), 'the request carried Friday';
+	nok $sent.content.contains('Monday'), 'and not a word of Monday';
+
+	is $session.run-contexts.map({ $_<digest> }).List,
+		($monday.digest, $friday.digest),
+		'both contexts are in the transcript, in order, for whoever asks '
+			~ 'later what the agent was told';
+	is $session.messages.map({ .role }).List,
+		('user', 'assistant', 'user', 'assistant'),
+		'while the conversation grew by exactly the turns that happened — and '
+			~ 'holds no system message at all';
+
+	$session.close;
+};
+
+subtest 'a context with nothing in it costs the request nothing' => {
+	plan 4;
+
+	# The degenerate case an app hits the first time every instruction file
+	# is missing and every optional fact is undefined: the context renders
+	# to no messages at all, and the request has to be exactly the request
+	# it would have been.
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $backend = scripted-backend(steps => [{ content => 'fine' },]);
+	my $context = LLM::Agent::RunContext.new(
+		head-sections => [instructions => ''],
+		facts         => [branch => Str],
+	);
+
+	my $run = LLM::Agent::Loop.new(backends => [$backend,], :$session)
+		.run(@prompt, :$context);
+	run-settled($run, 'the empty-context run');
+	my @events = drain-events($run);
+
+	is $backend.recorded-calls[0]<messages>.elems, 1,
+		'nothing was added to the request';
+	is (await $run.result)<outcome>, 'completed', 'and the run is unremarkable';
+
+	# It is still recorded, though: "this run was given a context, and the
+	# context was empty" is a different fact from "there was no context",
+	# and a transcript that cannot tell them apart is no use for an audit.
+	is $session.run-contexts.elems, 1, 'the empty context is still recorded';
+	is events-of(@events, 'run-started').head.context-digest, $context.digest,
+		'and RunStarted still names it';
+
+	$session.close;
+};
+
+subtest 'an audit record never fails a working run' => {
+	plan 3;
+
+	# A session stand-in from before 0.3: it can take messages and knows
+	# nothing about run contexts. The line cannot be written, and that is
+	# a Log event, not a failed run.
+	my class ContextlessSession {
+		has @.appended;
+		method append-message($message, :%extra --> Str:D) {
+			@!appended.push: $message;
+			'id-' ~ @!appended.elems;
+		}
+		method messages(--> List) { () }
+		method message-ids(--> List) { () }
+	}
+
+	my $session = ContextlessSession.new;
+	my $backend = scripted-backend(steps => [{ content => 'answered anyway' },]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$session);
+
+	my $run = $loop.run(
+		@prompt,
+		context => LLM::Agent::RunContext.new(facts => [date => 'today']),
+	);
+	run-settled($run, 'the unrecordable-context run');
+	my @events = drain-events($run);
+
+	is (await $run.result)<final>, 'answered anyway',
+		'the run completed as if nothing had happened';
+	ok $backend.recorded-calls[0]<messages>.tail.content.contains('- date: today'),
+		'having sent the context it could not record';
+
+	my @log = events-of(@events, 'log')
+		.grep({ .data ~~ Str && .data.contains('run context could not be written') });
+	is @log.elems, 1,
+		'and the one place the failure can still be seen is a Log event';
+};
+
 subtest 'the constructor refuses what it cannot drive' => {
-	plan 5;
+	plan 10;
 
 	throws-like { LLM::Agent::Loop.new(backends => []) }, Exception,
 		message => /'backends cannot be empty'/,
@@ -264,4 +633,70 @@ subtest 'the constructor refuses what it cannot drive' => {
 	my $loop = LLM::Agent::Loop.new(backends => [scripted-backend(steps => []),]);
 	throws-like { $loop.run([]) }, Exception, message => /'nothing to send'/,
 		'and a run with no messages at all';
+
+	# The conditional halves of a session's surface. A stand-in that can
+	# take messages but not compactions passes construction today and
+	# fails an hour in, with a run half written.
+	my class BareSession {
+		method append-message($message, :%extra --> Str:D) { 'id' }
+		method messages(--> List) { () }
+		method message-ids(--> List) { () }
+	}
+
+	my $counter = char-counter();
+	throws-like {
+		LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => []),],
+			session => BareSession.new,
+			:$counter,
+			compactor => LLM::Agent::Compactor.new(
+				backend => scripted-backend(steps => []),
+				:$counter, context-budget => 1_000,
+			),
+		)
+	}, Exception, message => /'append-compaction'/,
+		'a session that cannot take a compaction, under a loop that has a '
+			~ 'compactor';
+
+	throws-like {
+		LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => []),],
+			session => BareSession.new,
+			provider => ScriptedProvider.new(tools => []),
+		)
+	}, Exception, message => /'append-grants'/,
+		'and one that cannot take grants, under a loop that has a provider';
+
+	# The third conditional half, and the same rule: a session that can take
+	# grants but not tool operations would be found out at the first tool
+	# call, with a transcript that cannot say what was in flight when the
+	# process died.
+	my class GrantingSession is BareSession {
+		method append-grants(@grants --> Str:D) { 'id' }
+	}
+	throws-like {
+		LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => []),],
+			session => GrantingSession.new,
+			provider => ScriptedProvider.new(tools => []),
+		)
+	}, Exception, message => /'append-tool-dispatched'/,
+		'a session that cannot record a tool operation, under a loop that '
+			~ 'has a provider';
+
+	throws-like {
+		LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => []),],
+			tool-deadline => 0,
+		)
+	}, Exception, message => /'tool-deadline must be positive'/,
+		'a deadline of zero — which is not "no deadline", it is a deadline '
+			~ 'nothing can meet';
+
+	lives-ok {
+		LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => []),],
+			session => BareSession.new,
+		)
+	}, 'while the same session is fine for a loop that needs neither';
 };

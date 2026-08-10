@@ -12,7 +12,7 @@ use LLM::Chat::Conversation::Message;
 # the response it claims to, a scripted failure must look like a real one,
 # and the helpers must not hang.
 
-plan 14;
+plan 15;
 
 my @prompt = [msg('user', 'hello'),];
 
@@ -273,7 +273,7 @@ subtest 'the provider’s optional pieces: throwing, blocking, grants' => {
 	is $batch.status, Kept, 'and unblocks when its Promise is kept';
 
 	subtest 'grants exist only on the provider that has them' => {
-		plan 4;
+		plan 6;
 		my $plain = ScriptedProvider.new;
 		nok $plain.can('grants'),
 			'the loop’s .can("grants") probe is False for a plain provider';
@@ -285,7 +285,53 @@ subtest 'the provider’s optional pieces: throwing, blocking, grants' => {
 		is $granting.grants.elems, 1, 'starting from what it was given';
 		$granting.add-grant({ tool => 'fs_write', decision => 'deny' });
 		is $granting.grants.elems, 2, 'and growing mid-test';
+
+		# The case a loop that counted grants could never see: same size,
+		# different content.
+		$granting.replace-grants([
+			{ tool => 'fs_read', decision => 'deny' },
+			{ tool => 'fs_write', decision => 'deny' },
+		]);
+		is $granting.grants.elems, 2, 'a replaced snapshot can be the same size';
+		is $granting.grants[0]<decision>, 'deny', 'and still be a different one';
 	};
+};
+
+subtest 'the per-call knobs: one call slow, one call gated' => {
+	plan 7;
+
+	# Per CALL, not per batch — which is the whole point once a loop
+	# dispatches one call at a time: "gate the first of three" has to be a
+	# thing a test can say.
+	my $gate = Promise.new;
+	my $provider = ScriptedProvider.new(
+		results => { fs_read => 'contents', fs_write => 'written' },
+		latency => { c2 => 0.2 },
+		block-call => { fs_write => $gate },
+	);
+
+	my $started = now;
+	my @quick = $provider.execute-tool-calls([tool-call('c1', 'fs_read'),]);
+	my $quick-elapsed = now - $started;
+	is @quick[0]<content>, 'contents', 'a call with no knobs answers normally';
+	ok $quick-elapsed < 0.15, 'and immediately';
+
+	$started = now;
+	my @slow = $provider.execute-tool-calls([tool-call('c2', 'fs_read'),]);
+	my $slow-elapsed = now - $started;
+	is @slow[0]<content>, 'contents', 'a call with latency still answers';
+	ok $slow-elapsed >= 0.2,
+		"having taken its time ({$slow-elapsed.Rat.round(0.01)}s) — which is "
+			~ 'what a tool deadline is tested against';
+
+	# Keyed by tool name this time, and gated rather than slow.
+	my $blocked = start $provider.execute-tool-calls([tool-call('c3', 'fs_write'),]);
+	sleep 0.1;
+	is $blocked.status, Planned, 'a gated call really does block';
+	$gate.keep(True);
+	await Promise.anyof($blocked, Promise.in(TIMEOUT));
+	is $blocked.status, Kept, 'and finishes when the gate opens';
+	is $blocked.result[0]<content>, 'written', 'with its scripted answer';
 };
 
 subtest 'run-settled and drain-events, against a hand-driven Run' => {

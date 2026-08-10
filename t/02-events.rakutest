@@ -9,7 +9,7 @@ use LLM::Chat::Conversation::Message;
 # because the contracts that matter — one terminal then done, nothing
 # after it, a result that is always kept — belong to the pair.
 
-plan 16;
+plan 20;
 
 sub msg(Str:D $role, Str:D $content = '', *%extra) {
 	LLM::Chat::Conversation::Message.new(:$role, :$content, |%extra);
@@ -34,12 +34,24 @@ sub every-event(--> List) {
 		LLM::Agent::Event::AssistantMessage.new(
 			message => msg('assistant', 'hi'),
 		),
+		LLM::Agent::Event::TurnCommitted.new(round => 1),
 		LLM::Agent::Event::ToolCall.new(id => 'c1', name => 'fs_read'),
+		LLM::Agent::Event::ToolStarted.new(id => 'c1', name => 'fs_read'),
+		LLM::Agent::Event::ToolProgress.new(id => 'c1', progress => 1e0),
 		LLM::Agent::Event::ToolResult.new(id => 'c1', content => 'ok'),
+		LLM::Agent::Event::ToolAbandoned.new(
+			id => 'c2', name => 'fs_write', reason => 'cancelled',
+			dispatched => False,
+		),
+		LLM::Agent::Event::Subagent.new(
+			agent-id => 'reviewer-1', agent-type => 'reviewer',
+			inner => { kind => 'token', text => 'hi', 'run-id' => 'child', seq => 3 },
+		),
 		LLM::Agent::Event::AskPending.new(request => { kind => 'permission' }),
 		LLM::Agent::Event::AskAnswered.new(request => { kind => 'permission' }),
 		LLM::Agent::Event::Log.new(level => 'info', data => 'hello'),
 		LLM::Agent::Event::LimitReached.new(limit => 'tool-rounds'),
+		LLM::Agent::Event::TurnDiscarded.new(reason => 'limit'),
 		LLM::Agent::Event::CompactionStarted.new,
 		LLM::Agent::Event::CompactionDone.new,
 		LLM::Agent::Event::RunCompleted.new,
@@ -55,9 +67,10 @@ subtest 'the kind strings are the ones consumers match on' => {
 	is every-event().map({ .kind }), [
 		'run-started', 'round-started', 'attempt-started', 'token',
 		'attempt-failed', 'attempt-succeeded', 'assistant-message',
-		'tool-call', 'tool-result', 'ask-pending', 'ask-answered', 'log',
-		'limit-reached', 'compaction-started', 'compaction-done',
-		'run-completed', 'run-failed', 'run-cancelled',
+		'turn-committed', 'tool-call', 'tool-started', 'tool-progress',
+		'tool-result', 'tool-abandoned', 'subagent', 'ask-pending', 'ask-answered',
+		'log', 'limit-reached', 'turn-discarded', 'compaction-started',
+		'compaction-done', 'run-completed', 'run-failed', 'run-cancelled',
 	], 'every class, in run order, with its stable name';
 
 	is every-event().map({ .kind }).unique.elems, every-event().elems,
@@ -117,7 +130,7 @@ subtest 'to-hash always carries kind and an ISO-8601 UTC ts' => {
 };
 
 subtest 'undefined payload keys are absent, not null' => {
-	plan 4;
+	plan 6;
 	my %minimal = LLM::Agent::Event::AttemptFailed.new(
 		round => 1, attempt => 1, backend-index => 0,
 		error => 'connection reset', disposition => 'retry-same',
@@ -134,6 +147,56 @@ subtest 'undefined payload keys are absent, not null' => {
 		disposition => 'retry-same', backoff => 1.5e0, model => 'm',
 	).to-hash;
 	is %full<error-status>, 500, 'and a key it was told about is present';
+
+	# The same rule for a key whose value is a container: an ordinary tool
+	# result has no artifact, and says nothing about one.
+	nok LLM::Agent::Event::ToolResult.new(
+		id => 'c1', content => 'ok',
+	).to-hash<artifact>:exists,
+		'a tool result that fitted the conversation carries no artifact key';
+	is LLM::Agent::Event::ToolResult.new(
+		id => 'c1', content => 'excerpt…',
+		artifact => { file => 'x.txt', digest => 'd', bytes => 9, chars => 9,
+			'elided-chars' => 4 },
+	).to-hash<artifact><file>, 'x.txt',
+		'and one that was spilled to a file names it';
+};
+
+subtest 'RunStarted says what context the run was given, if any' => {
+	plan 5;
+
+	my $bare = LLM::Agent::Event::RunStarted.new(run-id => 'r', message-count => 3);
+	nok $bare.context-digest.defined, 'a run given no context has no digest';
+	nok $bare.to-hash<context-digest>:exists,
+		'and no key either — "no context" and "an empty context" are '
+			~ 'different facts';
+	is $bare.to-hash<message-count>, 3, 'while the count is where it was';
+
+	my $with = LLM::Agent::Event::RunStarted.new(
+		run-id => 'r', message-count => 3, context-digest => 'abc123',
+	);
+	is $with.to-hash<context-digest>, 'abc123',
+		'a run that was given one announces it, so a log can join a request '
+			~ 'to the run-context line beside it';
+	is $with.to-hash<message-count>, 3,
+		'and the count still describes the CONVERSATION — the context is '
+			~ 'not a message';
+};
+
+subtest 'RunFailed’s reason is present only when the failure has a name' => {
+	plan 4;
+
+	my $plain = LLM::Agent::Event::RunFailed.new(error => 'every backend failed');
+	nok $plain.reason.defined, 'an ordinary failure has no reason to give';
+	nok $plain.to-hash<reason>:exists,
+		'so nothing undefined leaks into the plain-data form';
+
+	my $named = LLM::Agent::Event::RunFailed.new(
+		error => 'the conversation does not fit', reason => 'context-exhausted',
+	);
+	is $named.reason, 'context-exhausted', 'a named one carries its name';
+	is $named.to-hash<reason>, 'context-exhausted',
+		'which a sink that never loads this module can still branch on';
 };
 
 subtest 'present-but-empty containers stay present' => {
@@ -215,6 +278,93 @@ subtest 'AskAnswered survives a UI that answers with anything' => {
 		'and a badly-formed one is reported as a string, not thrown over';
 };
 
+subtest 'the events v2 classes say the things v1 could only imply' => {
+	plan 10;
+
+	# TurnCommitted's whole job is the id, and a sessionless run has none.
+	is LLM::Agent::Event::TurnCommitted.new(
+		message-id => 'env-7', round => 2,
+	).to-hash<message-id>, 'env-7',
+		'a committed turn carries the session envelope id it was written under';
+	nok LLM::Agent::Event::TurnCommitted.new(round => 2).to-hash<message-id>:exists,
+		'and a sessionless one simply has no such key';
+
+	for <limit failed cancelled> -> $reason {
+		lives-ok {
+			LLM::Agent::Event::TurnDiscarded.new(:$reason)
+		}, "'$reason' is a way for a turn to be thrown away";
+	}
+	dies-ok { LLM::Agent::Event::TurnDiscarded.new(reason => 'whatever') },
+		'and a reason nothing emits is refused at construction';
+
+	# The distinction the whole ToolOperation state machine exists for.
+	my %never = LLM::Agent::Event::ToolAbandoned.new(
+		id => 'c1', name => 'fs_write', reason => 'cancelled',
+		dispatched => False,
+	).to-hash;
+	nok %never<dispatched>,
+		'an abandoned call that was never dispatched says so — it did not run';
+
+	my %unknown = LLM::Agent::Event::ToolAbandoned.new(
+		id => 'c1', name => 'fs_write', reason => 'deadline',
+		dispatched => True,
+	).to-hash;
+	ok %unknown<dispatched>,
+		'while one that was dispatched and detached admits it may have run';
+	is %unknown<reason>, 'deadline', 'saying why the loop stopped waiting';
+
+	# Progress is optional-total on purpose: a server that has no idea how
+	# many files there are still has something to report.
+	nok LLM::Agent::Event::ToolProgress.new(
+		id => 'c1', progress => 17e0,
+	).to-hash<total>:exists,
+		'progress without a total is a total-less key, not a null';
+};
+
+subtest 'the envelope is stamped by the Run, not built by the emitter' => {
+	plan 7;
+
+	# A hand-built event has no envelope at all, and serialises exactly as
+	# it did before there was one — which is what keeps a fixture, a
+	# transcript and a hand-rolled driver working.
+	my %bare = LLM::Agent::Event::Token.new(text => 'hi').to-hash;
+	nok %bare<run-id>:exists, 'an unpublished event has no run-id';
+	nok %bare<seq>:exists, 'and no seq';
+
+	# RunStarted's run-id is the base class's now: one attribute, filled
+	# by whoever supplies it and re-stamped by the Run at publication.
+	# It is still effectively required.
+	dies-ok { LLM::Agent::Event::RunStarted.new(message-count => 1) },
+		'a RunStarted that cannot say which run started is refused';
+	is LLM::Agent::Event::RunStarted.new(
+		run-id => 'r', message-count => 1,
+	).to-hash<run-id>, 'r',
+		'and one that can still serialises its run-id';
+
+	my $run = LLM::Agent::Run.new(id => 'the-run');
+	$run._emit: LLM::Agent::Event::Token.new(text => 'a');
+	$run._emit: LLM::Agent::Event::Token.new(text => 'b');
+	$run._finish: LLM::Agent::Event::RunCompleted.new(final => 'ab'),
+		final => 'ab';
+
+	my @kinds;
+	my @stamped;
+	my $done = Promise.new;
+	my $vow = $done.vow;
+	$run.events.tap(
+		-> $e { @kinds.push: $e.kind; @stamped.push: $e },
+		done => { $vow.keep(True) },
+	);
+	await Promise.anyof($done, Promise.in(10));
+
+	is @stamped.map({ .seq }).List, (0, 1, 2),
+		'published events are numbered in publication order, from zero';
+	is @stamped.map({ .run-id }).unique.List, ('the-run',),
+		'and stamped with the run that published them';
+	is @stamped.tail.to-hash<seq>, 2,
+		'the envelope reaches to-hash, so a transcript keeps the order too';
+};
+
 # --- the Run ----------------------------------------------------------
 
 subtest 'a fresh Run is running, identified, and not done' => {
@@ -286,8 +436,8 @@ subtest 'the result Promise is kept — for every outcome' => {
 	my %stopped = await $cancelled.result;
 	is %stopped<outcome>, 'cancelled', 'so does a cancelled one';
 	is %stopped.keys.sort,
-		['attempts', 'error', 'final', 'messages', 'outcome'],
-		'and all five keys are always there, so a caller can index blind';
+		['attempts', 'error', 'final', 'messages', 'outcome', 'reason'],
+		'and all six keys are always there, so a caller can index blind';
 };
 
 subtest 'the terminal contract is enforced by the Run, not by its driver' => {

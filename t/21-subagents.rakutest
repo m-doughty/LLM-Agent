@@ -1,0 +1,863 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Agent::Session;
+use LLM::Agent::Subagents;
+use LLM::Chat::Conversation::Message;
+
+# Delegation: a provider that publishes a `task` tool, spawns a child run
+# when the model calls it, forwards the child's events onto the PARENT's
+# stream wrapped in Subagent events, and answers with what the child
+# finally said.
+#
+# The three things this file exists to pin: the two streams never merge
+# (the parent's terminal contract survives a child completing), a child
+# that goes wrong is an is_error result and never an exception, and the
+# guards refuse in words the model can act on rather than by throwing.
+
+plan 16;
+
+my $tmp = $*TMPDIR.add("llm-agent-t21-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+my $n = 0;
+sub fresh-path(--> IO::Path) { $tmp.add('s' ~ $n++ ~ '.jsonl') }
+
+# Poll for a condition with a loud deadline. Never one sleep long enough
+# to "probably" be right.
+sub wait-until(&condition, Str:D $what) {
+	my $deadline = now + TIMEOUT;
+	until &condition() {
+		die "Timed out after {TIMEOUT}s waiting for $what" if now > $deadline;
+		sleep 0.005;
+	}
+}
+
+sub read-tool(--> Hash) {
+	tool-decl('fs_read', 'Read a file', { path => { type => 'string' } },
+		required => ['path']);
+}
+
+sub types(--> List) {
+	(
+		{ name => 'reviewer', description => 'Reviews a diff and reports problems.' },
+		{ name => 'tester', description => 'Runs the tests and reports failures.' },
+	);
+}
+
+# A task call as the model would emit it.
+sub task-call(
+	Str:D $id, Str:D $type, Str:D $prompt, Str :$label, Str :$raw,
+	--> Hash:D
+) {
+	tool-call($id, 'task', $raw // (
+		'{"agent-type":"' ~ $type ~ '","prompt":"' ~ $prompt ~ '"'
+			~ ($label.defined ?? ',"label":"' ~ $label ~ '"' !! '')
+			~ '}'
+	));
+}
+
+#|( The handle a spawn callback answers with: `.run` and `.session-path`,
+    duck-typed, exactly as the composer checks for. )
+class ChildHandle {
+	has LLM::Agent::Run:D $.run is required;
+	has Str:D $.session-path is required;
+}
+
+#|( A spawn callback over a table of scripts, keyed by agent type. Every
+    child it starts is recorded in C<@children> — the run, the spec it was
+    built from, and the loop that drives it (which has to be kept alive:
+    a loop that goes out of scope takes nothing with it, but a test that
+    wants to inspect one afterwards has to hold it). )
+class Spawner {
+	has %.scripts;
+	has $.provider;
+	has @.children;
+	has Lock:D $!lock .= new;
+
+	method callback(--> Callable:D) {
+		-> %spec {
+			my Str $type = %spec<type><name>;
+			my $backend = scripted-backend(
+				steps => (%!scripts{$type} // ()).map({ $_.Hash }).List,
+			);
+			my $loop = LLM::Agent::Loop.new(
+				backends => [$backend,],
+				|($!provider.defined ?? (provider => $!provider) !! ()),
+			);
+			my $run = $loop.run([msg('user', %spec<prompt>),]);
+
+			$!lock.protect: {
+				@!children.push: %(
+					spec => %spec.Hash, :$run, :$loop, :$backend,
+				);
+			};
+
+			ChildHandle.new(
+				run => $run,
+				session-path => $tmp.add("{%spec<agent-id>}.jsonl").Str,
+			);
+		};
+	}
+
+	method runs(--> List) { $!lock.protect: { @!children.map({ $_<run> }).List } }
+	method specs(--> List) { $!lock.protect: { @!children.map({ $_<spec> }).List } }
+	method count(--> Int) { $!lock.protect: { @!children.elems } }
+}
+
+# The two-round child script every happy-path test uses: a tool round,
+# then an answer.
+sub review-script(Str:D $answer = 'the review: it is fine' --> List) {
+	(
+		{ content => 'looking', tool-calls => [tool-call('k1', 'fs_read', '{"path":"a"}'),] },
+		{ content => $answer },
+	);
+}
+
+sub child-provider(--> ScriptedProvider) {
+	ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'the file says hello' },
+	);
+}
+
+subtest 'the task tool is published beside the inner catalogue' => {
+	plan 8;
+
+	my $inner = ScriptedProvider.new(tools => [read-tool(),]);
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => $inner, types => types(), spawn => -> %spec { Nil },
+	);
+
+	my @tools = $subagents.tools-for-llm.list;
+	is @tools.map({ $_<function><name> }).List, ('fs_read', 'task'),
+		"the inner catalogue first, in its own order, and the composer's "
+			~ 'own tool last';
+	is-deeply @tools[0], read-tool(),
+		'an inner declaration is passed through byte for byte — a composer '
+			~ 'that rewrote them would change what the model may call';
+
+	my %task = @tools[1]<function>;
+	is %task<parameters><required>.List, ('agent-type', 'prompt'),
+		'agent-type and prompt are required; label is not';
+	is %task<parameters><properties><agent-type><enum>.List,
+		('reviewer', 'tester'),
+		'and agent-type is an enum of exactly the types it was built with';
+	ok %task<description>.contains('reviewer: Reviews a diff'),
+		'the description tells the model what each agent is for, because '
+			~ 'nothing else will';
+	ok %task<parameters><properties><prompt><description>.contains('nothing of this one'),
+		'and that the child sees nothing of this conversation';
+
+	is $subagents.type-names.List, ('reviewer', 'tester'), 'type-names';
+	is $subagents.types[0]<description>, 'Reviews a diff and reports problems.',
+		'and types answers with the table it was given';
+};
+
+subtest 'an inner tool called task is dropped rather than published twice' => {
+	plan 2;
+
+	# Two declarations under one name is a request several providers
+	# reject outright, and the composer owns the name it routes on.
+	my $inner = ScriptedProvider.new(
+		tools => [read-tool(), tool-decl('task', 'Something else entirely'),],
+	);
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => $inner, types => types(), spawn => -> %spec { Nil },
+	);
+
+	my @names = $subagents.tools-for-llm.map({ $_<function><name> }).List;
+	is @names, ('fs_read', 'task'), 'the name appears exactly once';
+	ok $subagents.tools-for-llm[1]<function><description>.starts-with('Delegate'),
+		"and it is the composer's, not the inner provider's";
+};
+
+subtest 'a task call runs a child and answers with its final text' => {
+	plan 9;
+
+	my $spawner = Spawner.new(
+		scripts => { reviewer => review-script() }, provider => child-provider(),
+	);
+	my $inner = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'parent read' },
+	);
+
+	my $loop;
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => $inner, types => types(), spawn => $spawner.callback,
+		# The deferred form: $loop does not exist yet, and `loop => $loop`
+		# would copy an undefined value for ever.
+		loop => { $loop },
+	);
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'delegating',
+		  tool-calls => [task-call('c1', 'reviewer', 'review the diff', label => 'diff review'),] },
+		{ content => 'the reviewer says it is fine' },
+	]);
+	$loop = LLM::Agent::Loop.new(backends => [$backend,], provider => $subagents);
+
+	my $run = $loop.run([msg('user', 'review this'),]);
+	run-settled($run, 'the delegating run');
+	my @events = drain-events($run);
+
+	is (await $run.result)<outcome>, 'completed', 'the parent run completed';
+	is events-of(@events, 'tool-result').head.content,
+		'the review: it is fine',
+		"and the tool result IS the child's final message";
+	nok events-of(@events, 'tool-result').head.is-error,
+		'not an error';
+
+	is $spawner.count, 1, 'exactly one child was spawned';
+	is-deeply $spawner.specs[0]<type>, types()[0].Hash,
+		'and the spawn callback was handed the type record verbatim, so an '
+			~ "app's own keys survive";
+	is $spawner.specs[0]<prompt>, 'review the diff', 'with the prompt';
+	is $spawner.specs[0]<label>, 'diff review', 'and the label';
+
+	# THE ORDERING PROPERTY: the child's events land between the tool
+	# starting and the tool answering, in the child's own order, on the
+	# parent's stream.
+	my @kinds = event-kinds(@events);
+	my $started = @kinds.first({ $_ eq 'tool-started' }, :k);
+	my $result = @kinds.first({ $_ eq 'tool-result' }, :k);
+	my @wrapped = @events.grep({ $_ ~~ LLM::Agent::Event::Subagent }).List;
+	my @between = @wrapped.map({ $_.seq }).grep({ $started < $_ < $result });
+	ok @wrapped.elems > 5 && @between.elems == @wrapped.elems,
+		"every one of the child's events arrives after the call started "
+			~ 'and before it answered';
+
+	is-deeply @wrapped.map({ $_.inner<seq> }).List,
+		(^@wrapped.elems).List,
+		"and they arrive in the child's own order, contiguously, with the "
+			~ "child's seq intact inside the parent's";
+};
+
+subtest 'the wrapping keeps the two envelopes apart' => {
+	plan 7;
+
+	my $spawner = Spawner.new(
+		scripts => { tester => (({ content => 'all green' },)) },
+	);
+	my $loop;
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), spawn => $spawner.callback, loop => { $loop },
+	);
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'delegating',
+		  tool-calls => [task-call('c1', 'tester', 'run the tests'),] },
+		{ content => 'green' },
+	]);
+	$loop = LLM::Agent::Loop.new(backends => [$backend,], provider => $subagents);
+
+	my $run = $loop.run([msg('user', 'test this'),]);
+	run-settled($run, 'the tester run');
+	my @events = drain-events($run);
+
+	my @wrapped = @events.grep({ $_ ~~ LLM::Agent::Event::Subagent });
+	is @wrapped.map({ $_.run-id }).unique.List, ($run.id,),
+		"every wrapper carries the PARENT's run-id";
+	isnt @wrapped[0].inner<run-id>, $run.id,
+		"and the inner event the CHILD's";
+	is @wrapped[0].inner<run-id>, $spawner.runs[0].id,
+		'which is the child run it came from';
+
+	is @wrapped.map({ $_.agent-id }).unique.List, ('tester-1',),
+		'all of them tagged with the agent id';
+	is @wrapped.map({ $_.agent-type }).unique.List, ('tester',),
+		'and the agent type';
+
+	my @terminal = @wrapped.grep({
+		LLM::Agent::Event::TERMINAL-KINDS{$_.inner<kind>};
+	});
+	is @terminal.elems, 1,
+		"the child's terminal event is forwarded like any other";
+	nok @terminal[0].is-terminal,
+		'and the wrapper around it is NOT terminal — the child ending is '
+			~ 'not the parent ending, and a consumer that stops on a '
+			~ 'terminal must not stop here';
+};
+
+subtest 'a child that fails becomes an is_error result, and the run goes on' => {
+	plan 5;
+
+	my $spawner = Spawner.new(scripts => {
+		reviewer => (({ error => 'the model is on fire', error-class => 'http',
+			error-status => 500 },)),
+	});
+	my $loop;
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), spawn => $spawner.callback, loop => { $loop },
+	);
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'delegating',
+		  tool-calls => [task-call('c1', 'reviewer', 'review the diff'),] },
+		{ content => 'the reviewer could not do it, so here is my own answer' },
+	]);
+	$loop = LLM::Agent::Loop.new(backends => [$backend,], provider => $subagents);
+
+	my $run = $loop.run([msg('user', 'review this'),]);
+	run-settled($run, 'the failing-child run');
+	my @events = drain-events($run);
+
+	is (await $run.result)<outcome>, 'completed',
+		"the PARENT completed: a child's failure is data, not an exception";
+	my $result = events-of(@events, 'tool-result').head;
+	ok $result.is-error, 'the task call came back as an error';
+	ok $result.content.contains('reviewer-1'),
+		'naming the agent that failed';
+	ok $result.content.contains('the model is on fire'),
+		'and saying why, in the words the child failed with';
+	is $subagents.live-agents.elems, 0,
+		'and its slot was released';
+};
+
+subtest 'the arguments a model gets wrong are refused in words' => {
+	plan 7;
+
+	my $spawner = Spawner.new(scripts => { reviewer => review-script() });
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), spawn => $spawner.callback,
+	);
+
+	# No loop, no run: a task call is answerable on its own, which is what
+	# makes the refusals testable without driving a whole loop.
+	sub refusal(Str:D $arguments --> Hash) {
+		$subagents.execute-tool-calls(
+			[tool-call('c1', 'task', $arguments),],
+		).head;
+	}
+
+	my %unknown = refusal('{"agent-type":"designer","prompt":"do it"}');
+	ok %unknown<is_error>, 'an agent type nobody registered is refused';
+	ok %unknown<content>.contains("'reviewer', 'tester'"),
+		'and the refusal lists the ones that exist';
+
+	ok refusal('{"prompt":"do it"}')<is_error>, 'a call with no agent-type';
+	ok refusal('{"agent-type":"reviewer"}')<is_error>, 'a call with no prompt';
+	ok refusal('{"agent-type":"reviewer","prompt":"   "}')<is_error>,
+		'a call whose prompt is only whitespace';
+	ok refusal('not json at all')<is_error>,
+		'and arguments that are not a JSON object at all';
+
+	is $spawner.count, 0,
+		'and not one of them started a child: a refusal is a refusal '
+			~ 'before anything has been spent';
+};
+
+subtest 'the identical-spawn guard trips at the cap' => {
+	plan 5;
+
+	my $spawner = Spawner.new(scripts => {
+		reviewer => (({ content => 'the same answer' },)),
+	});
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), spawn => $spawner.callback,
+		max-identical-spawns => 2,
+	);
+
+	my Int $call-number = 0;
+	sub spawn-once(Str:D $arguments --> Hash) {
+		$subagents.execute-tool-calls(
+			[tool-call('c' ~ $call-number++, 'task', $arguments),],
+		).head;
+	}
+
+	my $first = '{"agent-type":"reviewer","prompt":"review the diff"}';
+	nok spawn-once($first)<is_error>, 'the first spawn runs';
+	# The same request, written differently: key order and the JSON's own
+	# whitespace are not part of what makes two spawns identical, exactly
+	# as they are not for the loop's identical-call guard.
+	nok spawn-once('{ "prompt" : "review the diff", "agent-type" : "reviewer" }')<is_error>,
+		'the second, written with the keys the other way round, still runs';
+
+	my %third = spawn-once($first);
+	ok %third<is_error>,
+		'the third is refused: the same task twice over is an answer '
+			~ 'already given';
+	ok %third<content>.contains('2 times'),
+		'and the refusal says what the limit was';
+
+	nok spawn-once('{"agent-type":"reviewer","prompt":"review something else"}')<is_error>,
+		'while a different task is unaffected — the guard is per request, '
+			~ 'not per agent';
+};
+
+subtest 'the max-live backstop refuses while children are running' => {
+	plan 5;
+
+	my $gate = Promise.new;
+	# A child whose one tool call is blocked, so it stays live until the
+	# test lets it go.
+	my $blocked = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'eventually' },
+		block-call => { fs_read => $gate },
+	);
+	my $spawner = Spawner.new(
+		scripts => { reviewer => review-script() }, provider => $blocked,
+	);
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), spawn => $spawner.callback, max-live => 2,
+	);
+
+	my @in-flight = (^2).map(-> $i {
+		start $subagents.execute-tool-calls(
+			[task-call("c$i", 'reviewer', "review chunk $i"),],
+		).head;
+	});
+	wait-until({ $subagents.live-agents.elems == 2 }, 'both children to start');
+
+	is $subagents.live-agents.map({ $_<agent-id> }).List,
+		('reviewer-1', 'reviewer-2'),
+		'live-agents lists them, oldest first';
+	ok $subagents.live-agents[0]<session-path>.ends-with('reviewer-1.jsonl'),
+		"each carrying the path the spawn callback gave it";
+
+	my %refused = $subagents.execute-tool-calls(
+		[task-call('c9', 'reviewer', 'review one more chunk'),],
+	).head;
+	ok %refused<is_error>, 'a third is refused while two are running';
+	ok %refused<content>.contains('Wait for'),
+		'and told to wait rather than left to guess';
+
+	$gate.keep(True);
+	my @results = await @in-flight;
+	is @results.grep({ !$_<is_error> }).elems, 2,
+		'and once they answer, both of the running ones succeeded';
+};
+
+subtest 'cancelling the parent cancels its children' => {
+	plan 5;
+
+	my $gate = Promise.new;
+	my $blocked = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'eventually' },
+		block-call => { fs_read => $gate },
+	);
+	my $spawner = Spawner.new(
+		scripts => { reviewer => review-script() }, provider => $blocked,
+	);
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my $loop;
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), spawn => $spawner.callback, loop => { $loop },
+		:$session,
+	);
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'delegating',
+		  tool-calls => [task-call('c1', 'reviewer', 'review the diff'),] },
+		{ content => 'never reached' },
+	]);
+	$loop = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => $subagents, :$session,
+	);
+
+	my $run = $loop.run([msg('user', 'review this'),]);
+	wait-until({ $subagents.live-agents.elems == 1 }, 'the child to start');
+
+	$run.cancel;
+	run-settled($run, 'the cancelled parent');
+
+	my $child = $spawner.runs[0];
+	wait-until({ $child.is-done }, 'the child to notice');
+	is $child.result.result<outcome>, 'cancelled',
+		'the cascade reached the child: cancelling the parent cancelled it';
+	is (await $run.result)<outcome>, 'cancelled', 'and the parent is cancelled';
+
+	wait-until({ $subagents.live-agents.elems == 0 },
+		'the child slot to be released');
+	is $subagents.live-agents.elems, 0,
+		'the slot is released even though nobody was waiting for the '
+			~ 'result any more';
+
+	# The task call still settled — the batch was detached, not left
+	# hanging — and the transcript is where that is visible.
+	wait-until(
+		{ $session.events.grep({ $_<type> eq 'subagent-settled' }).elems == 1 },
+		'the settle envelope',
+	);
+	my %settled = $session.events.first({ $_<type> eq 'subagent-settled' })<payload>;
+	is %settled<outcome>, 'cancelled', 'and recorded as cancelled';
+	ok %settled<result>.contains('cancelled'),
+		'with a result that says so in words the model would have been '
+			~ 'given';
+
+	$gate.keep(True);
+	$session.close;
+};
+
+subtest 'cancel-children settles a task call as an error instead of hanging' => {
+	plan 3;
+
+	my $gate = Promise.new;
+	my $blocked = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'eventually' },
+		block-call => { fs_read => $gate },
+	);
+	my $spawner = Spawner.new(
+		scripts => { reviewer => review-script() }, provider => $blocked,
+	);
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), spawn => $spawner.callback,
+	);
+
+	my $call = start $subagents.execute-tool-calls(
+		[task-call('c1', 'reviewer', 'review the diff'),],
+	).head;
+	wait-until({ $subagents.live-agents.elems == 1 }, 'the child to start');
+
+	is $subagents.cancel-children, 1, 'one child was asked to stop';
+
+	await Promise.anyof($call, Promise.in(TIMEOUT));
+	is $call.status, Kept, 'the task call settled rather than hanging';
+	ok $call.result<is_error>,
+		'as an error: a cancelled child produced no answer';
+
+	$gate.keep(True);
+};
+
+subtest 'the parent transcript records both envelopes, and replays without the child' => {
+	plan 8;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(
+		path => $path, meta => { agent => 'test' },
+	);
+
+	my $spawner = Spawner.new(
+		scripts => { reviewer => review-script('the diff is fine') },
+		provider => child-provider(),
+	);
+	my $loop;
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), spawn => $spawner.callback, loop => { $loop },
+		:$session,
+	);
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'delegating',
+		  tool-calls => [task-call('c1', 'reviewer', 'review the diff', label => 'the diff'),] },
+		{ content => 'it is fine' },
+	]);
+	$loop = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => $subagents, :$session,
+	);
+
+	my $run = $loop.run([msg('user', 'review this'),]);
+	run-settled($run, 'the recorded run');
+	drain-events($run);
+
+	my @types = $session.events.map({ $_<type> }).List;
+	is @types.grep({ $_ eq 'subagent-spawned' }).elems, 1, 'one spawn line';
+	is @types.grep({ $_ eq 'subagent-settled' }).elems, 1, 'one settle line';
+
+	my %spawned = $session.events.first({ $_<type> eq 'subagent-spawned' })<payload>;
+	is-deeply
+		%spawned<agent-id agent-type prompt label>.List,
+		('reviewer-1', 'reviewer', 'review the diff', 'the diff'),
+		'the spawn line says who, what and why';
+	ok %spawned<child-path>.ends-with('reviewer-1.jsonl'),
+		'and points at the child transcript rather than copying it';
+
+	my %settled = $session.events.first({ $_<type> eq 'subagent-settled' })<payload>;
+	is %settled<outcome>, 'completed', 'the settle line has the outcome';
+	is %settled<result>, 'the diff is fine',
+		'and an excerpt of what the parent model was given';
+
+	my Int $messages = $session.messages.elems;
+	$session.close;
+
+	# The whole point of append-event: a reader that has never heard of a
+	# subagent replays the file without complaint, and needs none of the
+	# children's files to do it.
+	ok !$tmp.add('reviewer-1.jsonl').e,
+		'the child transcript was never written by this test';
+	my $replayed = LLM::Agent::Session.load(path => $path);
+	is $replayed.messages.elems, $messages,
+		'and the parent replays to exactly the same conversation';
+	$replayed.close;
+};
+
+subtest 'what a child spent is recorded only when somebody was counting' => {
+	plan 3;
+
+	# The conditional key of the run result Map, carried through to the
+	# settle envelope: absent means NOBODY WAS COUNTING, which is a
+	# different answer from "nothing was spent" and must not collapse
+	# into a zero.
+	sub settled(Int $context-budget --> Hash) {
+		my $path = fresh-path();
+		my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+		my &spawn = -> %spec {
+			my $backend = scripted-backend(steps => [
+				{ content => 'counted', usage => { prompt => 40, completion => 8 } },
+			]);
+			ChildHandle.new(
+				run => LLM::Agent::Loop.new(
+					backends => [$backend,],
+					|($context-budget.defined ?? (:$context-budget) !! ()),
+				).run([msg('user', %spec<prompt>),]),
+				session-path => '',
+			);
+		};
+
+		my $subagents = LLM::Agent::Subagents.new(
+			inner => ScriptedProvider.new(tools => [read-tool(),]),
+			types => types(), :&spawn, :$session,
+		);
+		$subagents.execute-tool-calls(
+			[task-call('c1', 'reviewer', 'count something'),],
+		);
+
+		my %payload =
+			$session.events.first({ $_<type> eq 'subagent-settled' })<payload>;
+		$session.close;
+		%payload;
+	}
+
+	my %counted = settled(128_000);
+	ok %counted<spent>:exists, 'a child with a budget says what it spent';
+	is %counted<spent><total-tokens>, 48,
+		'the tokens the provider billed it for';
+
+	nok settled(Int)<spent>:exists,
+		'and one without a budget says nothing at all, rather than zero';
+};
+
+subtest 'everything that is not a task call goes through untouched' => {
+	plan 5;
+
+	my $inner = ScriptedProvider.new(
+		tools => [read-tool(),],
+		responder => -> $name, $args, $id { "read $args for $id" },
+	);
+	my $spawner = Spawner.new(scripts => {
+		reviewer => (({ content => 'reviewed' },)),
+	});
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => $inner, types => types(), spawn => $spawner.callback,
+	);
+
+	my %read = tool-call('c1', 'fs_read', '{"path":"a"}');
+	my @results = $subagents.execute-tool-calls([
+		%read,
+		task-call('c2', 'reviewer', 'review it'),
+		tool-call('c3', 'fs_read', '{"path":"b"}'),
+	]).List;
+
+	is @results.elems, 3, 'one result per call';
+	is @results.map({ $_<tool_call_id> }).List, ('c1', 'c2', 'c3'),
+		'in the order the calls came in, whatever route each took';
+	is-deeply $inner.recorded-calls[0], %read,
+		'the inner provider saw the call exactly as the model sent it';
+	is @results[0]<content>, 'read {"path":"a"} for c1',
+		"and its answer is the inner provider's, untouched";
+	is @results[1]<content>, 'reviewed',
+		'while the task call in the middle was answered by the child';
+};
+
+subtest 'wiring, and what a composer refuses to be built as' => {
+	plan 11;
+
+	my $inner = ScriptedProvider.new(tools => [read-tool(),]);
+	my $spawner = Spawner.new(scripts => {
+		reviewer => (({ content => 'done' },)),
+	});
+
+	# set-loop, the alternative to closing over a forward declaration.
+	my $late = LLM::Agent::Subagents.new(
+		inner => $inner, types => types(), spawn => $spawner.callback,
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [scripted-backend(steps => [{ content => 'hi' },]),],
+		provider => $late,
+	);
+	lives-ok { $late.set-loop($loop) }, 'set-loop takes a loop';
+	lives-ok { $late.set-loop({ $loop }) }, 'and a Callable returning one';
+	dies-ok { $late.set-loop('the loop') }, 'and nothing else';
+
+	# A composer with no loop at all still delegates; it just has nowhere
+	# to publish the child's events.
+	my $loopless = LLM::Agent::Subagents.new(
+		inner => $inner, types => types(), spawn => $spawner.callback,
+	);
+	nok $loopless.execute-tool-calls(
+		[task-call('c1', 'reviewer', 'review it'),],
+	).head<is_error>, 'a composer with no loop still runs a child';
+
+	throws-like
+		{ LLM::Agent::Subagents.new(
+			inner => $inner, types => types(), spawn => $spawner.callback,
+			loop => 'not a loop',
+		) },
+		Exception, message => /'Callable returning one'/,
+		'a loop that is neither a Loop nor a Callable is refused at '
+			~ 'construction';
+
+	throws-like
+		{ LLM::Agent::Subagents.new(
+			inner => 'not a provider', types => types(),
+			spawn => $spawner.callback,
+		) },
+		Exception, message => /'tools-for-llm'/,
+		'and an inner that is not a provider';
+
+	throws-like
+		{ LLM::Agent::Subagents.new(
+			inner => $inner, spawn => $spawner.callback,
+			# NO trailing comma, deliberately: this is the trap.
+			types => [{ name => 'reviewer', description => 'a' }],
+		) },
+		Exception, message => /'single-argument rule'/,
+		'a lone type hash that Raku flattened into Pairs is caught with '
+			~ 'the fix, not left to fail somewhere else';
+
+	throws-like
+		{ LLM::Agent::Subagents.new(
+			inner => $inner, spawn => $spawner.callback, types => [],
+		) },
+		Exception, message => /'types is empty'/,
+		'an empty table is refused';
+
+	throws-like
+		{ LLM::Agent::Subagents.new(
+			inner => $inner, spawn => $spawner.callback,
+			types => (
+				{ name => 'reviewer', description => 'a' },
+				{ name => 'reviewer', description => 'b' },
+			),
+		) },
+		Exception, message => /'both called'/,
+		'and so are two types with one name';
+
+	throws-like
+		{ LLM::Agent::Subagents.new(
+			inner => $inner, spawn => $spawner.callback,
+			types => ({ name => 'reviewer' }, { name => 'tester', description => 'b' }),
+		) },
+		Exception, message => /'no description'/,
+		'a type with no description';
+
+	throws-like
+		{ LLM::Agent::Subagents.new(
+			inner => $inner, types => types(), spawn => $spawner.callback,
+			max-live => 0,
+		) },
+		Exception, message => /'max-live'/,
+		'and a composer that could never run anything';
+};
+
+subtest 'a spawn callback that goes wrong is an error, not an exception' => {
+	plan 6;
+
+	my $inner = ScriptedProvider.new(tools => [read-tool(),]);
+
+	sub composer(&spawn --> LLM::Agent::Subagents) {
+		LLM::Agent::Subagents.new(
+			inner => $inner, types => types(), :&spawn,
+		);
+	}
+
+	sub answer($subagents --> Hash) {
+		$subagents.execute-tool-calls(
+			[task-call('c1', 'reviewer', 'review it'),],
+		).head;
+	}
+
+	my $threw = composer(-> %spec { die 'no capacity' });
+	my %died = answer($threw);
+	ok %died<is_error>, 'a callback that throws becomes an error result';
+	ok %died<content>.contains('no capacity'),
+		'carrying what it said';
+	is $threw.live-agents.elems, 0, 'and the slot it reserved is released';
+
+	ok answer(composer(-> %spec { 'a string' }))<is_error>,
+		'a callback that answers with something unshaped';
+	ok answer(composer(-> %spec { Nil }))<is_error>,
+		'or with nothing at all';
+
+	# A handle of the right shape whose .run is not a Run: the one a
+	# `.can`-only check would let through into an await that never ends.
+	my $wrong = composer(-> %spec {
+		class { has $.run = 'not a run'; has Str $.session-path = '' }.new;
+	});
+	ok answer($wrong)<is_error>,
+		'or with a handle whose run is not a Run';
+};
+
+subtest 'emit-external is the seam, and it refuses rather than racing' => {
+	plan 6;
+
+	my $gate = Promise.new;
+	my $provider = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'eventually' },
+		block-call => { fs_read => $gate },
+	);
+	my $backend = scripted-backend(steps => [
+		{ content => 'hello' },
+		{ content => 'again', tool-calls => [tool-call('c1', 'fs_read', '{}'),] },
+		{ content => 'done' },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$provider);
+
+	sub note-event(--> LLM::Agent::Event) {
+		LLM::Agent::Event::Log.new(
+			level => 'info', logger => 'test', data => 'from outside',
+		);
+	}
+
+	nok $loop.emit-external(note-event()),
+		'with no run ever started there is nothing to publish onto';
+
+	my $run = $loop.run([msg('user', 'hi'),]);
+	run-settled($run, 'the first run');
+	my @events = drain-events($run);
+
+	nok $loop.emit-external(note-event()),
+		'and a finished run refuses rather than emitting after its terminal';
+	is events-of(@events, 'log').elems, 0,
+		'so nothing landed on it';
+
+	throws-like
+		{ $loop.emit-external(LLM::Agent::Event::RunCompleted.new(final => 'x')) },
+		Exception, message => /'terminal'/,
+		'a terminal event is a category error, not a race: only the loop '
+			~ 'may end its own run';
+
+	# And the live case, from a thread of its own — which is the whole
+	# reason this exists. The run is held open by a blocked tool call, so
+	# "live" is a fact here rather than a hope about scheduling.
+	my $second = $loop.run([msg('user', 'again'),]);
+	wait-until({ $provider.recorded-calls.elems == 1 },
+		'the second run to reach its tool call');
+	my $emitted = await start { $loop.emit-external(note-event()) };
+	$gate.keep(True);
+	run-settled($second, 'the second run');
+	my @more = drain-events($second);
+
+	ok $emitted, 'a live run takes it, from whichever thread it came from';
+	is events-of(@more, 'log').elems, 1,
+		'and it is published on that run, once';
+};

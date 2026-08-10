@@ -1,0 +1,347 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Agent::Run;
+use LLM::Chat::Conversation::Message;
+
+# The concurrency contracts: one published order however many threads are
+# emitting, nothing after the terminal, and a run that has ended keeping
+# its hands off the run that replaced it.
+#
+# These are HAMMERS. Each one is written to lose on the old code and to
+# lose loudly rather than intermittently: the races are driven from a
+# start gun and repeated, and every assertion is made after a POLLED wait
+# (run-settled / drained-settled / wait-until), never after a sleep long
+# enough to "probably" be right.
+
+plan 5;
+
+my @prompt = [msg('user', 'hello'),];
+
+# How many times the Run-level publication race is run. High enough that a
+# lost event or a stray terminal shows up as a failure rather than as a
+# story about a machine that was busy that afternoon.
+constant ITERATIONS = 100;
+
+# Poll for a condition with a loud deadline — the t/06 idiom.
+sub wait-until(&condition, Str:D $what) {
+	my $deadline = now + TIMEOUT;
+	until &condition() {
+		die "Timed out after {TIMEOUT}s waiting for $what" if now > $deadline;
+		sleep 0.005;
+	}
+}
+
+#| One iteration of the publication race: four threads emitting as fast as
+#| the mailbox will take them, one thread finishing the run out from under
+#| them. Returns C<< { complaint, events } >> — an empty complaint is a
+#| clean iteration.
+sub hammer-run(Int:D $iteration --> Hash:D) {
+	my $run = LLM::Agent::Run.new;
+
+	my @seen;
+	my $status-at-terminal;
+	my $published = Promise.new;
+	my $vow = $published.vow;
+
+	my $tap = $run.events.tap(
+		-> $event {
+			@seen.push: $event;
+			# Read the result through .status and never by awaiting it: a
+			# regression that keeps the vow AFTER publishing the terminal
+			# has to fail this test, not hang the suite on it.
+			$status-at-terminal = $run.result.status if $event.is-terminal;
+		},
+		done => { $vow.keep(True) },
+	);
+
+	# One start gun for all five threads, so the terminal is racing live
+	# emissions from the first microsecond instead of arriving once they
+	# have all been made.
+	my $go = Promise.new;
+
+	my @emitters = (^4).map(-> $worker {
+		start {
+			await $go;
+			my Int $n = 0;
+			# _emit returns False the moment the run closes, which is the
+			# only stop signal these threads have.
+			while $run._emit(LLM::Agent::Event::Log.new(
+				level => 'info', logger => "emitter-$worker", data => "$n",
+			)) { $n++ }
+			$n;
+		}
+	});
+
+	my $finisher = start {
+		await $go;
+		# A different slice of the window every iteration: sometimes the
+		# terminal is the first thing in the mailbox, sometimes it lands
+		# under a few hundred log events.
+		sleep 0.0005 * ($iteration % 4);
+		$run._finish(
+			LLM::Agent::Event::RunCompleted.new(final => 'done'),
+			final => 'done',
+		);
+	};
+
+	$go.keep(True);
+	await Promise.allof(|@emitters, $finisher);
+	await Promise.anyof($published, Promise.in(TIMEOUT));
+	$tap.close;
+
+	my %report = events => @seen.elems, complaint => '';
+	my &complain = -> Str:D $why { %report<complaint> = "iteration $iteration: $why" };
+
+	if $published.status !== Kept {
+		complain('the Supply never said done');
+	}
+	elsif @seen.grep({ .is-terminal }).elems != 1 {
+		complain('published '
+			~ @seen.grep({ .is-terminal }).elems ~ ' terminal events');
+	}
+	elsif !@seen.tail.is-terminal {
+		complain(@seen.elems - 1 - @seen.first({ .is-terminal }, :k)
+			~ ' events were published after the terminal');
+	}
+	elsif (^@seen.elems).first({ @seen[$_].seq != $_ }).defined {
+		my $bad = (^@seen.elems).first({ @seen[$_].seq != $_ });
+		complain("event $bad of {@seen.elems} carries seq "
+			~ @seen[$bad].seq.gist ~ ' — the order has a hole in it');
+	}
+	elsif @seen.first({ .run-id ne $run.id }).defined {
+		complain('an event carries run-id '
+			~ @seen.first({ .run-id ne $run.id }).run-id.gist);
+	}
+	elsif $status-at-terminal !=== Kept {
+		complain('the result was ' ~ $status-at-terminal.gist
+			~ ' when the terminal arrived, not Kept');
+	}
+
+	%report;
+}
+
+subtest 'nothing is published after the terminal, however many threads emit' => {
+	plan 3;
+
+	my @reports = (^ITERATIONS).map({ hammer-run($_) });
+	my @complaints = @reports.map({ $_<complaint> }).grep({ .chars });
+
+	is @complaints.elems, 0, "{ITERATIONS} iterations of a four-thread "
+		~ 'publication race, and every one of them published exactly one '
+		~ 'terminal, last, with a contiguous seq and a kept result'
+		~ (@complaints ?? ' — ' ~ @complaints.head !! '');
+
+	# Proof the race was real rather than four threads that never got to
+	# run: if the terminal always won the start gun, the assertion above
+	# would be true and meaningless.
+	ok @reports.map({ $_<events> }).sum > ITERATIONS,
+		'the emitters really did get events in before the terminal';
+
+	is @reports.grep({ $_<events> < 1 }).elems, 0,
+		'and every iteration published at least its terminal — a run that '
+			~ 'closed before its drain task ever ran would still have to '
+			~ 'deliver it';
+};
+
+subtest 'a subscriber that throws loses its own event and nothing else' => {
+	plan 4;
+
+	# Supplier.emit rethrows a tap's exception at whoever emitted it, and
+	# whoever emits here is the one task publishing the whole run. Without
+	# per-event shielding, one badly-written `whenever` block would eat the
+	# rest of the mailbox — the terminal and the Supply's done with it.
+	my $run = LLM::Agent::Run.new;
+
+	my @survived;
+	my $done = Promise.new;
+	my $vow = $done.vow;
+
+	# The gate holds the drain task inside the tap while the rest of the
+	# run is enqueued, so the exploding event and the two events after it
+	# are certainly published as ONE batch. Without that, a drain task
+	# quick enough to take them one at a time would hide the bug.
+	my $gate = Promise.new;
+
+	$run.events.tap(
+		-> $event {
+			await $gate if $event.kind eq 'run-started';
+			die 'the subscriber blew up' if $event.kind eq 'token';
+			@survived.push: $event;
+		},
+		done => { $vow.keep(True) },
+		quit => -> $ex { $vow.break($ex) },
+	);
+
+	$run._emit: LLM::Agent::Event::RunStarted.new(
+		run-id => $run.id, message-count => 1,
+	);
+	$run._emit: LLM::Agent::Event::Token.new(text => 'boom');
+	$run._emit: LLM::Agent::Event::Log.new(level => 'info', data => 'after');
+	$run._finish: LLM::Agent::Event::RunCompleted.new(final => 'ok'),
+		final => 'ok';
+	$gate.keep(True);
+
+	await Promise.anyof($done, Promise.in(TIMEOUT));
+
+	is $done.status, Kept,
+		'the Supply still finished — the drain task survived the throw';
+	is event-kinds(@survived), ['run-started', 'log', 'run-completed'],
+		'everything after the exploding event was still delivered';
+	is (await $run.result)<outcome>, 'completed', 'and the result stands';
+	is $run.drained.status, Kept, 'as does drained';
+};
+
+subtest 'the log hook cannot land an event after the loop finished the run' => {
+	plan 6;
+
+	# A stream slow enough that the hammer below is still going when the
+	# run ends, which is the only interesting moment.
+	my $backend = scripted-backend(steps => [
+		{ chunks => ('a' .. 'z').List, 'chunk-delay' => 0.01 },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
+	my &log = $loop.log-hook;
+
+	my $run = $loop.run(@prompt);
+
+	# Two threads doing what an MCP server's notification thread does,
+	# throttled only enough to keep the event count reviewable.
+	my @hammers = (^2).map(-> $worker {
+		start {
+			my Int $n = 0;
+			until $run.is-done {
+				log({ level => 'info', logger => "hammer-$worker", data => "$n" });
+				$n++;
+				sleep 0.0002;
+			}
+			$n;
+		}
+	});
+
+	run-settled($run, 'the hammered run');
+	await Promise.allof(|@hammers);
+	drained-settled($run, 'the hammered run');
+
+	my @events = drain-events($run);
+
+	is @events.grep({ .is-terminal }).elems, 1, 'exactly one terminal';
+	is event-kinds(@events).tail, 'run-completed',
+		'and it is the last event on the Supply — a log from another '
+			~ 'thread cannot get in behind it';
+	ok events-of(@events, 'log').elems > 0,
+		'the hook really was publishing into this run';
+	is-deeply @events.map({ .seq }).List, (^@events.elems).List,
+		'seq is contiguous across every thread that emitted';
+	is @events.map({ .run-id }).unique.List, ($run.id,),
+		'and every event is stamped with the run that published it';
+	is (await $run.result)<outcome>, 'completed', 'the run itself was fine';
+};
+
+subtest 'a finished run cannot reach into the run that replaced it' => {
+	plan 8;
+
+	my $backend = scripted-backend(steps => [
+		# A: answers at once. B: streams for as long as the test needs.
+		{ content => 'the first answer' },
+		{ chunks => ('a' .. 'z').List, 'chunk-delay' => 0.2 },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
+
+	my $a = $loop.run(@prompt);
+	run-settled($a, 'run A');
+	drained-settled($a, 'run A');
+	is (await $a.result)<outcome>, 'completed', 'A finished on its own';
+
+	my $b = $loop.run(@prompt);
+	wait-until { $backend.recorded-calls.elems >= 2 }, 'B to start streaming';
+
+	# The defect this pins: A's cancel hook captured no run identity, so
+	# it poked whatever stream the loop happened to be holding — which by
+	# now is B's.
+	my @cancellers = (^4).map({
+		start { $a.cancel for ^50 }
+	});
+	await Promise.allof(|@cancellers);
+
+	is $backend.cancelled-responses.elems, 0,
+		'two hundred cancels of a finished run reach no response at all — '
+			~ "B's stream is not A's to cancel";
+	nok $a.is-cancelled,
+		'and A does not claim to have been cancelled after it completed';
+	is $a.cancellation.status, Planned,
+		'the cancellation Promise of a finished run stays Planned';
+	is (await $a.result)<outcome>, 'completed', "A's outcome stands";
+	is $a.drained.status, Kept, 'and A is still drained';
+
+	# The positive control: the owner tag must not have made cancel a
+	# no-op for the run that DOES own the slot.
+	$b.cancel;
+	run-settled($b, 'run B');
+	ok $backend.cancelled-responses.elems >= 1,
+		"B's own cancel does reach the backend";
+	is $backend.cancelled-responses.map({ .id }).unique.List,
+		('scripted-stream-2',),
+		'and reaches exactly the response B was streaming';
+};
+
+subtest 'cancelling a blocked batch frees the loop at once; drained waits' => {
+	plan 9;
+
+	my $gate = Promise.new;
+	my $backend = scripted-backend(steps => [
+		{ content => 'reading',
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+		{ content => 'the second run' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [tool-decl('fs_read', 'Read a file'),],
+		results => { fs_read => 'the file contents' },
+		block-on => $gate,
+	);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$provider);
+
+	my $a = $loop.run(@prompt);
+	wait-until { $provider.recorded-batches.elems >= 1 }, "A's batch to block";
+	$a.cancel;
+	run-settled($a, 'run A');
+
+	is (await $a.result)<outcome>, 'cancelled',
+		'the cancelled run gets its answer without waiting for the batch';
+	is $a.drained.status, Planned,
+		'but it is NOT drained: the batch nobody can interrupt is still '
+			~ 'running, and that is exactly where result and drained '
+			~ 'deliberately diverge';
+
+	# The guard pin. The old code kept A's result vow inside the state
+	# machine and cleaned up afterwards, so this admitted B while A's
+	# driver was still holding the loop's stream slot.
+	my $b;
+	lives-ok { $b = $loop.run(@prompt) },
+		'the loop admits the next run the moment the first one is done';
+	run-settled($b, 'run B');
+	is (await $b.result)<outcome>, 'completed',
+		'and B runs to completion over the top of the abandoned batch';
+
+	# Let the batch land, and give what it produces every chance to leak
+	# into a run before believing that it cannot.
+	$gate.keep(True);
+	drained-settled($a, 'run A after the batch finally returned');
+	drained-settled($b, 'run B');
+
+	my @a-events = drain-events($a, "run A's events");
+	my @b-events = drain-events($b, "run B's events");
+
+	is event-kinds(@a-events).tail, 'run-cancelled', "A's terminal is last";
+	is events-of(@a-events, 'tool-result').elems, 0,
+		'the batch that finished after the cancel reported nothing — no '
+			~ 'ToolResult, in either direction';
+	is events-of(@b-events, 'tool-result').elems, 0,
+		"and nothing of A's landed in B";
+	is @a-events.map({ .run-id }).unique.List, ($a.id,),
+		"every event A published is stamped A's";
+	is @b-events.map({ .run-id }).unique.List, ($b.id,),
+		"and every event B published is stamped B's";
+};

@@ -1,0 +1,729 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Agent::Session;
+use LLM::Chat::Conversation::Message;
+
+# Per-operation dispatch: one call at a time, each with a start and a
+# settle of its own, and the three ways one can end without an answer —
+# never dispatched, deadline, cancelled. This is the file that pins the
+# difference between "it did not run" and "we do not know".
+
+plan 14;
+
+my @prompt = [msg('user', 'do the thing'),];
+
+my $tmp = $*TMPDIR.add("llm-agent-t18-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+my $n = 0;
+sub fresh-path(--> IO::Path) { $tmp.add('d' ~ $n++ ~ '.jsonl') }
+
+# Wait for a condition by POLLING, with a loud deadline. Never one sleep
+# long enough to "probably" be right.
+sub wait-until(&condition, Str:D $what) {
+	my $deadline = now + TIMEOUT;
+	until &condition() {
+		die "Timed out after {TIMEOUT}s waiting for $what" if now > $deadline;
+		sleep 0.005;
+	}
+}
+
+sub tools(--> List) {
+	(
+		tool-decl('fs_read', 'Read a file', { path => { type => 'string' } }),
+		tool-decl('fs_write', 'Write a file', { path => { type => 'string' } }),
+	);
+}
+
+# The envelope types of a transcript, in file order — the shape every
+# durability assertion below is made against.
+sub envelope-types($session --> List) {
+	$session.events.map({ $_<type> }).List;
+}
+
+subtest 'each call is dispatched, settled and recorded on its own' => {
+	plan 7;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'two things',
+		  'tool-calls' => [
+			tool-call('c1', 'fs_read', '{"path":"a"}'),
+			tool-call('c2', 'fs_write', '{"path":"b"}'),
+		  ] },
+		{ content => 'done' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(),
+		results => { fs_read => 'contents', fs_write => 'written' },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$session,
+		idempotency-rules => [
+			{ tool => 'fs_read', idempotency => 'read-only' },
+			{ tool => 'fs_*', idempotency => 'destructive' },
+		],
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the two-call run');
+	my @events = drain-events($run);
+
+	is $provider.recorded-batches.map({ .elems }).List, (1, 1),
+		'the provider saw two batches of ONE — per-operation dispatch, not a '
+			~ 'batch that happens to be executed in order';
+
+	is-deeply event-kinds(@events).grep({ .starts-with('tool-') }).List,
+		('tool-call', 'tool-call', 'tool-started', 'tool-result',
+		 'tool-started', 'tool-result'),
+		'the model asks for both up front, and then each one starts and '
+			~ 'answers before the next one starts';
+
+	is-deeply envelope-types($session),
+		(
+			'session-meta', 'message', 'message',
+			'tool-dispatched', 'message', 'tool-settled',
+			'tool-dispatched', 'message', 'tool-settled',
+			'message',
+		),
+		'and the transcript records dispatch, the answer, then the settle — '
+			~ 'in that order, per call';
+
+	my @dispatched = $session.events.grep({ $_<type> eq 'tool-dispatched' });
+	is @dispatched.map({ $_<payload><idempotency> }).List,
+		('read-only', 'destructive'),
+		'each dispatch carrying the class its tool was configured with';
+
+	my @settled = $session.events.grep({ $_<type> eq 'tool-settled' });
+	is @settled.map({ $_<payload><outcome> }).List, ('completed', 'completed'),
+		'and each settle the outcome it really had';
+	is @settled.map({ $_<payload><op-id> }).List,
+		@dispatched.map({ $_<id> }).List,
+		'named by the dispatch envelope it closes';
+
+	$session.close;
+	my $replayed = LLM::Agent::Session.load(path => $path);
+	is-deeply $replayed.pending-tool-operations, (),
+		'so a reload finds nothing in flight: a clean run leaves nothing open';
+	$replayed.close;
+};
+
+subtest 'a deadline is an unknown outcome, not a failure' => {
+	plan 14;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my $gate = Promise.new;
+	my $backend = scripted-backend(steps => [
+		{ content => 'writing',
+		  'tool-calls' => [tool-call('c1', 'fs_write', '{"path":"b"}'),] },
+		{ content => 'I could not tell whether that worked.' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { fs_write => 'written' },
+		# Held open past the deadline, and released by the test rather than
+		# by a sleep: the deadline fires at a time this test decides.
+		block-call => { c1 => $gate },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$session, tool-deadline => 0.15,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the deadlined run');
+	my @events = drain-events($run);
+
+	is (await $run.result)<outcome>, 'completed',
+		'the RUN carries on: one tool giving up is not the end of anything';
+
+	is events-of(@events, 'tool-result').elems, 0,
+		'no ToolResult — nothing came back to report';
+	my @abandoned = events-of(@events, 'tool-abandoned');
+	is @abandoned.elems, 1, 'one abandonment instead';
+	is @abandoned[0].reason, 'deadline', 'because the deadline passed';
+	ok @abandoned[0].dispatched,
+		'and the call HAD been dispatched, so it may well have written the '
+			~ 'file';
+
+	my @messages = (await $run.result)<messages>;
+	my $answer = @messages.first({ .role eq 'tool' });
+	is $answer.tool-call-id, 'c1',
+		'the call is still answered, or the next request would be a 400';
+	like $answer.content, /'unknown'/,
+		'with an answer that says the outcome is unknown';
+	unlike $answer.content, /'fail'/,
+		'and never that it failed — a model told its write failed writes it '
+			~ 'again';
+
+	# The transcript says the same thing, in machine-readable form.
+	my $settled = $session.events.first({ $_<type> eq 'tool-settled' });
+	is $settled<payload><outcome>, 'outcome-unknown', 'the settle is unknown';
+	is $settled<payload><reason>, 'deadline', 'and says why';
+
+	my $line = $session.events.first({
+		$_<type> eq 'message' && ($_<payload><tool-call-id> // '') eq 'c1'
+	});
+	ok $line<payload><outcome-unknown>,
+		'the message is marked as an unknown outcome';
+	nok $line<payload><is-error>,
+		'and NOT as an error — which is the whole difference between a '
+			~ 'deadline and a failure';
+
+	# The detached call is still running, and `drained` knows it even
+	# though `result` was kept a second ago.
+	is $run.drained.status, Planned,
+		'drained is still Planned: the tool nobody could interrupt is still '
+			~ 'in flight';
+	$gate.keep(True);
+	drained-settled($run, 'the detached call');
+	is $run.drained.status, Kept, 'and only settles once it has returned';
+
+	$session.close;
+};
+
+subtest 'the deadline waits for humans' => {
+	plan 4;
+
+	# The ask happens INSIDE the call, which is what sequential dispatch
+	# guarantees: the question is about the operation in flight, and the
+	# time a human takes is not time that operation spent working.
+	my $backend = scripted-backend(steps => [
+		{ content => 'writing',
+		  'tool-calls' => [tool-call('c1', 'fs_write', '{"path":"b"}'),] },
+		{ content => 'done' },
+	]);
+
+	my $loop;
+	my &ask;
+	my @asked;
+	my $provider = ScriptedProvider.new(
+		tools => tools(),
+		responder => -> $name, $args, $id {
+			# Four times the deadline, spent entirely on the human.
+			ask(%( kind => 'permission', tool => $name ));
+			'written';
+		},
+	);
+	$loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, tool-deadline => 0.15,
+	);
+	&ask = $loop.wrap-ask(-> %request {
+		@asked.push: %request<tool>;
+		sleep 0.6;
+		%( action => 'allow-once' );
+	});
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the asking run');
+	my @events = drain-events($run);
+
+	is @asked.elems, 1, 'the human was asked, inside the call';
+	is events-of(@events, 'tool-abandoned').elems, 0,
+		'and the deadline did NOT fire, though four times as long passed as '
+			~ 'it allows';
+	is events-of(@events, 'tool-result').head.content, 'written',
+		'the call answered normally';
+	is (await $run.result)<outcome>, 'completed', 'and the run completed';
+};
+
+subtest 'the deadline does fire when nobody is being asked' => {
+	plan 3;
+
+	# The control for the subtest above: the same shape of delay, with no
+	# question in it, is a deadline.
+	my $backend = scripted-backend(steps => [
+		{ content => 'writing',
+		  'tool-calls' => [tool-call('c1', 'fs_write', '{"path":"b"}'),] },
+		{ content => 'done' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { fs_write => 'written' },
+		latency => { c1 => 0.6 },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, tool-deadline => 0.15,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the slow-tool run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'tool-abandoned').elems, 1, 'the deadline fired';
+	is events-of(@events, 'tool-abandoned')[0].reason, 'deadline', 'as one';
+	is (await $run.result)<outcome>, 'completed', 'and the run carried on';
+
+	drained-settled($run, 'the detached call');
+};
+
+subtest 'a cancel mid-batch splits it: unknown here, did-not-run behind' => {
+	plan 12;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my $gate = Promise.new;
+	my $backend = scripted-backend(steps => [
+		{ content => 'three things',
+		  'tool-calls' => [
+			tool-call('c1', 'fs_write', '{"path":"1"}'),
+			tool-call('c2', 'fs_write', '{"path":"2"}'),
+			tool-call('c3', 'fs_write', '{"path":"3"}'),
+		  ] },
+		{ content => 'never reached' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { fs_write => 'written' },
+		block-call => { c1 => $gate },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$session,
+	);
+
+	my $run = $loop.run(@prompt);
+	wait-until { $provider.recorded-calls.elems >= 1 }, 'the first call to start';
+	$run.cancel;
+	run-settled($run, 'the cancelled run');
+	my @events = drain-events($run);
+
+	is $provider.recorded-calls.elems, 1,
+		'only the call that was already running ever reached the provider';
+
+	my @abandoned = events-of(@events, 'tool-abandoned');
+	is @abandoned.elems, 3, 'all three calls are accounted for';
+	is @abandoned.map({ .id }).List, ('c1', 'c2', 'c3'), 'in the model’s order';
+	ok @abandoned[0].dispatched,
+		'the one in flight was dispatched, so its outcome is unknown';
+	is-deeply @abandoned[1 .. 2].map({ .dispatched }).List, (False, False),
+		'and the two behind it were not, so they are known NOT to have run';
+
+	my @messages = (await $run.result)<messages>;
+	my @tool-messages = @messages.grep({ .role eq 'tool' });
+	is @tool-messages.elems, 3,
+		'every tool_calls entry is answered, or the transcript is unresumable';
+	like @tool-messages[0].content, /'Whether it took effect is unknown'/,
+		'the in-flight one says its outcome is unknown';
+	like @tool-messages[1].content, /'It did not run'/,
+		'and the queued ones say, flatly, that they did not';
+
+	# The durable half: exactly one operation existed, because exactly one
+	# call was ever dispatched. Abandoned calls get no envelopes at all —
+	# there is no operation to record.
+	is $session.events.grep({ $_<type> eq 'tool-dispatched' }).elems, 1,
+		'one dispatch envelope, for the one call that was dispatched';
+	my $settled = $session.events.first({ $_<type> eq 'tool-settled' });
+	is $settled<payload><outcome>, 'outcome-unknown', 'settled as unknown';
+	is $settled<payload><reason>, 'cancelled', 'because the run was cancelled';
+
+	$gate.keep(True);
+	drained-settled($run, 'the detached call');
+
+	$session.close;
+	my $replayed = LLM::Agent::Session.load(path => $path);
+	is-deeply $replayed.pending-tool-operations, (),
+		'and the transcript is left with nothing pending: the loop settled '
+			~ 'what it knew about before it went';
+	$replayed.close;
+};
+
+subtest 'a cancel between calls abandons everything that is left' => {
+	plan 5;
+
+	# The other side of the boundary: the cancel lands after the first
+	# call has SETTLED and before the second is dispatched, so nothing is
+	# in flight and the second can be promised not to have run.
+	#
+	# Landing it exactly there is what the grants read is used for: the
+	# loop reads the provider's snapshot after every operation settles,
+	# which is precisely the window this test is about. It is a seam, not
+	# a trick — and the alternative (sleep and hope) is how a suite starts
+	# flaking on a loaded machine.
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my $run;
+	my $backend = scripted-backend(steps => [
+		{ content => 'two things',
+		  'tool-calls' => [
+			tool-call('c1', 'fs_read', '{"path":"1"}'),
+			tool-call('c2', 'fs_write', '{"path":"2"}'),
+		  ] },
+		{ content => 'never reached' },
+	]);
+
+	my class CancelBetweenOps is ScriptedProviderWithGrants {
+		has $.run is rw;
+		has Int $.reads is rw = 0;
+		method grants(--> List:D) {
+			# Read 1 is the loop taking its starting digest, before the run
+			# has done anything. Read 2 is the sync that follows the first
+			# operation settling.
+			$!reads++;
+			if $!reads >= 2 {
+				# The test hands the Run over the instant `run` returns.
+				# On the vanishingly small chance this read got there
+				# first, WAIT for it: racing it is how a suite starts
+				# failing once a month on somebody else's machine.
+				my $deadline = now + TIMEOUT;
+				until $!run.defined || now > $deadline { sleep 0.002 }
+				$!run.cancel if $!run.defined;
+			}
+			callsame;
+		}
+	}
+
+	my $provider = CancelBetweenOps.new(tools => tools());
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$session,
+	);
+
+	$run = $loop.run(@prompt);
+	$provider.run = $run;
+	run-settled($run, 'the run cancelled between calls');
+	drained-settled($run, 'the run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'tool-result').map({ .id }).List, ('c1',),
+		'the call that answered before the cancel is a real result';
+	is events-of(@events, 'tool-abandoned').map({ .id }).List, ('c2',),
+		'and only the one that never started is abandoned';
+	nok events-of(@events, 'tool-abandoned')[0].dispatched,
+		'as a call that was never dispatched';
+
+	is $session.events.grep({ $_<type> eq 'tool-dispatched' }).elems, 1,
+		'one operation was recorded, because one was dispatched';
+	is $session.events.first({ $_<type> eq 'tool-settled' })<payload><outcome>,
+		'completed',
+		'and it settled as what it really was, before the run wound down';
+
+	$session.close;
+};
+
+subtest 'an unknown outcome counts against the identical-call guard' => {
+	plan 3;
+
+	# A call that never returns must not be able to evade the guard by
+	# never returning: the second identical attempt is stopped.
+	my $backend = scripted-backend(steps => [
+		{ content => 'once',
+		  'tool-calls' => [tool-call('c1', 'sh_run', '{"cmd":"hang"}'),] },
+		{ content => 'again',
+		  'tool-calls' => [tool-call('c2', 'sh_run', '{"cmd":"hang"}'),] },
+		{ content => 'fine, answering' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [tool-decl('sh_run', 'Run a command'),],
+		latency => { sh_run => 0.5 },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider,
+		tool-deadline => 0.1, max-identical-calls => 1,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the hanging-tool run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'limit-reached').head.limit, 'identical-calls',
+		'the repeat was caught';
+	is events-of(@events, 'tool-abandoned').elems, 1,
+		'having let exactly one of them run to its deadline';
+	is (await $run.result)<outcome>, 'completed',
+		'and the model answered with what it had';
+
+	drained-settled($run, 'the detached calls');
+};
+
+subtest 'progress notifications are correlated, not trusted' => {
+	plan 5;
+
+	my $loop;
+	my &progress;
+	my @seen;
+	my $backend = scripted-backend(steps => [
+		{ content => 'reading',
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+		{ content => 'done' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(),
+		responder => -> $name, $args, $id {
+			# What a server sends while it works, as MCP::Client resolves
+			# it: the token is already back to a call id by this point.
+			progress(%( 'tool-call-id' => 'c1', progress => 1, total => 3,
+				message => 'a third of the way' ));
+			# A late note from a call that is not the one in flight. It
+			# would move the wrong bar, so it is dropped.
+			progress(%( 'tool-call-id' => 'an-older-call', progress => 99 ));
+			# And one with no id at all.
+			progress(%( progress => 50 ));
+			'contents';
+		},
+	);
+	$loop = LLM::Agent::Loop.new(backends => [$backend,], :$provider);
+	&progress = $loop.progress-hook;
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the reporting run');
+	my @events = drain-events($run);
+
+	my @reported = events-of(@events, 'tool-progress');
+	is @reported.elems, 1, 'exactly the one that named the call in flight';
+	is @reported[0].id, 'c1', 'under that call’s id';
+	is @reported[0].progress, 1e0, 'with the number the server sent';
+	is @reported[0].total, 3e0, 'and the total, when there is one';
+	is @reported[0].message, 'a third of the way', 'and its note';
+};
+
+subtest 'a progress hook with no run, and nonsense in it, is harmless' => {
+	plan 3;
+
+	my $backend = scripted-backend(steps => [{ content => 'done' },]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
+	my &progress = $loop.progress-hook;
+
+	lives-ok { progress(%( 'tool-call-id' => 'c1', progress => 1 )) },
+		'a notification with no run to publish into is dropped, not thrown';
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the toolless run');
+	lives-ok {
+		progress(%( 'tool-call-id' => 'c1', progress => 'a third' ))
+	}, 'and a server with an odd idea of a number cannot take a run down';
+
+	is events-of(drain-events($run), 'tool-progress').elems, 0,
+		'neither of them became an event';
+};
+
+subtest 'grant-hook writes the snapshot the moment it is told to' => {
+	plan 5;
+
+	# The 0.1.1 mechanism, gone on purpose: a task that polled the
+	# provider's digest for two seconds after every "always" answer,
+	# guessing at a moment the policy could simply report. If it ever comes
+	# back, this is where somebody has to explain why.
+	nok LLM::Agent::Loop.^find_private_method('sync-grants-when-applied').defined,
+		'the snapshot watcher is gone — a callback replaced the poll';
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my $gate = Promise.new;
+	my $loop;
+	my &grant;
+	my $granting;
+	$granting = ScriptedProviderWithGrants.new(
+		tools => tools(),
+		responder => -> $name, $args, $id {
+			# What a policy does when a human says "always": record the
+			# rule, then say so. The call is still running afterwards.
+			$granting.add-grant({ tool => $name, decision => 'allow' });
+			grant();
+			await $gate;
+			'written';
+		},
+	);
+	my $backend = scripted-backend(steps => [
+		{ content => 'writing',
+		  'tool-calls' => [tool-call('c1', 'fs_write', '{"path":"b"}'),] },
+		{ content => 'done' },
+	]);
+	$loop = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => $granting, :$session,
+	);
+	&grant = $loop.grant-hook;
+
+	my $run = $loop.run(@prompt);
+	wait-until { $session.grants.elems >= 1 },
+		'the grant to reach the transcript while the call is still running';
+	is $session.grants.map({ $_<tool> }).List, ('fs_write',),
+		'the answer is durable before the tool that provoked it returned';
+	is $session.events.grep({ $_<type> eq 'tool-settled' }).elems, 0,
+		'and it really is still running — nothing has settled yet';
+
+	$gate.keep(True);
+	run-settled($run, 'the granting run');
+
+	is $session.events.grep({ $_<type> eq 'grants' }).elems, 1,
+		'written once: the per-operation sync compares digests and finds '
+			~ 'nothing new to say';
+	is (await $run.result)<outcome>, 'completed', 'and the run completed';
+
+	$session.close;
+};
+
+subtest 'unwired, a grant still lands before the next call is dispatched' => {
+	plan 3;
+
+	# The belt-and-braces half of grants v2: no hook at all, and the loss
+	# is still bounded to one tool's runtime rather than a whole batch.
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my $gate = Promise.new;
+	my $granting;
+	$granting = ScriptedProviderWithGrants.new(
+		tools => tools(),
+		responder => -> $name, $args, $id {
+			$granting.add-grant({ tool => 'fs_write', decision => 'allow' })
+				if $id eq 'c1';
+			'ok';
+		},
+		block-call => { c2 => $gate },
+	);
+	my $backend = scripted-backend(steps => [
+		{ content => 'two things',
+		  'tool-calls' => [
+			tool-call('c1', 'fs_read', '{"path":"a"}'),
+			tool-call('c2', 'fs_write', '{"path":"b"}'),
+		  ] },
+		{ content => 'done' },
+	]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => $granting, :$session,
+	);
+
+	my $run = $loop.run(@prompt);
+	# The second call has been dispatched and is blocked; the first has
+	# settled. Whatever the first call earned is already on disk.
+	wait-until { $granting.recorded-calls.elems >= 2 },
+		'the second call to be dispatched';
+	is $session.grants.map({ $_<tool> }).List, ('fs_write',),
+		'the grant answered during the first call is durable before the '
+			~ 'second one starts';
+
+	$gate.keep(True);
+	run-settled($run, 'the two-call run');
+	is $session.events.grep({ $_<type> eq 'grants' }).elems, 1,
+		'and it is written once, not once per operation';
+	is (await $run.result)<outcome>, 'completed', 'the run completed';
+
+	$session.close;
+};
+
+subtest 'a sessionless run dispatches per operation just the same' => {
+	plan 4;
+
+	# Nothing durable, so nothing to join on — but the state machine, the
+	# events and the ordering are identical. Session and tools are
+	# independently optional.
+	my $backend = scripted-backend(steps => [
+		{ content => 'two things',
+		  'tool-calls' => [
+			tool-call('c1', 'fs_read', '{"path":"a"}'),
+			tool-call('c2', 'fs_read', '{"path":"b"}'),
+		  ] },
+		{ content => 'done' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { fs_read => 'contents' },
+	);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$provider);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the sessionless run');
+	my @events = drain-events($run);
+
+	is $provider.recorded-batches.map({ .elems }).List, (1, 1),
+		'still two batches of one';
+	is events-of(@events, 'tool-started').map({ .id }).List, ('c1', 'c2'),
+		'each announced as it started';
+	is events-of(@events, 'tool-result').map({ .id }).List, ('c1', 'c2'),
+		'and each answered before the next one started';
+
+	# TurnCommitted still fires; it just has no id to carry.
+	nok events-of(@events, 'turn-committed').head.message-id.defined,
+		'and a committed turn has no message id, because there is no '
+			~ 'transcript to have written one';
+};
+
+subtest 'a provider that answers lazily still gets a deadline' => {
+	plan 4;
+
+	# A bridge whose execute-tool-calls returns a LAZY list has not done
+	# the work when it returns — it does it wherever the caller reifies.
+	# Reified on the driver's thread, after the wait, that is the one
+	# moment nothing is watching the clock: the deadline would never fire
+	# and a cancel would end up waiting for the very call it cancelled.
+	# The loop forces the list inside the section it can give up on, so
+	# this shape is a deadline like any other.
+	my $started = Promise.new;
+	my class LazyProvider {
+		has $.gate is required;
+		has $.started is required;
+		method tools-for-llm(--> List) { (tool-decl('sh_run', 'Run'),) }
+		method execute-tool-calls(@calls --> List) {
+			@calls.map(-> $call {
+				$!started.keep(True) if $!started.status ~~ Planned;
+				await $!gate;
+				%( role => 'tool', tool_call_id => $call<id>, content => 'ran',
+				   is_error => False );
+			}).List;      # NB: lazy on purpose
+		}
+	}
+
+	my $gate = Promise.new;
+	my $backend = scripted-backend(steps => [
+		{ content => 'running',
+		  'tool-calls' => [tool-call('c1', 'sh_run', '{"cmd":"sleep"}'),] },
+		{ content => 'done' },
+	]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,],
+		provider => LazyProvider.new(:$gate, started => $started),
+		tool-deadline => 0.15,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the lazy-provider run');
+	my @events = drain-events($run);
+
+	is $started.status, Kept,
+		'the work really did start off the driver thread';
+	is events-of(@events, 'tool-abandoned').elems, 1, 'and the deadline fired';
+	is events-of(@events, 'tool-abandoned')[0].reason, 'deadline', 'as one';
+	is (await $run.result)<outcome>, 'completed', 'while the run carried on';
+
+	$gate.keep(True);
+	drained-settled($run, 'the detached lazy call');
+};
+
+subtest 'a loop with no budget observes and caps nothing' => {
+	plan 4;
+
+	# The two settle-path seams answer from the request budget, and a loop
+	# with none of one has nothing to say: every byte a tool produced
+	# reaches the conversation, and no cap can trip. That is the whole
+	# behaviour of the 0.1.x-shaped loop, pinned so that adding a budget
+	# is what turns either of them on.
+	my $loop = LLM::Agent::Loop.new(
+		backends => [scripted-backend(steps => []),],
+	);
+
+	my &observe = $loop.^find_private_method('observe-result').assuming($loop);
+	my &caps = $loop.^find_private_method('caps-tripped').assuming($loop);
+
+	ok &observe.defined && &caps.defined,
+		'both seams exist as methods, not as comments';
+
+	my %observed = observe(Any, Any, 'a tool result, in full');
+	is %observed<content>, 'a tool result, in full',
+		'with no budget the observation seam is identity: what a tool said '
+			~ 'is what the conversation, the transcript and the event all get';
+	is-deeply %observed<artifact>, {},
+		'and there is no artifact to point at';
+
+	is-deeply caps(), {},
+		'nothing has tripped, because nothing was capped';
+};

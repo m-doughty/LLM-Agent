@@ -10,7 +10,17 @@ use MCP::Client::Policy;
 # transcript, with a real compactor. Every other test file mocks one of
 # its neighbours; this one mocks only the network.
 
-plan 6;
+plan 10;
+
+# Wait for a condition by POLLING, with a loud deadline — never one sleep
+# long enough to "probably" be right.
+sub wait-until(&condition, Str:D $what) {
+	my $deadline = now + TIMEOUT;
+	until &condition() {
+		die "Timed out after {TIMEOUT}s waiting for $what" if now > $deadline;
+		sleep 0.005;
+	}
+}
 
 my $tmp = $*TMPDIR.add("llm-agent-t11-{$*PID}-{now.Int}");
 $tmp.mkdir;
@@ -231,6 +241,270 @@ subtest 'a resumed run extends the transcript rather than duplicating it' => {
 		'with an error that says what to do about it';
 
 	$third.close;
+};
+
+subtest 'a resumed run is checked by identity, not by prose' => {
+	plan 5;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $system = LLM::Chat::Conversation::Message.new(
+		role => 'system', content => 'BE GOOD', sysprompt => True, sticky => True,
+	);
+	my $first-loop = LLM::Agent::Loop.new(
+		backends => [scripted-backend(steps => [{ content => 'one' },]),],
+		:$session,
+	);
+	run-settled($first-loop.run([$system, msg('user', 'a')]), 'the first run');
+	$session.close;
+
+	my $resumed = LLM::Agent::Session.load(path => $path);
+	my @messages = $resumed.messages;
+	ok @messages[0].is-sticky, 'the transcript remembers a sticky sysprompt';
+
+	# Same role, same text, NOT the same message: an application that
+	# rebuilt its system prompt without the flags would hand the loop a
+	# conversation whose compaction rules are different from the one the
+	# transcript describes. Prose cannot tell; a digest can.
+	my $rebuilt = LLM::Chat::Conversation::Message.new(
+		role => 'system', content => 'BE GOOD',
+	);
+	my $wrong-loop = LLM::Agent::Loop.new(
+		backends => [scripted-backend(steps => [{ content => 'x' },]),],
+		session => $resumed,
+	);
+	my $bad = $wrong-loop.run([$rebuilt, @messages[1], @messages[2], msg('user', 'b')]);
+	run-settled($bad, 'the almost-right run');
+	my %bad-outcome = await $bad.result;
+	is %bad-outcome<outcome>, 'failed',
+		'a message that only READS the same is refused';
+	like %bad-outcome<error>, /'message 0'/, 'naming the message it disagreed at';
+	like %bad-outcome<error>, /'extends'/,
+		'and saying what to do about it';
+
+	# The control: the transcript's own messages still seed cleanly.
+	my $right-loop = LLM::Agent::Loop.new(
+		backends => [scripted-backend(steps => [{ content => 'two' },]),],
+		session => $resumed,
+	);
+	my $good = $right-loop.run([|@messages, msg('user', 'b')]);
+	run-settled($good, 'the resumed run');
+	is (await $good.result)<final>, 'two',
+		'while the messages the session handed back are accepted as its own';
+
+	$resumed.close;
+};
+
+subtest 'a resumed run is told about today, not about the day it started' => {
+	plan 9;
+
+	# The recipe in the umbrella Pod, over a real file, twice: the
+	# conversation is replayed from the transcript and the CONTEXT is
+	# rebuilt. Everything that used to fossilise at index 0 — the date,
+	# the branch, the instruction file — is different the second time, and
+	# none of it is a contradiction.
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	my $monday = LLM::Agent::RunContext.new(
+		head-sections => [
+			identity     => 'You are a coding assistant.',
+			instructions => '## AGENTS.md \n\nRun prove6.',
+		],
+		facts => [date => '2026-08-10', branch => 'main'],
+	);
+
+	my $first-backend = scripted-backend(steps => [{ content => 'on it' },]);
+	run-settled(
+		LLM::Agent::Loop.new(backends => [$first-backend,], :$session)
+			.run([msg('user', 'start the work')], context => $monday),
+		'the first run',
+	);
+	$session.close;
+
+	# A new process would do exactly this: load, rebuild, carry on.
+	my $resumed = LLM::Agent::Session.load(path => $path);
+	is $resumed.messages.map({ .role }).List, ('user', 'assistant'),
+		'the transcript replays the conversation, and only the conversation';
+	is $resumed.last-run-context<facts>.list.map({ $_[0] ~ '=' ~ $_[1] }).List,
+		('date=2026-08-10', 'branch=main'),
+		'while the context it was run with is still readable, in render order';
+
+	my $friday = LLM::Agent::RunContext.new(
+		head-sections => [
+			identity     => 'You are a coding assistant.',   # unchanged
+			instructions => '## AGENTS.md \n\nRun prove6 -I. t.',  # edited
+		],
+		facts => [date => '2026-08-14', branch => 'feature/x'],
+	);
+
+	my $second-backend = scripted-backend(steps => [{ content => 'still on it' },]);
+	my $next = msg('user', 'and now?');
+	$resumed.append-message($next);
+	my $run = LLM::Agent::Loop.new(backends => [$second-backend,], session => $resumed)
+		.run([|$resumed.messages], context => $friday);
+	run-settled($run, 'the resumed run');
+	is (await $run.result)<outcome>, 'completed',
+		'the resumed run is not refused, though everything it is told has changed';
+
+	my @sent = $second-backend.recorded-calls[0]<messages>.list;
+	ok @sent.tail.content.contains('- date: 2026-08-14'), 'it was told today';
+	nok @sent.tail.content.contains('2026-08-10'), 'and not the day it started';
+	ok @sent[0].content.contains('Run prove6 -I. t.'),
+		'the head carries the instruction file as it reads NOW, not as it '
+			~ 'read when the transcript was created';
+
+	# The transcript's own account of both runs, and the deduplication
+	# that keeps an unchanged section from being written twice.
+	my @contexts = $resumed.run-contexts;
+	is @contexts.elems, 2, 'both runs left a context line';
+
+	my %identity = @contexts[1]<sections>.list.first({ $_<name> eq 'identity' });
+	ok %identity<rendered-in>.defined,
+		'the identity section, unchanged, is a back-pointer the second time';
+	is $resumed.run-context-section(%identity<digest>),
+		'You are a coding assistant.',
+		'and it still resolves to the body the first line carries';
+
+	$resumed.close;
+};
+
+subtest 'an "always" answer reaches the transcript before the run moves on' => {
+	plan 6;
+
+	# Grants v2: the policy tells the loop when it has recorded a rule
+	# (`on-grant` => `grant-hook`), and the loop's own per-operation sync
+	# is the belt-and-braces behind that. The 0.1.1 snapshot watcher — a
+	# task that polled the provider's digest for two seconds after every
+	# "always" answer — is gone; this subtest is what proves neither the
+	# hook nor the fallback lost the answer.
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	# The call blocks AFTER the policy has asked and been answered. That
+	# gap — answer given, tool still running — is where a crash, or a
+	# cancel, loses the grant and makes the human answer again.
+	my $gate = Promise.new;
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { fs_write => 'written' }, block-on => $gate,
+	);
+
+	my @asked;
+	my $loop;
+	my %policy-args =
+		provider => $provider,
+		on-ask => -> %request {
+			$loop.wrap-ask(-> %inner {
+				@asked.push: %inner<tool>;
+				%( action => 'always-allow', rule => %( tool => %inner<tool> ) );
+			}).(%request);
+		},
+		# Grants v2, and unconditional since MCP::Client 0.3.0: the hook is
+		# what makes the grant durable BEFORE the tool that provoked it
+		# returns.
+		on-grant => -> | { $loop.grant-hook.() },
+	;
+
+	my $policy = MCP::Client::Policy.new(|%policy-args);
+	my $backend = scripted-backend(steps => [
+		{ content => 'writing',
+		  'tool-calls' => [tool-call('c1', 'fs_write', '{"path":"b.txt"}'),] },
+		{ content => 'never reached' },
+	]);
+	$loop = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => $policy, :$session,
+	);
+
+	my $run = $loop.run([msg('user', 'write b.txt'),]);
+	wait-until { @asked.elems >= 1 }, 'the permission question to be answered';
+
+	# Still inside the call: the tool has not returned and the run has not
+	# moved on. The grant is already durable, because the policy said so
+	# the moment it recorded it.
+	wait-until { $session.grants.elems >= 1 },
+		'the grant to reach the transcript while the call is still running';
+	is $session.grants.map({ $_<tool> }).List, ('fs_write',),
+		'the answer is on disk before the tool that provoked it returned';
+
+	$run.cancel;
+	run-settled($run, 'the cancelled run');
+	$gate.keep(True);
+	drained-settled($run, 'the abandoned call');
+
+	is (await $run.result)<outcome>, 'cancelled', 'the run ended cancelled';
+	is @asked.elems, 1, 'having asked exactly once';
+
+	# The floor, hook or no hook: an operation that settles syncs the
+	# grants, and a cancelled operation settles.
+	is $session.grants.map({ $_<tool> }).List, ('fs_write',),
+		'and the grant is durable by the time the run ends, whatever wrote it';
+
+	$session.close;
+	my $replayed = LLM::Agent::Session.load(path => $path);
+	is $replayed.grants.map({ $_<tool> }).List, ('fs_write',),
+		'so a new process finds it, and nobody is asked again';
+	is $replayed.events.grep({ $_<type> eq 'grants' }).elems, 1,
+		'written once, not once per exit path';
+};
+
+subtest 'a grant that was replaced rather than added is still written' => {
+	plan 4;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	# Same number of grants before and after: a loop that decided by
+	# counting would never write this, and tomorrow's run would inherit
+	# the permission the human narrowed today.
+	my $granting;
+	$granting = ScriptedProviderWithGrants.new(
+		tools => tools(),
+		grants => [{ tool => 'fs_write', decision => 'allow' },],
+		responder => -> $name, $args, $id {
+			$granting.replace-grants([{ tool => 'fs_write', decision => 'deny' },]);
+			'ok';
+		},
+	);
+	my $backend = scripted-backend(steps => [
+		{ content => 'writing',
+		  'tool-calls' => [tool-call('c1', 'fs_write', '{"path":"b.txt"}'),] },
+		{ content => 'done' },
+	]);
+	my $run = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => $granting, :$session,
+	).run([msg('user', 'write b.txt'),]);
+	run-settled($run, 'the narrowing run');
+
+	is $granting.grants.elems, 1, 'the snapshot is the same size it was';
+	is $session.grants.map({ $_<decision> }).List, ('deny',),
+		'and the transcript has the new content anyway';
+
+	# The other half of the same rule: an unchanged snapshot writes nothing.
+	my $steady-path = fresh-path();
+	my $steady-session = LLM::Agent::Session.create(path => $steady-path, meta => {});
+	my $steady = ScriptedProviderWithGrants.new(
+		tools => tools(),
+		grants => [{ tool => 'fs_write', decision => 'allow' },],
+		results => { fs_write => 'written' },
+	);
+	my $steady-run = LLM::Agent::Loop.new(
+		backends => [scripted-backend(steps => [
+			{ content => 'writing',
+			  'tool-calls' => [tool-call('c1', 'fs_write', '{"path":"b.txt"}'),] },
+			{ content => 'done' },
+		]),],
+		provider => $steady, session => $steady-session,
+	).run([msg('user', 'write b.txt'),]);
+	run-settled($steady-run, 'the unchanging run');
+
+	is $steady-session.events.grep({ $_<type> eq 'grants' }).elems, 0,
+		'a snapshot that did not change writes no line at all';
+
+	$session.close;
+	$steady-session.close;
+	my $replayed = LLM::Agent::Session.load(path => $path);
+	is $replayed.grants.map({ $_<decision> }).List, ('deny',),
+		'and the narrowed grant is what a resumed run inherits';
 };
 
 subtest 'compaction inside a run, replayed identically from the transcript' => {

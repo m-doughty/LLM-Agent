@@ -12,7 +12,7 @@ use MCP::Client::Policy;
 # real policy, and a damaged file has to fail loudly everywhere except the
 # one place a crash really leaves damage.
 
-plan 13;
+plan 21;
 
 my $tmp = $*TMPDIR.add("llm-agent-t08-{$*PID}-{now.Int}");
 $tmp.mkdir;
@@ -28,10 +28,24 @@ sub fresh-path(--> IO::Path) { $tmp.add('r' ~ $n++ ~ '.jsonl') }
 
 # A transcript written straight to a file, for the damage tests: the API
 # cannot produce a broken one, which is rather the point.
-sub raw-transcript(@lines --> IO::Path) {
+#
+# `:!eol` leaves the final separator off, which is what a crash mid-`say`
+# really leaves behind; `:nl` writes the file with another line ending.
+sub raw-transcript(@lines, Str:D :$nl = "\n", Bool:D :$eol = True --> IO::Path) {
 	my $path = fresh-path();
-	$path.spurt(@lines.join("\n") ~ "\n");
+	$path.spurt(@lines.join($nl) ~ ($eol ?? $nl !! ''));
 	$path;
+}
+
+# ...and for damage that is not text at all.
+sub raw-bytes(Blob:D $bytes --> IO::Path) {
+	my $path = fresh-path();
+	$path.spurt($bytes, :bin);
+	$path;
+}
+
+sub repair-file(IO::Path:D $path --> IO::Path) {
+	$path.sibling($path.basename ~ '.repair');
 }
 
 sub envelope(Str:D $type, %payload, Str :$id = 'id-' ~ $++, Int :$v = 1 --> Str) {
@@ -200,6 +214,143 @@ subtest 'a malformed FINAL line is dropped and reported' => {
 	is $session.messages[0].content, 'hello', 'leaving what did land intact';
 };
 
+subtest 'a crash tail is cut off the file, not merely skipped' => {
+	plan 14;
+
+	# Both shapes a crash mid-`say` can leave. The newline is the last
+	# thing written, so it is the likeliest thing to be missing — but a
+	# transcript whose garbage DID get its newline out is just as broken,
+	# and the process that appends after it is the one that finds out.
+	for (False, True) -> $eol {
+		my $shape = $eol ?? 'newline and all' !! 'stopped mid-line';
+
+		my $path = raw-transcript([
+			envelope('session-meta', {}),
+			envelope('message', { role => 'user', content => 'hello' }),
+			'{"v":1,"type":"message","payload":{"role":"assis',
+		], :$eol);
+
+		my $session = LLM::Agent::Session.load(path => $path);
+		is $session.warnings.elems, 1, "$shape: the partial line is reported";
+		is $session.warnings[0].line-number, 3, "$shape: by line number";
+		is $path.lines.elems, 2,
+			"$shape: and is gone from the FILE, not just from the conversation";
+		nok repair-file($path).e, "$shape: leaving no repair copy behind";
+
+		# The append that used to land inside the garbage, twice over.
+		$session.append-message(msg('assistant', 'day two'));
+		$session.append-message(msg('user', 'day three'));
+		$session.close;
+
+		my $again = LLM::Agent::Session.load(path => $path);
+		is-deeply $again.messages.map({ .content }).List,
+			('hello', 'day two', 'day three'),
+			"$shape: and the resumed transcript reads back whole";
+		is $again.warnings.elems, 0,
+			"$shape: with nothing left to warn about";
+		is $again.events.elems, 4, "$shape: and no room for a hole";
+	}
+};
+
+subtest 'a crash inside a character is repaired too' => {
+	plan 5;
+
+	# A kill can land between the bytes of one character, and then the
+	# file is not text at all — which is why the scan reads bytes and why
+	# nothing may decode the file before the repair has run.
+	my $whole = (
+		envelope('session-meta', {}),
+		envelope('message', { role => 'user', content => 'hello' }),
+	).join("\n") ~ "\n";
+	my $partial = '{"v":1,"type":"message","payload":{"role":"user","content":"héllö';
+	my $bytes = ($whole ~ $partial).encode('utf8');
+
+	# One byte short of the closing ö, i.e. a lead byte with no follower.
+	my $path = raw-bytes($bytes.subbuf(0, $bytes.elems - 1));
+
+	my $fh = $path.open;
+	dies-ok { $fh.lines.elems }, 'the file cannot be read as text at all';
+	$fh.close;
+
+	my $session = LLM::Agent::Session.load(path => $path);
+	is $session.warnings.elems, 1, 'and yet it loads, with a warning';
+	like $session.warnings[0].value, /'héll'/,
+		'whose raw text is readable as far as the damage';
+	is $session.messages.elems, 1, 'leaving the lines that did land';
+	is $path.lines.elems, 2, 'and the repaired file is text again';
+
+	$session.close;
+};
+
+subtest 'a CRLF transcript keeps its line endings through a repair' => {
+	plan 5;
+
+	my $path = raw-transcript([
+		envelope('session-meta', {}),
+		envelope('message', { role => 'user', content => 'hello' }),
+		'{"v":1,"type":"message","payload":{"role":"assis',
+	], nl => "\r\n", eol => False);
+
+	my $session = LLM::Agent::Session.load(path => $path);
+	is $session.warnings.elems, 1, 'the partial line is reported';
+	is $session.messages.elems, 1, 'and dropped';
+	$session.close;
+
+	# The prefix is copied byte for byte: a repair is not a rewrite, and a
+	# file written on Windows does not come back with Unix line endings.
+	my $raw = $path.slurp(:bin);
+	is-deeply $raw.subbuf($raw.elems - 2).list, (0x0D, 0x0A),
+		'the file still ends the way it was written';
+	is $raw.decode('latin-1').comb("\r\n").elems, 2,
+		'with both survivors keeping their CRLF';
+
+	my $again = LLM::Agent::Session.load(path => $path);
+	is $again.messages.elems, 1, 'and it loads again, quietly';
+	$again.close;
+};
+
+subtest 'a repair copy left behind by an interrupted repair is not trusted' => {
+	plan 3;
+
+	my $path = raw-transcript([
+		envelope('session-meta', {}),
+		envelope('message', { role => 'user', content => 'hello' }),
+	]);
+
+	# What a crash between the copy and the rename leaves: a partial
+	# duplicate of a file that was never itself touched.
+	my $stale = repair-file($path);
+	$stale.spurt('this was never renamed over anything');
+
+	my $session = LLM::Agent::Session.load(path => $path);
+	is $session.messages.elems, 1, 'the transcript loads from the original';
+	is $session.warnings.elems, 0, 'having lost nothing at all';
+	nok $stale.e, 'and the leftover is cleared out of the way';
+
+	$session.close;
+};
+
+subtest 'two malformed lines at the end are not a crash artifact' => {
+	plan 3;
+
+	my $path = raw-transcript([
+		envelope('session-meta', {}),
+		envelope('message', { role => 'user', content => 'hello' }),
+		'{"v":1,"type":"mess',
+		'{"v":1,"type":"messa',
+	], eol => False);
+	my $before = $path.slurp(:bin);
+
+	# Repairing one line per load would eat a damaged file backwards, a
+	# line per resume, and hand back the leftovers as a conversation.
+	throws-like { LLM::Agent::Session.load(path => $path) },
+		Exception, message => /'FINAL'/,
+		'one crash is a crash; two is damage';
+	is-deeply $path.slurp(:bin), $before,
+		'and the file is left exactly as it was found';
+	nok repair-file($path).e, 'with nothing staged beside it';
+};
+
 subtest 'a malformed line anywhere else is fatal' => {
 	plan 2;
 
@@ -358,6 +509,147 @@ subtest 'the loop writes the turns it is handed, and the app writes none' => {
 	like %outcome<error>, /'session.messages'/,
 		'and the error says where to start from instead';
 	$eager.close;
+};
+
+subtest 'a run context replays as data, and never as a conversation' => {
+	plan 9;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	$session.append-message(msg('user', 'hello'));
+
+	# Three runs of the same agent: the identity never changes, the
+	# instruction file changes once, and the facts change every time —
+	# which is the shape that makes whole-blob deduplication useless and
+	# per-section deduplication almost always fire.
+	for 1 .. 3 -> $n {
+		$session.append-run-context(
+			run-id   => "run-$n",
+			digest   => "digest-$n",
+			facts    => [date => "day-$n", cwd => '/srv'],
+			sections => [
+				%(name => 'identity', digest => 'd-identity', rendered => 'IDENTITY'),
+				%(
+					name     => 'instructions',
+					digest   => 'd-instructions-' ~ ($n < 3 ?? 'a' !! 'b'),
+					rendered => $n < 3 ?? 'AGENTS v1' !! 'AGENTS v2',
+				),
+			],
+		);
+	}
+	$session.close;
+
+	my $replayed = LLM::Agent::Session.load(path => $path);
+
+	is $replayed.messages.map({ .content }).List, ('hello',),
+		'a run context is not a message';
+	is $replayed.message-ids.elems, 1, 'and has no place in the id list';
+	is $replayed.events.elems, 5, 'while every line is still in .events';
+
+	my @contexts = $replayed.run-contexts;
+	is @contexts.map({ $_<run-id> }).List, ('run-1', 'run-2', 'run-3'),
+		'the contexts come back in file order';
+	is @contexts[0]<facts>.list.map({ $_[0] }).List, ('date', 'cwd'),
+		'with their facts in RENDER order, which is why they are lists';
+	is $replayed.last-run-context<digest>, 'digest-3',
+		'and the last one is a lookup of its own';
+
+	# The body is written once and pointed at afterwards.
+	is @contexts.map({ $_<sections>.list.grep({ $_<rendered>.defined }).elems }).List,
+		(2, 0, 1),
+		'each body is stored exactly once: two on the first line, none on '
+			~ 'the second, and only the changed one on the third';
+
+	# ...and every section of every line still resolves to exactly one
+	# body, whether it carries one or points at one.
+	my @bodies = @contexts.map(-> %context {
+		%context<sections>.list.map(-> %section {
+			%section<rendered> // $replayed.run-context-section(%section<digest>);
+		}).List;
+	}).List;
+	is-deeply @bodies.List,
+		(
+			('IDENTITY', 'AGENTS v1'),
+			('IDENTITY', 'AGENTS v1'),
+			('IDENTITY', 'AGENTS v2'),
+		),
+		'so every run can still say what it was told, in full';
+
+	# And what a back-pointer points at is a line that is really there.
+	my %pointing = @contexts[1]<sections>.list.first({ $_<rendered-in>.defined });
+	is %pointing<rendered-in>, @contexts[0]<id>,
+		'the pointer names the envelope that carries the body';
+
+	$replayed.close;
+};
+
+subtest 'two identical sections in one context resolve to one body' => {
+	plan 3;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $id = $session.append-run-context(
+		run-id   => 'r', digest => 'd',
+		facts    => [],
+		sections => [
+			%(name => 'first', digest => 'same', rendered => 'THE BODY'),
+			%(name => 'second', digest => 'same', rendered => 'THE BODY'),
+		],
+	);
+	$session.close;
+
+	my $replayed = LLM::Agent::Session.load(path => $path);
+	my @sections = $replayed.last-run-context<sections>.list;
+
+	is @sections[0]<rendered>, 'THE BODY', 'the first section carries the body';
+	is @sections[1]<rendered-in>, $id,
+		'and the second points at its own line rather than repeating it';
+	is $replayed.run-context-section('same'), 'THE BODY',
+		'which resolves, because that line is right there';
+
+	$replayed.close;
+};
+
+subtest 'a context body the transcript no longer has is absent, not fatal' => {
+	plan 5;
+
+	# What a crash-tail repair leaves: the line that carried a section
+	# body is gone, and a later line still points at it. A transcript is a
+	# conversation first and an audit trail second — this loads.
+	my $path = raw-transcript([
+		envelope('session-meta', {}),
+		envelope('message', { role => 'user', content => 'hello' }),
+		envelope('run-context', {
+			'run-id' => 'r2', digest => 'd2',
+			facts    => [['date', 'day-2'],],
+			sections => [
+				{
+					name          => 'identity',
+					digest        => 'd-identity',
+					'rendered-in' => 'the-line-that-was-repaired-away',
+				},
+				{ name => 'notes', digest => 'd-notes', rendered => 'STILL HERE' },
+			],
+		}),
+	]);
+
+	my $session = LLM::Agent::Session.load(path => $path);
+	is $session.messages.elems, 1, 'the transcript loads';
+	is $session.warnings.elems, 0, 'with nothing to repair';
+
+	my $absent = $session.run-context-section('d-identity');
+	nok $absent.defined,
+		'the body that is no longer here is reported absent, not invented';
+	# NB the variable: a `<key>` subscript on a leading-dot continuation
+	# line parses as a new term, and the file stops compiling.
+	my %identity = $session.last-run-context<sections>.list
+		.first({ $_<name> eq 'identity' });
+	ok %identity<rendered-in>.defined,
+		'while the record still says where it went, so the loss is visible';
+	is $session.run-context-section('d-notes'), 'STILL HERE',
+		'and the section beside it is unaffected';
+
+	$session.close;
 };
 
 subtest 'blank lines are ignored wherever they are' => {

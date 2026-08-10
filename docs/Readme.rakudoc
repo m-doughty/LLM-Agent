@@ -41,19 +41,21 @@ given %outcome<outcome> {
 
 =begin table
 
-Module                  | What it is
-========================|=========================================================
-LLM::Agent::Loop        | the state machine; everything else serves it
-LLM::Agent::Run         | the handle on one run: events, result, cancel
-LLM::Agent::Event       | the typed event taxonomy, and the framing contract
-LLM::Agent::Session     | the durable JSONL transcript, and resuming from one
-LLM::Agent::Compactor   | summarize the middle before the window fills
-LLM::Agent::TokenCount  | how big is this conversation: three answers
-LLM::Agent::Prompt      | the four pieces a system prompt is made of
+Module                    | What it is
+==========================|=========================================================
+LLM::Agent::Loop          | the state machine; everything else serves it
+LLM::Agent::Run           | the handle on one run: events, result, cancel
+LLM::Agent::Event         | the typed event taxonomy, and the framing contract
+LLM::Agent::Session       | the durable JSONL transcript, and resuming from one
+LLM::Agent::ToolOperation | one tool call's states: dispatched, settled, unknown
+LLM::Agent::Compactor     | summarize the middle before the window fills
+LLM::Agent::TokenCount    | how big is this conversation: three answers
+LLM::Agent::Prompt        | the four pieces a system prompt is made of
+LLM::Agent::Canonical     | stable digests: is this the same message, conversation, snapshot?
 
 =end table
 
-C<use LLM::Agent;> loads all seven and is enough for every class. It does
+C<use LLM::Agent;> loads all nine and is enough for every class. It does
 not re-export C<LLM::Agent::Prompt>'s B<subs> — an C<is export> reaches
 one scope, not two — so call those fully qualified
 (C<LLM::Agent::Prompt::assemble(...)>) or C<use LLM::Agent::Prompt;> as
@@ -75,19 +77,42 @@ C<LimitReached>, appends a system message in C<LLM::Chat::ToolLoop>'s
 exact wording, switches tools off, and gives the model one last round to
 answer with what it has.
 
-=item B<The assistant turn is committed.> C<AssistantMessage>, appended
-to the conversation and written to the transcript with C<reasoning> and
-C<usage> as replay-visible extras.
+=item B<The assistant turn is committed.> C<AssistantMessage> and
+C<TurnCommitted>, appended to the conversation and written to the
+transcript with C<reasoning> and C<usage> as replay-visible extras.
 
-=item B<Tools.> One C<ToolCall> per call, one batch through the provider,
-one C<ToolResult> per result, one C<< role => 'tool' >> message per
-result.
+=item B<Tools, one at a time.> One C<ToolCall> per call (the model
+asked), and then each call is dispatched, waited for and settled on its
+own: a C<tool-dispatched> transcript line, C<ToolStarted>, the provider,
+then the C<< role => 'tool' >> message, a C<tool-settled> line and either
+C<ToolResult> or C<ToolAbandoned>. Only then does the next call start.
+Side effects therefore happen in the order the model asked for them, and
+every call has a durable start and end — which is what lets a resumed
+transcript tell "never ran" from "was running" from "finished, and the
+settle never landed".
 
 =item B<Grants.> If the provider C<can('grants')> — a policy does — a
 changed snapshot is written to the transcript, so a resumed session does
-not ask the human the same question again.
+not ask the human the same question again. With C<< on-grant =>
+$loop.grant-hook >> wired that happens the moment the policy records the
+rule; without it, at the latest when the running call settles.
 
 No tool calls, or tools switched off: C<RunCompleted>, and the run ends.
+
+=head3 Tool deadlines, and the outcome nobody knows
+
+C<tool-deadline> (off by default) bounds a single call. When it passes
+the call is detached and the operation settles B<outcome-unknown> — no
+C<ToolResult>, a C<ToolAbandoned> with C<< reason => 'deadline' >>, and a
+C<tool> message telling the model that whether it took effect is unknown.
+It is never an error: a local clock knows nothing about a remote side
+effect, and a model told its C<fs_write> failed will write it again. The
+run carries on; C<< $run.drained >> waits for the detached call even
+though C<< $run.result >> did not.
+
+The deadline B<pauses while a human is being asked>. Dispatch is
+sequential, so a permission prompt raised inside a call belongs to that
+call, and the seconds it takes are subtracted from that call's clock.
 
 =head2 Failure, retry and fallback
 
@@ -157,21 +182,31 @@ Situation                    | On cancel
 mid-stream                   | backend told to cancel; run ends promptly
 during a retry backoff       | wait ends within 0.25s; run ends
 between rounds               | no further round starts
-during a tool batch          | loop stops waiting; the calls still finish
+during a tool call           | loop stops waiting; that call still finishes
+queued behind that call      | never dispatched: known B<not> to have run
 blocked on a permission ask  | nothing happens until the human answers
 after the run finished       | no-op; the outcome stands
 
 =end table
 
 The two "nothing happens" rows are honest limitations rather than bugs
-waiting to be fixed. A tool batch has no cancellation to forward, and an
+waiting to be fixed. A tool call has no cancellation to forward, and an
 C<fs_write> already in flight has already happened; the loop drains the
-result and emits no C<ToolResult> for it — but it does write one
-synthetic C<tool> message per abandoned call, because an assistant turn
-carrying C<tool_calls> that nothing answers is a conversation every
-provider rejects, and the transcript has to stay resumable. An ask is a
-leaf: the policy holds a non-reentrant lock and is waiting for a human,
-and a run cannot dismiss a modal something else owns.
+result and emits no C<ToolResult> for it. An ask is a leaf: the policy
+holds a non-reentrant lock and is waiting for a human, and a run cannot
+dismiss a modal something else owns.
+
+What the loop does instead is say two different things about the two
+halves of an interrupted batch. The call B<in flight> becomes
+C<outcome-unknown>: C<< ToolAbandoned(dispatched => True) >> and a C<tool>
+message saying the run was cancelled before it returned and that whether
+it took effect is unknown. The calls B<behind it> were never dispatched,
+so they become C<abandoned>: C<< ToolAbandoned(dispatched => False) >> and
+a message saying, flatly, that they did not run. Both messages exist
+because an assistant turn carrying C<tool_calls> that nothing answers is a
+conversation every provider rejects, and the transcript has to stay
+resumable — and neither is an error, because one is unknown and the other
+did not happen.
 
 Note also that "the backend was told to cancel" is not "the model stopped
 generating". Among the LLM::Chat backends only KoboldCpp really aborts
@@ -187,10 +222,20 @@ C<JSONL::Writer>, so every line is durable the moment its method returns.
 {"id":"6f1c...","payload":{...},"ts":"2026-08-09T13:10:08.542283Z","type":"message","v":1}
 =end code
 
-Four types: C<session-meta> (always first, the caller's own hash
-verbatim), C<message>, C<grants> (the B<whole> snapshot, last one wins)
-and C<compaction>. Unknown types are preserved on replay and skipped by
-the readers, so a file written by a newer LLM::Agent still loads.
+Six types: C<session-meta> (always first, the caller's own hash verbatim),
+C<message>, C<grants> (the B<whole> snapshot, last one wins),
+C<compaction>, and the two halves of a tool operation —
+C<tool-dispatched> (whose envelope id B<is> the operation id) and
+C<tool-settled>. Unknown types are preserved on replay and skipped by the
+readers, so a file written by a newer LLM::Agent still loads — and so a
+0.2 transcript still loads in 0.1.x, minus the operations.
+
+C<< $session.pending-tool-operations >> is what a resumed run reads to
+find out what was in flight when the process died, and
+C<< $session.resolve-tool-operation($id, outcome => 'outcome-unknown') >>
+is how it closes one off. An operation may be settled once; a settle
+naming an operation the transcript does not have is refused before it is
+written.
 
 =begin code :lang<raku>
 my $session = LLM::Agent::Session.create(
@@ -293,6 +338,11 @@ my $fs = MCP::Client.connect-stdio(
     # server that had nothing to say.
     on-log    => -> %params { $loop.log-hook.(%params) },
     log-level => 'info',
+
+    # Progress notifications become ToolProgress events, correlated to the
+    # call in flight. A note for a call that is not the one running is
+    # dropped rather than moving the wrong bar.
+    on-progress => -> %params { $loop.progress-hook.(%params) },
 );
 
 my $registry = MCP::Client::Registry.new;
@@ -307,6 +357,10 @@ $policy = MCP::Client::Policy.new(
     roots    => { fs => $*CWD.Str },
     grants   => $session.grants,          # last session's "always allow"s
     on-ask   => -> %request { $loop.wrap-ask(&ask-the-human).(%request) },
+
+    # An "always" answer reaches the transcript the moment the policy has
+    # recorded it, rather than when the call it was asked inside of ends.
+    on-grant => -> | { $loop.grant-hook.() },
 );
 
 my $counter   = LLM::Agent::TokenCount::Usage.new;
@@ -330,14 +384,22 @@ my $system = LLM::Agent::Prompt::assemble(
 my $question = LLM::Chat::Conversation::Message.new(
     role => 'user', content => 'Make the tests pass.',
 );
-$session.append-message($question);      # the app owns the turns it originates
+
+# NOTE what is NOT here: no $session.append-message($question). On a fresh
+# session the loop records every message it is handed — system prompt first.
+# Pre-appending the user turn puts it in the file BEFORE the system prompt,
+# and the loop's position check then refuses the very run that wrote it.
+# (On a RESUME the pre-append is correct, because the system prompt is
+# already the first line of the transcript — see Resuming below.)
 
 my $run = $loop.run([$system, $question]);
 =end code
 
 C<wrap-ask> emits C<AskPending>, calls the real asker (which still blocks,
 and still holds the policy's lock), emits C<AskAnswered>, and returns the
-answer untouched. What does B<not> work is
+answer untouched — and times the question against the tool call it is
+about, which is what stops a deadline firing while somebody is reading a
+permission prompt. What does B<not> work is
 C<< on-ask => $loop.wrap-ask(&ask) >> with C<$loop> still undefined: that
 calls a method on a type object at construction time and dies there.
 
@@ -354,12 +416,17 @@ Token             | token              | text, round?, attempt?
 AttemptFailed     | attempt-failed     | round, attempt, backend-index, model?, error, error-class?, error-status?, disposition, backoff?
 AttemptSucceeded  | attempt-succeeded  | round, attempt, backend-index, model-used?, finish-reason?, usage, latency-ms?
 AssistantMessage  | assistant-message  | message, reasoning?, round?
+TurnCommitted     | turn-committed     | message-id?, round?
 ToolCall          | tool-call          | id, name, arguments?, round?
+ToolStarted       | tool-started       | id, name, round?
+ToolProgress      | tool-progress      | id, progress, total?, message?, round?
 ToolResult        | tool-result        | id, name?, content, is-error, round?
+ToolAbandoned     | tool-abandoned     | id, name, reason, dispatched, round?
 AskPending        | ask-pending        | request, tool?
 AskAnswered       | ask-answered       | request, answer?
 Log               | log                | level, logger?, data
 LimitReached      | limit-reached      | limit, count?, max?
+TurnDiscarded     | turn-discarded     | reason, round?
 CompactionStarted | compaction-started | tokens-before?, budget?, message-count?, round?
 CompactionDone    | compaction-done    | tokens-before?, tokens-after?, dropped?, summary?, fallback, round?
 RunCompleted      | run-completed      | final, rounds?, message-count?
@@ -372,6 +439,17 @@ A C<?> marks a key that is absent from C<.to-hash> when it was not
 supplied. Exactly one terminal event is emitted per run and the Supply is
 then C<done>; it is B<never> C<quit>, because a failure is data, not an
 exception thrown at whoever happened to be tapping.
+
+Two pairs in that table are the ones a consumer has to read carefully.
+C<AttemptSucceeded> says the B<transport> worked; C<TurnCommitted> says
+the turn is part of the conversation, and carries the transcript id it
+was written under. B<Every C<AttemptSucceeded> that is never followed by
+an C<AssistantMessage> in the same round is followed by a
+C<TurnDiscarded>> (C<limit>, C<failed> or C<cancelled>), so streamed text
+can always be retracted on a signal rather than left on screen. And
+C<ToolAbandoned> is not a failed C<ToolResult>: C<< dispatched => False >>
+means the call never ran, C<< dispatched => True >> means it ran and the
+outcome is unknown.
 
 The Supply is a C<Supplier::Preserving>, so a consumer that taps late
 still sees the whole run from the beginning — B<but the buffer is
@@ -396,7 +474,10 @@ prove6 -Ilib -It/lib -I../LLM-Chat/lib -I../MCP-Client/lib \
 The suite needs no network, no model and no API key: C<t/lib/AgentTestKit>
 provides a C<ScriptedBackend> that replays a list of steps — including
 mid-stream failures, stalls, per-attempt usage and structured error
-classes — and a duck-typed C<ScriptedProvider> that never throws.
+classes — and a duck-typed C<ScriptedProvider> that never throws, with
+per-call C<latency> and C<block-call> knobs so a deadline or a mid-batch
+cancel can be tested at a moment the test chooses rather than one it
+hopes for.
 C<t/11> runs the loop over a B<real> C<MCP::Client::Policy>, a real
 transcript on a temporary file and a real compactor, and checks that a
 resumed session replays exactly the conversation the loop ended with.

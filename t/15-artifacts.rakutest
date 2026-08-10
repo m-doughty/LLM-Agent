@@ -1,0 +1,417 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Artifacts;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Agent::RequestBudget;
+use LLM::Agent::Session;
+use LLM::Chat::Conversation::Message;
+
+# One tool result too big to live in the conversation. The invariant this
+# file exists for: the excerpt is computed ONCE, before the tool message
+# is built, so the conversation, the transcript and the event all carry
+# the same string — and a resumed run replays it byte for byte WITHOUT
+# the artifact file existing at all.
+
+plan 12;
+
+my @prompt = [msg('user', 'read the big file'),];
+
+my $tmp = $*TMPDIR.add("llm-agent-t15-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	if $tmp.e {
+		# The artifact directories are children, so this is depth-first.
+		for $tmp.dir -> $entry {
+			if $entry.d {
+				.unlink for $entry.dir;
+				$entry.rmdir;
+			}
+			else {
+				$entry.unlink;
+			}
+		}
+		$tmp.rmdir;
+	}
+}
+
+my $n = 0;
+sub fresh-path(--> IO::Path) { $tmp.add('a' ~ $n++ ~ '.jsonl') }
+
+sub tools(--> List) {
+	(tool-decl('fs_read', 'Read a file', { path => { type => 'string' } }),);
+}
+
+sub budget(Int:D $size --> LLM::Agent::RequestBudget) {
+	LLM::Agent::RequestBudget.new(
+		default-profile => LLM::Agent::RequestBudget::Profile.new(
+			context-window => 10_000_000,
+		),
+		max-observation-size => $size,
+	);
+}
+
+# One round that asks for fs_read and one that answers, with the provider
+# returning $content.
+sub oversized-run($session, Str:D $content, Int:D $size, *%extra) {
+	my $backend = scripted-backend(steps => [
+		{ content => 'let me look',
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"big"}'),] },
+		{ content => 'that is a big file' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { fs_read => $content },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider,
+		|($session.defined ?? (:$session) !! ()),
+		request-budget => budget($size),
+		|%extra,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the oversized run');
+	%( run => $run, events => drain-events($run), loop => $loop );
+}
+
+# 40,000 characters of numbered lines: long enough to be excerpted at any
+# threshold below it, and self-describing enough that a head/tail cut is
+# obvious in a failure message.
+sub big-content(Int:D $lines = 2_000 --> Str:D) {
+	(1 .. $lines).map({ "line $_: " ~ ('x' x 10) }).join("\n");
+}
+
+subtest 'the excerpt sub is head-weighted, marked, and grapheme-safe' => {
+	plan 9;
+
+	is excerpt('short', 100, marker => 'M'), 'short',
+		'content under the limit comes back untouched';
+	is excerpt('x' x 100, 100, marker => 'M'), 'x' x 100,
+		'and content exactly ON the limit too — the threshold is "bigger '
+			~ 'than", so a result the size of the budget is left alone';
+
+	my Str $cut = excerpt(('a' x 60) ~ ('b' x 60), 100, marker => 'MARKER');
+	is $cut.lines.elems, 3, 'an excerpt is head, marker, tail';
+	is $cut.lines[0], 'a' x 60 ~ 'b' x 15,
+		'three quarters of the budget from the head';
+	is $cut.lines[1], 'MARKER', 'then the marker, on a line of its own';
+	is $cut.lines[2], 'b' x 25, 'then the last quarter';
+
+	is elided-chars(120, 100), 20, 'and 20 characters went missing';
+
+	# Every cut is a character cut, not a byte cut: a combining accent
+	# stays with the letter it belongs to, and a CRLF stays one grapheme.
+	my Str $graphemes = ("e\c[COMBINING ACUTE ACCENT]" x 40)
+		~ ("a\r\n" x 40);
+	my Str $trimmed = excerpt($graphemes, 40, marker => 'M');
+	ok $trimmed.lines[0].chars == 30,
+		'a head of exactly 30 GRAPHEMES, whatever they weigh in codepoints';
+	ok $graphemes.starts-with($trimmed.lines[0]),
+		'and it really is the head of the original, uncorrupted';
+};
+
+subtest 'an oversized result is excerpted once, into all three places' => {
+	plan 9;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my Str $content = big-content();
+	my %out = oversized-run($session, $content, 2_000);
+
+	my $result = events-of(%out<events>, 'tool-result').head;
+	ok $result.content.chars < $content.chars,
+		'the event carries an excerpt rather than the whole result';
+	ok $result.content.contains('elided'), 'with the marker in it';
+
+	# The three copies, and they are one string.
+	my @messages = $session.messages;
+	my $tool-message = @messages.first({ .role eq 'tool' });
+	is $tool-message.content, $result.content,
+		'the transcript holds exactly what the event holds';
+	is (await %out<run>.result)<messages>.first({ .role eq 'tool' }).content,
+		$result.content,
+		'and so does the conversation the run hands back — one excerpt, '
+			~ 'computed once, before the message was ever built';
+
+	# The metadata, on the event and on the durable record.
+	my %artifact = $result.artifact;
+	is %artifact<chars>, $content.chars, 'the artifact records the full size';
+	is %artifact<bytes>, $content.encode('utf-8').bytes, 'in bytes as well';
+	is %artifact<elided-chars>, $content.chars - 2_000,
+		'and how much the model did not see';
+
+	my $settled = $session.events.first({ $_<type> eq 'tool-settled' });
+	is $settled<payload><artifact><file>, %artifact<file>,
+		'the settle envelope names the same file';
+
+	# The file itself: the whole thing, and a digest that agrees.
+	my $file = artifact-dir-for($path).add(%artifact<file>);
+	is $file.slurp, $content,
+		'which holds every byte the tool produced, unaltered';
+	$session.close;
+};
+
+subtest 'the digest in the marker is the digest of the file' => {
+	plan 3;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my Str $content = big-content(500);
+	my %out = oversized-run($session, $content, 1_000);
+
+	my $result = events-of(%out<events>, 'tool-result').head;
+	my %artifact = $result.artifact;
+	my $file = artifact-dir-for($path).add(%artifact<file>);
+
+	is %artifact<digest>, content-digest($file.slurp),
+		'the recorded digest is the digest of what is on disk';
+	ok $result.content.contains(%artifact<digest>),
+		'and the marker in the conversation quotes it, so a human reading '
+			~ 'the transcript can check the file by hand';
+	ok $result.content.contains(%artifact<file>)
+		&& !$result.content.contains($path.parent.Str),
+		'the marker names the file by BASENAME and never by path — a '
+			~ 'transcript that moves must not carry a path that was only '
+			~ 'true on one machine';
+	$session.close;
+};
+
+subtest 'a resumed run replays byte for byte with the artifact GONE' => {
+	plan 5;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my Str $content = big-content();
+	my %out = oversized-run($session, $content, 2_000);
+	is (await %out<run>.result)<outcome>, 'completed', 'the first run finished';
+	$session.close;
+
+	# The artifact directory is deleted outright: this is the invariant.
+	my $dir = artifact-dir-for($path);
+	.unlink for $dir.dir;
+	$dir.rmdir;
+	nok $dir.e, 'the artifacts are gone';
+
+	my $resumed = LLM::Agent::Session.load(path => $path);
+	my @messages = $resumed.messages;
+	is @messages.first({ .role eq 'tool' }).content,
+		(await %out<run>.result)<messages>.first({ .role eq 'tool' }).content,
+		'the transcript still replays the excerpt, byte for byte';
+
+	# And the loop's own seed check — the digest comparison that refuses a
+	# run contradicting its transcript — passes over it.
+	my $backend = scripted-backend(steps => [{ content => 'still here' },]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], session => $resumed,
+		request-budget => budget(2_000),
+	);
+	my $next = msg('user', 'and now?');
+	$resumed.append-message($next);
+	my $run = $loop.run([|@messages, $next]);
+	run-settled($run, 'the resumed run');
+
+	is (await $run.result)<outcome>, 'completed',
+		'and a resumed run seeds from it without complaint — replay never '
+			~ 'needs the artifact to exist';
+	is $backend.recorded-calls.head<messages>.first({ .role eq 'tool' }).content,
+		@messages.first({ .role eq 'tool' }).content,
+		'the request it sent carries the excerpt, exactly as the first run did';
+	$resumed.close;
+};
+
+subtest 'a sessionless run excerpts and says the result was not stored' => {
+	plan 4;
+
+	my Str $content = big-content();
+	my %out = oversized-run(Nil, $content, 2_000);
+
+	my $result = events-of(%out<events>, 'tool-result').head;
+	ok $result.content.chars < $content.chars, 'the result is still excerpted';
+	ok $result.content.contains('was not stored'),
+		'and the marker says so rather than naming a file nobody can open';
+	ok $result.content.contains(content-digest($content)),
+		'while still carrying the digest of what was lost';
+	is-deeply $result.artifact, {},
+		'with no artifact metadata claimed — there is no artifact';
+};
+
+subtest 'the threshold is a boundary, and it is exact' => {
+	plan 4;
+
+	# Exactly at the limit: untouched, and no file at all.
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my Str $exact = 'x' x 500;
+	my %at = oversized-run($session, $exact, 500);
+	is events-of(%at<events>, 'tool-result').head.content, $exact,
+		'a result exactly the size of the budget reaches the model whole';
+	nok artifact-dir-for($path).e,
+		'and nothing is written — a run whose results all fit leaves no '
+			~ 'directory behind';
+	$session.close;
+
+	# One character over: excerpted.
+	my $path2 = fresh-path();
+	my $session2 = LLM::Agent::Session.create(path => $path2, meta => {});
+	my %over = oversized-run($session2, 'x' x 501, 500);
+	my $content = events-of(%over<events>, 'tool-result').head.content;
+	isnt $content, 'x' x 501, 'one character over, and it is excerpted';
+	is events-of(%over<events>, 'tool-result').head.artifact<elided-chars>, 1,
+		'by exactly one character';
+	$session2.close;
+};
+
+subtest 'a write that fails is shielded: excerpt, warning, settled op' => {
+	plan 6;
+
+	# A FILE where the artifact directory would go, so mkdir cannot
+	# succeed. Portable, and nothing like a permission bit that root
+	# ignores.
+	my $path = fresh-path();
+	my $blocker = artifact-dir-for($path);
+	$blocker.spurt('not a directory');
+
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my Str $content = big-content();
+	my %out = oversized-run($session, $content, 2_000);
+
+	is (await %out<run>.result)<outcome>, 'completed',
+		'the run finishes — a tool call is not a failure because a scratch '
+			~ 'file could not be opened';
+
+	my $result = events-of(%out<events>, 'tool-result').head;
+	ok $result.content.contains('could not be stored'),
+		'the marker says the full result did not make it';
+	nok $result.is-error, 'and the result is not an error';
+	is-deeply $result.artifact, {},
+		'no artifact metadata is claimed for a file that is not there';
+
+	my @warnings = events-of(%out<events>, 'log').grep({
+		.level eq 'warning' && .data ~~ Associative
+			&& .data<message>.contains('artifact')
+	});
+	is @warnings.elems, 1, 'the failure is reported, once, as a log event';
+
+	my $settled = $session.events.first({ $_<type> eq 'tool-settled' });
+	is $settled<payload><outcome>, 'completed',
+		'and the operation settled normally — the envelope simply names no '
+			~ 'artifact';
+	$session.close;
+};
+
+subtest 'an orphan artifact is nobody’s problem' => {
+	plan 3;
+
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my Str $content = big-content();
+	my %out = oversized-run($session, $content, 2_000);
+	$session.close;
+
+	# What a crash between the write and the settle leaves: a file no
+	# envelope names. And the reverse, an envelope whose file was deleted.
+	my $dir = artifact-dir-for($path);
+	$dir.add('deadbeef.txt').spurt('an artifact whose run never settled');
+
+	my $named = events-of(%out<events>, 'tool-result').head.artifact<file>;
+	$dir.add($named).unlink;
+
+	my $resumed = LLM::Agent::Session.load(path => $path);
+	is $resumed.messages.elems, (await %out<run>.result)<messages>.elems,
+		'the transcript loads with an orphan beside it and a referenced '
+			~ 'file missing';
+	is $resumed.pending-tool-operations.elems, 0,
+		'with nothing left pending';
+	ok $dir.add('deadbeef.txt').e,
+		'and nothing deletes the orphan: retention is the application’s '
+			~ 'decision, not a library’s';
+	$resumed.close;
+};
+
+subtest 'a pending record is the caller’s to keep' => {
+	plan 3;
+
+	# The nested values a settle can carry are copied a level deeper than
+	# `.Hash` goes, so a caller poking at what it was handed cannot
+	# rewrite the session's replayed state.
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	$session.append-tool-dispatched(
+		call-id => 'c1', tool => 'fs_read',
+		arguments => { path => 'a' },
+	);
+
+	my %pending = $session.pending-tool-operations.head;
+	%pending<arguments><path> = 'somewhere else';
+	%pending<tool> = 'fs_write';
+
+	is $session.pending-tool-operations.head<arguments><path>, 'a',
+		'mutating the nested arguments of the record you were handed '
+			~ 'changes nothing here';
+	is $session.pending-tool-operations.head<tool>, 'fs_read',
+		'and neither does mutating the record itself';
+	is %pending<arguments><path>, 'somewhere else',
+		'the copy really was yours to mutate';
+	$session.close;
+};
+
+subtest 'the store writes one file per operation, and creates its dir late' => {
+	plan 4;
+
+	my $dir = $tmp.add('store-' ~ $n++ ~ '.artifacts');
+	my $store = LLM::Agent::Artifacts::Store.new(:$dir);
+	nok $dir.e, 'constructing a store creates nothing';
+
+	my %first = $store.store('op-1', 'hello');
+	ok $dir.d, 'the first write creates the directory';
+	is $dir.add(%first<file>).slurp, 'hello', 'and the file it named';
+
+	# An id that is not a uuid still produces one file, in the directory,
+	# with nothing clever in its name.
+	my %odd = $store.store('../../etc/passwd', 'nope');
+	is %odd<file>.IO.basename, %odd<file>,
+		'an id with path separators in it stays one flat file name';
+};
+
+subtest 'no budget means no excerpting at all' => {
+	plan 2;
+
+	# The threshold lives on the request budget, so a loop without one
+	# behaves exactly as 0.1.x did: every byte a tool produced reaches the
+	# conversation.
+	my $path = fresh-path();
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my Str $content = big-content();
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'let me look',
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"big"}'),] },
+		{ content => 'done' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { fs_read => $content },
+	);
+	my $run = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$session,
+	).run(@prompt);
+	run-settled($run, 'the unbudgeted run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'tool-result').head.content, $content,
+		'the whole result reaches the conversation';
+	nok artifact-dir-for($path).e, 'and nothing was written anywhere';
+	$session.close;
+};
+
+subtest 'the artifact directory is a sibling of the transcript' => {
+	plan 3;
+
+	is artifact-dir-for('/state/run.jsonl'.IO).Str, '/state/run.artifacts',
+		'the transcript stem plus .artifacts, beside the file';
+	is artifact-dir-for('/state/2026-08-10.run.jsonl'.IO).Str,
+		'/state/2026-08-10.run.artifacts',
+		'only the LAST extension is replaced';
+	is artifact-dir-for('/state/run'.IO).Str, '/state/run.artifacts',
+		'and a transcript with no extension is not handed its own path';
+};

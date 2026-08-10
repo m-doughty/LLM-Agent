@@ -1,0 +1,374 @@
+use Test;
+# The fixture below is ONE piece of source, run in this process and in two
+# children, so that "the same context" really is the same context rather
+# than two hand-copied ones that could drift apart.
+use MONKEY-SEE-NO-EVAL;
+use lib 'lib', 't/lib';
+use LLM::Agent::Canonical;
+use LLM::Agent::RunContext;
+use LLM::Chat::Conversation::Message;
+
+# The refreshable half of a prompt, on its own: what it refuses to be
+# built from, what it renders, what it digests — and the one property an
+# in-process test cannot check at all, which is that two PROCESSES render
+# the same bytes.
+
+plan 10;
+
+my $tmp = $*TMPDIR.add("llm-agent-t20-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+# The facts and sections both halves of the determinism test build, as
+# source a child process can run. Deliberately several keys whose hash
+# order would differ from their given order.
+my constant FIXTURE = q:to/END/;
+	my @facts = (
+		platform => 'darwin (arm64)',
+		os       => 'macos 26.3.1',
+		date     => '2026-08-10',
+		cwd      => '/srv/project',
+		branch   => 'feature/run-context',
+		head     => '4f2c9ab',
+		dirty    => '3 files',
+		shell    => 'zsh',
+		user     => 'somebody',
+		host     => 'a-laptop',
+		tz       => 'Europe/London',
+		locale   => 'en_GB.UTF-8',
+	);
+	my $context = LLM::Agent::RunContext.new(
+		facts         => @facts,
+		head-sections => [
+			identity     => 'You are a coding assistant.',
+			instructions => "## AGENTS.md\n\nRun the tests.",
+		],
+		tail-sections => [ reminders => 'Never commit.' ],
+	);
+	END
+	;
+
+sub fixture-context(--> LLM::Agent::RunContext) {
+	EVAL(FIXTURE ~ "\n\$context");
+}
+
+# What a process is asked to print about that context: the two rendered
+# messages and the digest, as one blob to compare byte for byte.
+my constant REPORT = q:to/END/;
+	print join("\x1F",
+		$context.digest,
+		($context.head-message.defined ?? $context.head-message.content !! '<none>'),
+		($context.tail-message.defined ?? $context.tail-message.content !! '<none>'),
+		$context.section-digests.join(','),
+	);
+	END
+	;
+
+subtest 'the three lists are ordered lists of Pairs, and nothing else' => {
+	plan 9;
+
+	# THE one that matters: a Hash iterates in a per-process random order,
+	# so the same context would render differently in two processes while
+	# its digest — canonical JSON, sorted keys — stayed identical. Nothing
+	# downstream could ever notice.
+	throws-like { LLM::Agent::RunContext.new(facts => { date => 'today' }) },
+		Exception, message => /'randomises'/,
+		'a Hash of facts is refused, with the reason spelled out';
+	throws-like {
+		LLM::Agent::RunContext.new(head-sections => { identity => 'x' })
+	}, Exception, message => /'head-sections'/,
+		'and so is a Hash of head sections';
+	throws-like {
+		LLM::Agent::RunContext.new(tail-sections => { reminders => 'x' })
+	}, Exception, message => /'tail-sections'/,
+		'and of tail sections';
+
+	# A Pair does the Associative role, so ONE fact with no trailing comma
+	# would otherwise be told it was handed a Hash — which it was not, and
+	# the fix (a comma) is nowhere in that sentence.
+	throws-like { LLM::Agent::RunContext.new(facts => (date => 'today')) },
+		Exception, message => /'single Pair'/,
+		'a lone Pair says it is a lone Pair, not a Hash';
+
+	throws-like { LLM::Agent::RunContext.new(facts => ['date', 'today']) },
+		Exception, message => /'not a Pair'/,
+		'a flat list is not a list of Pairs';
+	throws-like { LLM::Agent::RunContext.new(facts => [date => 20_260_810]) },
+		Exception, message => /'every value is a Str'/,
+		'and a value that is not a Str is refused rather than stringified';
+	throws-like { LLM::Agent::RunContext.new(facts => ['' => 'today']) },
+		Exception, message => /'non-empty Str'/,
+		'a nameless fact is refused too';
+
+	# Raku accepts any named argument and drops the ones nothing matches,
+	# which would make a typo a context that says nothing at all.
+	throws-like { LLM::Agent::RunContext.new(head_sections => [a => 'b']) },
+		Exception, message => /'head_sections'/,
+		'a misspelled argument is a construction error, not a silent empty';
+
+	# The one thing that IS dropped: an optional fact passed as an
+	# undefined variable, so a call site needs no conditional.
+	my $absent = Str;
+	is LLM::Agent::RunContext.new(
+		facts => [date => 'today', branch => $absent],
+	).facts.map({ .key }).List, ('date',),
+		'an undefined value is dropped, the way env-block drops one';
+};
+
+subtest 'facts render in the order they were given, not in any other' => {
+	plan 4;
+
+	my $forward = LLM::Agent::RunContext.new(
+		facts => [alpha => '1', beta => '2', gamma => '3'],
+	);
+	my $reverse = LLM::Agent::RunContext.new(
+		facts => [gamma => '3', beta => '2', alpha => '1'],
+	);
+
+	is $forward.facts.map({ .key }).List, ('alpha', 'beta', 'gamma'),
+		'the facts come back in the order they went in';
+	is-deeply $forward.tail-message.content.lines.grep(*.starts-with('- ')).List,
+		('- alpha: 1', '- beta: 2', '- gamma: 3'),
+		'and render in that order';
+	is-deeply $reverse.tail-message.content.lines.grep(*.starts-with('- ')).List,
+		('- gamma: 3', '- beta: 2', '- alpha: 1'),
+		'the other order renders the other way round';
+	isnt $forward.digest, $reverse.digest,
+		'and the two are different contexts, because the order is part of '
+			~ 'what was said';
+};
+
+subtest 'the messages are framing, not history' => {
+	plan 6;
+
+	my $context = LLM::Agent::RunContext.new(
+		head-sections => [identity => 'IDENT'],
+		facts         => [date => 'today'],
+	);
+
+	is $context.head-message.role, 'system', 'the head message is a system one';
+	is $context.tail-message.role, 'system', 'and so is the tail';
+
+	# Neither flag, deliberately: this is never in a conversation, so the
+	# two things that protect a message from compaction have nothing to
+	# protect — and setting them would make a context look like history to
+	# anything that inspected the request.
+	nok $context.head-message.sticky, 'the head is not sticky';
+	nok $context.head-message.sysprompt, 'nor a sysprompt';
+	nok $context.tail-message.sticky, 'the tail is not sticky';
+	nok $context.tail-message.sysprompt, 'nor a sysprompt';
+};
+
+subtest 'empty is empty: no sections, no facts, no messages' => {
+	plan 7;
+
+	my $nothing = LLM::Agent::RunContext.new;
+	nok $nothing.head-message.defined,
+		'a context with nothing in it has no head message';
+	nok $nothing.tail-message.defined,
+		'and no tail message — the boilerplate alone is not worth a request';
+	ok $nothing.is-empty, 'which is what is-empty says';
+
+	# The reason it matters: a caller passes instructions-from-files(...)
+	# without first checking whether any of the paths existed.
+	my $blank = LLM::Agent::RunContext.new(
+		head-sections => [identity => '', instructions => "  \n  "],
+		tail-sections => [reminders => ''],
+	);
+	nok $blank.head-message.defined,
+		'every head section empty is no head message at all';
+	nok $blank.tail-message.defined,
+		'and an empty tail section does not conjure one either';
+
+	my $mixed = LLM::Agent::RunContext.new(
+		head-sections => [identity => 'IDENT', instructions => ''],
+	);
+	is $mixed.head-message.content, 'IDENT',
+		'an empty section between two others is dropped from the join';
+	nok $mixed.tail-message.defined,
+		'and head sections alone still leave the tail unsent';
+};
+
+subtest 'the tail block says what it is and what it outranks' => {
+	plan 5;
+
+	my $context = LLM::Agent::RunContext.new(
+		facts         => [date => '2026-08-10'],
+		tail-sections => [reminders => 'Never commit.'],
+	);
+	my $content = $context.tail-message.content;
+
+	ok $content.starts-with(LLM::Agent::RunContext::CONTEXT-HEADER),
+		'the block opens with its header';
+	ok $content.contains('- date: 2026-08-10'), 'the facts are bullets';
+	ok $content.contains('Never commit.'), 'the tail sections follow them';
+
+	# Both lines are load-bearing: the first is what makes a legacy
+	# transcript with a fat sysprompt at index 0 safe to resume, the
+	# second is what stops a model answering the context instead of the
+	# question.
+	ok $content.contains(LLM::Agent::RunContext::SUPERSEDES-LINE),
+		'and it ends by saying it supersedes anything earlier that '
+			~ 'describes the same world';
+	ok $content.contains(LLM::Agent::RunContext::NOT-A-REQUEST-LINE),
+		'and that it is not something to reply to';
+};
+
+subtest 'head and tail land on opposite sides, and the head is prose only' => {
+	plan 3;
+
+	my $context = LLM::Agent::RunContext.new(
+		head-sections => [identity => 'IDENT', instructions => 'INSTRUCTIONS'],
+		facts         => [date => 'today'],
+		tail-sections => [reminders => 'REMINDERS'],
+	);
+
+	is $context.head-message.content, "IDENT\n\nINSTRUCTIONS",
+		'the head is its sections, joined by blank lines and nothing else';
+	nok $context.head-message.content.contains('today'),
+		'the facts are NOT in the head — they are what changes every turn, '
+			~ 'and a volatile block near index 0 re-prefills the whole '
+			~ 'conversation on every request';
+	nok $context.tail-message.content.contains('IDENT'),
+		'and the head sections are not repeated in the tail';
+};
+
+subtest 'equal contexts have equal digests, and different ones do not' => {
+	plan 6;
+
+	sub build(Str:D $date, Str:D $instructions --> LLM::Agent::RunContext) {
+		LLM::Agent::RunContext.new(
+			head-sections => [identity => 'IDENT', instructions => $instructions],
+			facts         => [date => $date, cwd => '/srv'],
+			tail-sections => [reminders => 'REMINDERS'],
+		);
+	}
+
+	is build('2026-08-10', 'A').digest, build('2026-08-10', 'A').digest,
+		'two contexts built the same way agree';
+	isnt build('2026-08-10', 'A').digest, build('2026-08-11', 'A').digest,
+		'a changed fact is a changed context';
+	isnt build('2026-08-10', 'A').digest, build('2026-08-10', 'B').digest,
+		'and so is a changed section';
+
+	# A section that has been emptied since the last run is a change worth
+	# noticing, even though it renders to the same text as no section.
+	isnt LLM::Agent::RunContext.new(head-sections => [a => 'x', b => '']).digest,
+		LLM::Agent::RunContext.new(head-sections => [a => 'x']).digest,
+		'an emptied section is a change, even though it renders to nothing';
+
+	# And the one thing that is NOT a change: an instruction file that
+	# gained a final newline. Otherwise every such file would be stored
+	# again in the transcript for nothing.
+	is LLM::Agent::RunContext.new(head-sections => [a => "x\n\n"]).digest,
+		LLM::Agent::RunContext.new(head-sections => [a => 'x']).digest,
+		'trailing whitespace is not a change';
+	is LLM::Agent::RunContext.new(head-sections => [a => "x\n"]).head-sections[0].value,
+		'x', 'because it comes off at construction, once';
+};
+
+subtest 'every section carries its own digest, in one order' => {
+	plan 6;
+
+	my $context = LLM::Agent::RunContext.new(
+		head-sections => [identity => 'IDENT', instructions => 'INSTR'],
+		facts         => [date => 'today'],
+		tail-sections => [reminders => 'REMIND'],
+	);
+
+	is $context.sections.map({ $_<name> }).List,
+		('identity', 'instructions', 'reminders'),
+		'the sections are head first, then tail';
+	is-deeply $context.section-digests, $context.sections.map({ $_<digest> }).List,
+		'section-digests is the same list, digests only';
+	is $context.sections[0]<rendered>, 'IDENT', 'each carries its rendered text';
+
+	# Per SECTION, because that is what deduplicates: the facts change
+	# every run and an identity block does not.
+	my $tomorrow = LLM::Agent::RunContext.new(
+		head-sections => [identity => 'IDENT', instructions => 'CHANGED'],
+		facts         => [date => 'tomorrow'],
+		tail-sections => [reminders => 'REMIND'],
+	);
+	is $tomorrow.sections[0]<digest>, $context.sections[0]<digest>,
+		'an unchanged section keeps its digest across contexts';
+	isnt $tomorrow.sections[1]<digest>, $context.sections[1]<digest>,
+		'and a changed one does not';
+
+	# The digest covers the name as well as the body: two sections with
+	# the same prose under different headings are different sections.
+	isnt LLM::Agent::RunContext.new(head-sections => [a => 'same']).sections[0]<digest>,
+		LLM::Agent::RunContext.new(head-sections => [b => 'same']).sections[0]<digest>,
+		'the name is part of a section digest';
+};
+
+subtest 'what you are handed cannot rewrite what was rendered' => {
+	plan 3;
+
+	my $context = LLM::Agent::RunContext.new(
+		head-sections => [identity => 'IDENT'],
+		facts         => [date => 'today'],
+	);
+
+	my @sections = $context.sections;
+	@sections[0]<rendered> = 'TAMPERED';
+	is $context.sections[0]<rendered>, 'IDENT',
+		'a section record is a copy, one level deeper than the list';
+
+	my $before = $context.digest;
+	my @facts = $context.facts;
+	@facts.push: (tampered => 'yes');
+	is $context.facts.elems, 1, 'the facts list is a copy too';
+	is $context.digest, $before,
+		'so the digest still describes what was actually rendered';
+};
+
+subtest 'two fresh processes render the same bytes' => {
+	plan 3;
+
+	# THE test an in-process one cannot do. Raku randomises hash iteration
+	# PER PROCESS: a version of this class that walked a Hash would render
+	# identically every time inside one process, and differently in the
+	# next one — while the digest, which sorts keys, agreed all along.
+	my $script = $tmp.add('render.raku');
+	$script.spurt(
+		"use LLM::Agent::RunContext;\n" ~ FIXTURE ~ "\n" ~ REPORT
+	);
+
+	# The include path this test is running under, handed to the children:
+	# a checkout under test is a FileSystem repo, and there may be several
+	# (sibling dists, when the whole tree is being tested at once).
+	my @includes = $*REPO.repo-chain
+		.grep({ $_ ~~ CompUnit::Repository::FileSystem })
+		.map({ '-I' ~ .prefix.absolute });
+
+	sub render-in-a-child(--> Str) {
+		my $proc = run(
+			$*EXECUTABLE, |@includes, $script.absolute,
+			:out, :err,
+		);
+		my $out = $proc.out.slurp(:close);
+		my $err = $proc.err.slurp(:close);
+		die "the child process failed: $err" unless $proc.so;
+		$out;
+	}
+
+	my $first  = render-in-a-child();
+	my $second = render-in-a-child();
+
+	ok $first.chars, 'the child process rendered something';
+	is $second, $first,
+		'and a second, entirely separate process rendered exactly the same '
+			~ 'bytes — facts, sections, digest and all';
+
+	# ...and this process agrees with both, which is what makes the digest
+	# a comparison key across a resume.
+	my $mine = fixture-context();
+	is $first.split("\x1F").head, $mine.digest,
+		'as does this one';
+};

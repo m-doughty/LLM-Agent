@@ -100,6 +100,44 @@ latency-sensitive, it does not need tools, and a small cheap model does
 it well. Pointing it at C<@backends[0]> is perfectly reasonable, and
 pointing it somewhere cheaper is usually better.
 
+=head2 A compaction has to prove it compacted
+
+C<compact> does not accept a summary just because the model produced
+one. After assembling the new conversation it counts it, and requires
+C<< tokens-after < tokens-before >>. A model that answers a request for a
+summary with something as long as the transcript has not compacted
+anything, and taking it would mean the next round asks for a compaction
+again over a conversation that has not moved — forever.
+
+A summary that fails that test gets B<one> retry, with the instruction
+saying in as many words that the previous attempt was too long, and the
+retry is accepted only if it is both smaller than the conversation B<and>
+smaller than the first attempt. Otherwise it is the hard trim, which is
+arithmetic and cannot fail to shrink anything.
+
+(The retry tightens with words rather than with a completion cap on
+purpose: L<LLM::Chat> keeps that limit on a backend's C<Settings>, which
+this compactor normally shares with the loop that owns it — turning it
+down here would turn it down for the conversation as well, from a thread
+the conversation knows nothing about.)
+
+=head2 When even a hard trim is not enough
+
+There is a floor: the trim never eats into the recent window, so a
+conversation whose sticky prefix plus recent window is B<itself> bigger
+than the budget cannot be made to fit. One 400KB C<fs_read> in the last
+turn does it.
+
+Rather than hand back a conversation whose next request is guaranteed to
+fail, C<compact> says so: C<< exhausted => True >> in the result. It is a
+marker, not an exception — the C<messages> are still the best available
+version, and L<LLM::Agent::Loop> still writes them to the session before
+ending the run with C<RunFailed> and a C<reason> of C<context-exhausted>.
+A no-op compaction over a conversation that is already past the B<budget>
+(as opposed to merely past the trigger) is marked the same way, for the
+same reason: there was nothing to summarize, so there is nothing left to
+try.
+
 =head2 When the summarizer fails
 
 It will. The context is large, the call is a single one with no fallback
@@ -143,6 +181,34 @@ C<fallback> is on the C<CompactionDone> event and in the transcript, so
 "the model seems to have forgotten everything" is answerable after the
 fact.
 
+=head2 Compacting to somebody else's number
+
+C<compact> normally aims at C<target> — C<target-ratio> of the budget —
+and reports C<exhausted> against C<context-budget>. Both are this class's
+own numbers, and both are wrong for one caller: L<LLM::Agent::Loop>'s
+per-attempt preflight, which knows something this class does not. A
+backend's usable room is its window B<minus> the tokens reserved for the
+answer, B<minus> a safety margin, B<minus> the tool declarations the
+request carries — and in a fallback chain it is the B<largest> such
+number across the backends that are still worth trying.
+
+C<< compact(@messages, :$target) >> is how that number gets in. It
+overrides C<target> for the one invocation, and three things follow it
+through:
+
+=item the B<hard trim> aims at it rather than at C<target>;
+
+=item a B<summary> is accepted only if it gets under it — a summary that
+shrank the conversation but left it too big for the backend that asked
+is not an answer, and falling through to the trim that would have fitted
+is;
+
+=item C<exhausted> is judged against it rather than against
+C<context-budget>, so "I did everything and it still will not fit" means
+what the caller asked rather than what this class assumes.
+
+Without C<:$target> every one of those is exactly as it was.
+
 =head2 The result
 
 C<compact> returns a C<Map>:
@@ -158,6 +224,7 @@ cut-index     | Index, in the INPUT array, of the last message replaced.
 tokens-before | The counter's answer before.
 tokens-after  | The counter's answer after.
 fallback      | True when this was a hard trim rather than a summary.
+exhausted     | True when even that could not make the conversation fit.
 
 =end table
 
@@ -217,6 +284,28 @@ our constant INSTRUCTION = q:to/END/.trim;
 	invented facts. Prefer exact identifiers — paths, function names, error
 	strings — over paraphrase. You are writing notes for the assistant that
 	continues this conversation, not a report for a human.
+	END
+
+#|( Added to C<INSTRUCTION> for the one retry a summary that made no
+    progress gets.
+
+    B<Why an instruction rather than a cap:> the completion limit in
+    L<LLM::Chat> lives on a backend's C<Settings> and applies to every
+    call that backend serves. This one is shared — the summarizer is
+    normally the loop's own backend — so turning it down here would turn
+    it down for the conversation too, from a thread the conversation
+    knows nothing about. An instruction reaches only this request, and
+    the result is checked rather than trusted: a retry that is not
+    smaller than the first attempt is discarded. )
+our constant TIGHTEN = q:to/END/.trim;
+	YOUR PREVIOUS ATTEMPT WAS TOO LONG. It was no shorter than the
+	conversation it was meant to replace, which makes it useless — the
+	entire point is to make the conversation smaller.
+
+	Write it again, drastically shorter: at most a quarter of the length
+	of the transcript below, and shorter still if you can manage it. Cut
+	detail, not headings; keep exact identifiers, drop the prose around
+	them. One dense line per fact is the target.
 	END
 
 #|( The backend that writes the summaries. Typically a cheaper model than
@@ -283,32 +372,83 @@ method needs-compaction(@messages --> Bool:D) {
 #|( Compact C<@messages>. Never throws and never returns an unusable
     conversation: see the failure policy in the Pod. C<:&cancelled> is
     polled during the backoff between summarization attempts, and a
-    cancelled compaction hard-trims rather than hanging on. )
-method compact(@messages, :&cancelled --> Map) {
+    cancelled compaction hard-trims rather than hanging on.
+
+    C<:$target> overrides C<target> B<for this invocation only>, and is
+    how L<LLM::Agent::Loop> asks for a compaction against a number this
+    class does not know: the largest conversation that would actually fit
+    the backends it is about to try (window minus completion reserve
+    minus safety margin minus the tool declarations). See
+    L</Compacting to somebody else's number>. )
+method compact(@messages, :&cancelled, Int :$target --> Map) {
 	my Int $tokens-before = $!counter.count-messages(@messages);
 	my Int $cut = self!cut-index(@messages);
 
 	# Nothing between the sticky prefix and the recent window: a no-op,
 	# and — importantly — no backend call.
-	return self!unchanged(@messages, $tokens-before)
+	return self!unchanged(@messages, $tokens-before, $target)
 		if $cut < 0 || !self!middle(@messages, $cut).elems;
 
 	my $summary = self!summarize(@messages, $cut, :&cancelled);
 
-	return self!trim(@messages, $cut, $tokens-before) unless $summary.defined;
+	if $summary.defined {
+		my %summarized = self!summarized(@messages, $cut, $summary, $tokens-before);
+		return %summarized.Map
+			if self!good-enough(%summarized<tokens-after>, $tokens-before, $target);
 
+		# A summary that is not smaller than what it replaced is not a
+		# compaction, it is a rewrite — and accepting it means the next
+		# round asks for one again, over a conversation that has not
+		# moved. One more try, told in as many words to be shorter, and
+		# only accepted if it really is.
+		my $tighter = self!attempt-summary(
+			self!summarizer-input(@messages, $cut, :tighten),
+		);
+		if $tighter<ok> {
+			my %retried = self!summarized(
+				@messages, $cut, $tighter<summary>, $tokens-before,
+			);
+			return %retried.Map
+				if self!good-enough(%retried<tokens-after>, $tokens-before, $target)
+					&& %retried<tokens-after> < %summarized<tokens-after>;
+		}
+	}
+
+	self!trim(@messages, $cut, $tokens-before, $target);
+}
+
+#|( Is a summary worth keeping? Smaller than what it replaced — always —
+    and, when a caller named a C<$target>, actually under it.
+
+    The second half only exists for the targeted call. A summary that
+    shrank the conversation but left it too big for the backend that
+    asked for the compaction has not solved the caller's problem, and
+    accepting it would mean handing back a conversation whose next
+    request is still guaranteed to fail while a hard trim that would have
+    fitted was one line away. )
+method !good-enough(Int:D $after, Int:D $before, Int $target --> Bool:D) {
+	so ($after < $before && (!$target.defined || $after <= $target));
+}
+
+# The result of accepting C<$summary>: the same Hash `compact` returns,
+# built before anybody has decided whether it is good enough to return.
+method !summarized(
+	@messages, Int:D $cut, Str:D $summary, Int:D $tokens-before,
+	--> Hash:D
+) {
 	my $content = SUMMARY-HEADER ~ "\n" ~ $summary;
 	my @result = self!assemble(@messages, $cut, $content);
 
 	%(
-		messages      => @result.List,
-		summary       => $content,
-		dropped       => self!middle(@messages, $cut).elems,
-		'cut-index'   => $cut,
+		messages        => @result.List,
+		summary         => $content,
+		dropped         => self!middle(@messages, $cut).elems,
+		'cut-index'     => $cut,
 		'tokens-before' => $tokens-before,
 		'tokens-after'  => $!counter.count-messages(@result),
-		fallback      => False,
-	).Map;
+		fallback        => False,
+		exhausted       => False,
+	);
 }
 
 # === Choosing what to replace ===
@@ -347,7 +487,7 @@ method !assemble(@messages, Int:D $cut, Str:D $content --> List) {
 	@result.List;
 }
 
-method !unchanged(@messages, Int:D $tokens-before --> Map) {
+method !unchanged(@messages, Int:D $tokens-before, Int $target? --> Map) {
 	%(
 		messages        => @messages.List,
 		summary         => '',
@@ -356,16 +496,24 @@ method !unchanged(@messages, Int:D $tokens-before --> Map) {
 		'tokens-before' => $tokens-before,
 		'tokens-after'  => $tokens-before,
 		fallback        => False,
+		# A no-op over a conversation that is merely past the TRIGGER is
+		# fine — the next request still fits. A no-op over one past the
+		# BUDGET (or past the caller's own target) is the end of the road:
+		# there was nothing to summarize, so there is nothing left to try.
+		exhausted       => $tokens-before > ($target // $!context-budget),
 	).Map;
 }
 
 # === Summarizing ===
 
-# The model's summary, or an undefined Str when every attempt failed.
-method !summarize(@messages, Int:D $cut, :&cancelled --> Str) {
-	my @input = (
+# The two messages the summarizer is asked with. `:tighten` adds the
+# second-chance instruction; everything else is identical, deliberately —
+# the retry summarizes the same transcript, not a different one.
+method !summarizer-input(@messages, Int:D $cut, Bool :$tighten --> List) {
+	(
 		LLM::Chat::Conversation::Message.new(
-			role => 'system', content => INSTRUCTION,
+			role    => 'system',
+			content => $tighten ?? INSTRUCTION ~ "\n\n" ~ TIGHTEN !! INSTRUCTION,
 		),
 		LLM::Chat::Conversation::Message.new(
 			role    => 'user',
@@ -374,6 +522,11 @@ method !summarize(@messages, Int:D $cut, :&cancelled --> Str) {
 				~ "\n</transcript>",
 		),
 	);
+}
+
+# The model's summary, or an undefined Str when every attempt failed.
+method !summarize(@messages, Int:D $cut, :&cancelled --> Str) {
+	my @input = self!summarizer-input(@messages, $cut);
 
 	my Int $attempt = 0;
 	my Str $summary;
@@ -479,8 +632,8 @@ method !render(@middle --> Str:D) {
     shape a summarized compaction has — sticky prefix, one synthetic
     message, tail — because L<LLM::Agent::Session> replays both the same
     way. )
-method !trim(@messages, Int:D $cut, Int:D $tokens-before --> Map) {
-	my Int $target = self.target;
+method !trim(@messages, Int:D $cut, Int:D $tokens-before, Int $aim? --> Map) {
+	my Int $target = $aim // self.target;
 	my Int $chosen = $cut;
 	my @result;
 	my Str $content;
@@ -509,14 +662,25 @@ method !trim(@messages, Int:D $cut, Int:D $tokens-before --> Map) {
 		@result  = self!assemble(@messages, $cut, $content);
 	}
 
+	my Int $tokens-after = $!counter.count-messages(@result);
+
 	%(
 		messages        => @result.List,
 		summary         => $content,
 		dropped         => self!middle(@messages, $chosen).elems,
 		'cut-index'     => $chosen,
 		'tokens-before' => $tokens-before,
-		'tokens-after'  => $!counter.count-messages(@result),
+		'tokens-after'  => $tokens-after,
 		fallback        => True,
+		# The last word. A hard trim is the floor of what this class can
+		# do, so a trim that did not shrink the conversation — or that
+		# shrank it and still left it over the window (or over the target
+		# a caller named, which is the same statement about a number this
+		# class was handed) — is the end of the line, and saying so is
+		# worth more than handing back a conversation whose next request
+		# cannot succeed.
+		exhausted       => $tokens-after >= $tokens-before
+			|| $tokens-after > ($aim // $!context-budget),
 	).Map;
 }
 

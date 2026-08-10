@@ -3,15 +3,26 @@ use lib 'lib', 't/lib';
 use AgentTestKit;
 use LLM::Agent::Event;
 use LLM::Agent::Loop;
+use LLM::Agent::Session;
+use LLM::Agent::Subagents;
 use LLM::Chat::Conversation::Message;
 
 # The tool half of the loop: what reaches the provider, what comes back,
 # what the conversation looks like afterwards, and the four ways the loop
 # refuses to go round for ever.
 
-plan 10;
+plan 15;
 
 my @prompt = [msg('user', 'what is in a.txt?'),];
+
+my $tmp = $*TMPDIR.add("llm-agent-t04-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
 
 sub read-tool(--> Hash) {
 	tool-decl('fs_read', 'Read a file', { path => { type => 'string' } },
@@ -39,12 +50,15 @@ subtest 'a tool round: ordering, wire shapes, and the conversation it leaves' =>
 		(
 			'run-started',
 			'round-started', 'attempt-started', 'token', 'attempt-succeeded',
-			'assistant-message', 'tool-call', 'tool-result',
+			'assistant-message', 'turn-committed',
+			'tool-call', 'tool-started', 'tool-result',
 			'round-started', 'attempt-started', 'token', 'attempt-succeeded',
-			'assistant-message',
+			'assistant-message', 'turn-committed',
 			'run-completed',
 		),
-		'the call is announced before it runs and the result after it';
+		'the model asks (tool-call), the loop dispatches (tool-started), the '
+			~ 'provider answers (tool-result) — in that order, each turn '
+			~ 'committed before the calls it asked for';
 
 	my $call = events-of(@events, 'tool-call').head;
 	is $call.id, 'call_1', 'the ToolCall carries the provider id';
@@ -88,6 +102,63 @@ subtest 'the tool catalogue is fetched once per run, not once per round' => {
 	is $backend.recorded-calls.elems, 3, 'which really were three rounds';
 };
 
+subtest 'a composed provider reaches the backend as one catalogue' => {
+	plan 5;
+
+	# The loop is provider-agnostic, and a composer is just another
+	# provider — so what a stack publishes is what goes on the wire, and
+	# what it CANNOT do (grants) is what the loop must not assume.
+	my $spawn = -> %spec { Nil };
+
+	my $plain = ScriptedProvider.new(tools => [read-tool(),]);
+	my $composed = LLM::Agent::Subagents.new(
+		inner => $plain, spawn => $spawn,
+		types => [
+			{ name => 'reviewer', description => 'Reviews a diff.' },
+			{ name => 'tester', description => 'Runs the tests.' },
+		],
+	);
+
+	my $backend = scripted-backend(steps => [{ content => 'no tools today' },]);
+	my $run = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => $composed,
+	).run(@prompt);
+	run-settled($run, 'the composed run');
+
+	my @declared = $backend.recorded-calls[0]<tools>.list;
+	is @declared.map({ $_<function><name> }).List, ('fs_read', 'task'),
+		"the backend is declared the inner provider's tools AND the "
+			~ "composer's own, in one list";
+	is @declared[1]<function><parameters><properties><agent-type><enum>.List,
+		('reviewer', 'tester'),
+		'with the agent types the composer was built with';
+	is $plain.list-calls, 1,
+		'and the inner catalogue was still fetched exactly once per run';
+
+	# The `grants` half of the contract, which is invisible until a
+	# resumed session asks the human everything again: the loop decides
+	# whether to persist grants with .can('grants'), so a composer has to
+	# answer for the stack underneath it rather than for itself.
+	nok $composed.can('grants'),
+		'a composer over a provider with no grants has none either';
+
+	my $granting = ScriptedProviderWithGrants.new(
+		tools => [read-tool(),],
+		grants => [{ tool => 'fs_read', decision => 'allow' },],
+	);
+	my $over-grants = LLM::Agent::Subagents.new(
+		inner => $granting, spawn => $spawn,
+		types => [
+			{ name => 'reviewer', description => 'Reviews a diff.' },
+			{ name => 'tester', description => 'Runs the tests.' },
+		],
+	);
+	is-deeply
+		($over-grants.can('grants') ?? $over-grants.grants.List !! ()),
+		$granting.grants.List,
+		'and one over a policy passes its snapshot straight through';
+};
+
 subtest 'a provider that throws becomes one is_error result per call' => {
 	plan 4;
 
@@ -125,7 +196,7 @@ subtest 'a provider that throws becomes one is_error result per call' => {
 };
 
 subtest 'a provider that comes up short is padded, so the next request is valid' => {
-	plan 3;
+	plan 5;
 
 	my $backend = scripted-backend(steps => [
 		{ content => 'reading',
@@ -136,25 +207,38 @@ subtest 'a provider that comes up short is padded, so the next request is valid'
 		{ content => 'done' },
 	]);
 
+	# A bridge that answers a batch with nothing at all. Since dispatch is
+	# per operation, "came up short" is a batch of one that came back
+	# empty — and it has to be answered anyway, or the assistant turn's
+	# tool_calls go unpaired and the next request is a 400.
 	my class ShortProvider {
+		has @.sizes;
 		method tools-for-llm(--> List) { (read-tool(),) }
 		method execute-tool-calls(@calls --> List) {
-			({ role => 'tool', tool_call_id => 'c1', content => 'a!' },);
+			@!sizes.push: @calls.elems;
+			();
 		}
 	}
 
-	my $loop = LLM::Agent::Loop.new(
-		backends => [$backend,], provider => ShortProvider.new,
-	);
+	my $provider = ShortProvider.new;
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$provider);
 	my $run = $loop.run(@prompt);
 	run-settled($run, 'the short-provider run');
 
 	my @results = events-of(drain-events($run), 'tool-result');
 	is @results.elems, 2, 'a missing result is synthesized rather than skipped';
-	ok @results[1].is-error, 'and marked as an error';
-	is @results[1].id, 'c2',
-		'under the id of the call it should have answered — which is what '
-			~ 'keeps every tool_calls entry paired in the next request';
+	ok @results.all.is-error, 'and marked as an error';
+	is @results.map({ .id }).List, ('c1', 'c2'),
+		'under the ids of the calls they should have answered — which is '
+			~ 'what keeps every tool_calls entry paired in the next request';
+
+	is $provider.sizes.List, (1, 1),
+		'and both calls went to the provider on their own: two batches of '
+			~ 'one, not one batch of two';
+
+	my @messages = (await $run.result)<messages>;
+	is @messages.grep({ .role eq 'tool' }).elems, 2,
+		'both tool messages reached the conversation';
 };
 
 subtest 'the identical-call guard stops a model repeating itself' => {
@@ -201,8 +285,219 @@ subtest 'the identical-call guard stops a model repeating itself' => {
 		'in ToolLoop’s exact wording';
 };
 
-subtest 'a limit discards the assistant turn that tripped it' => {
+subtest 'the identical-call guard counts a batch against itself' => {
 	plan 4;
+
+	# The whole loop happens inside ONE turn: a guard that only looked at
+	# what previous rounds executed would let all three through, and then
+	# run them.
+	my $backend = scripted-backend(steps => [
+		{ content => 'reading it three times',
+		  'tool-calls' => [
+			tool-call('c1', 'fs_read', '{"path":"a.txt"}'),
+			tool-call('c2', 'fs_read', '{"path":"a.txt"}'),
+			tool-call('c3', 'fs_read', '{"path":"a.txt"}'),
+		  ] },
+		{ content => 'answering from what I have' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'hello' },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, max-identical-calls => 2,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the self-repeating batch');
+	my @events = drain-events($run);
+
+	my $limit = events-of(@events, 'limit-reached').head;
+	ok $limit.defined, 'the limit fired inside the batch that tripped it';
+	is $limit.limit, 'identical-calls', 'by name';
+	is $limit.count, 3,
+		'counting what the batch WOULD have made it, not what history was';
+	is $provider.recorded-calls.elems, 0,
+		'and not one of the three ran — the batch is refused whole, because '
+			~ 'a limit is checked before anything is committed';
+};
+
+subtest 'identical means the same request, not the same bytes' => {
+	plan 4;
+
+	# The same call twice, spelled differently: keys in another order and
+	# whitespace where a model felt like it. A model going round in circles
+	# rarely re-emits a byte-identical document.
+	my $backend = scripted-backend(steps => [
+		{ content => 'once',
+		  'tool-calls' => [
+			tool-call('c1', 'fs_read', '{"path":"a.txt","mode":"r"}'),
+		  ] },
+		{ content => 'again',
+		  'tool-calls' => [
+			tool-call('c2', 'fs_read', '{ "mode" : "r",  "path" : "a.txt" }'),
+		  ] },
+		{ content => 'fine, answering' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'hello' },
+	);
+	my $run = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, max-identical-calls => 1,
+	).run(@prompt);
+	run-settled($run, 'the reshuffled-arguments run');
+
+	is events-of(drain-events($run), 'limit-reached').head.limit,
+		'identical-calls',
+		'a re-ordered, re-spaced repeat of a call is the same call';
+	is $provider.recorded-calls.elems, 1, 'so only the first one ran';
+
+	# The control: a call that really is different is not caught by it.
+	my $other-backend = scripted-backend(steps => [
+		{ content => 'once',
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a.txt"}'),] },
+		{ content => 'again',
+		  'tool-calls' => [tool-call('c2', 'fs_read', '{"path":"b.txt"}'),] },
+		{ content => 'done' },
+	]);
+	my $other-provider = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'hello' },
+	);
+	my $other = LLM::Agent::Loop.new(
+		backends => [$other-backend,], provider => $other-provider,
+		max-identical-calls => 1,
+	).run(@prompt);
+	run-settled($other, 'the two-different-calls run');
+
+	is events-of(drain-events($other), 'limit-reached').elems, 0,
+		'reading a different file is a different call';
+	is $other-provider.recorded-calls.elems, 2, 'and both of them ran';
+};
+
+subtest 'a provider’s own tool_call_id never wins over the model’s' => {
+	plan 6;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'reading',
+		  'tool-calls' => [tool-call('call_1', 'fs_read', '{"path":"a.txt"}'),] },
+		{ content => 'done' },
+	]);
+
+	# A bridge that files its answer under an id nothing in the
+	# conversation asked for. Taking it at its word puts that id in the
+	# transcript, and the next request is a 400.
+	my class MisfilingProvider {
+		method tools-for-llm(--> List) { (read-tool(),) }
+		method execute-tool-calls(@calls --> List) {
+			(
+				{ role => 'tool', tool_call_id => 'not-the-one',
+				  content => 'hello' },
+			);
+		}
+	}
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => MisfilingProvider.new,
+	);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the misfiling-provider run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'tool-result').head.id, 'call_1',
+		'the result is reported under the id the model used';
+
+	my @messages = (await $run.result)<messages>;
+	is @messages[2].tool-call-id, 'call_1',
+		'and the tool message the model will see answers the call it made';
+	is @messages[2].content, 'hello',
+		'while the content the provider really returned is kept';
+
+	my @logs = events-of(@events, 'log');
+	is @logs.elems, 1, 'the correction is said out loud, once';
+	is @logs[0].data<provider-id>, 'not-the-one',
+		'naming the id the provider tried to use';
+	is @logs[0].data<call-id>, 'call_1', 'and the one it was filed under';
+};
+
+subtest 'a streamed tool-call turn that trips a limit is discarded whole' => {
+	plan 11;
+
+	my $path = $tmp.add('limit-discard.jsonl');
+	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+
+	# The turn that trips the limit is STREAMED: its tokens are on the
+	# wire and in the event stream before anybody knows it will be thrown
+	# away. What the loop promises is that the framing says so.
+	my $backend = scripted-backend(steps => [
+		{ chunks => ['I will ', 'read it for you. '],
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a.txt"}'),] },
+		{ content => 'the real answer' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'hello' },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$session, max-tool-rounds => 0,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the limited streaming run');
+	my @events = drain-events($run);
+	my @kinds = event-kinds(@events);
+
+	is events-of(@events, 'limit-reached').head.limit, 'tool-rounds',
+		'the limit fired';
+
+	# The framing, by index — the same shape t/05 uses for a retracted
+	# attempt. The discarded turn's tokens sit between its AttemptStarted
+	# and the LimitReached, and NO AssistantMessage closes that scope.
+	my $limit-at = @kinds.first({ $_ eq 'limit-reached' }, :k);
+	my $opened-at = @kinds[0 ..^ $limit-at].grep({ $_ eq 'attempt-started' }, :k).tail;
+	is events-of(@events[$opened-at ..^ $limit-at], 'token').map({ .text }).join,
+		'I will read it for you. ',
+		'the discarded turn really did stream, and the tokens are framed by '
+			~ 'the attempt that produced them';
+	is events-of(@events[$opened-at ..^ $limit-at], 'assistant-message').elems, 0,
+		'and nothing committed that scope — a limit discards the turn';
+
+	# The other half of that framing, and the reason TurnDiscarded exists:
+	# a consumer told to commit tokens on attempt-succeeded is told here,
+	# explicitly, to throw them away again.
+	my @discarded = events-of(@events, 'turn-discarded');
+	is @discarded.elems, 1, 'exactly one turn was discarded';
+	is @discarded[0].reason, 'limit', 'because a limit stopped it';
+	ok event-kinds(@events).first({ $_ eq 'turn-discarded' }, :k) > $opened-at
+		&& events-of(
+			@events[$opened-at ..^ event-kinds(@events)
+				.first({ $_ eq 'turn-discarded' }, :k)],
+			'assistant-message',
+		).elems == 0,
+		'and it closes the scope the attempt opened, with no assistant '
+			~ 'message anywhere in it';
+
+	is events-of(@events, 'assistant-message').elems, 1,
+		'exactly one assistant turn was committed in the whole run';
+	is events-of(@events, 'assistant-message').head.message.content,
+		'the real answer', 'the one that asked for no tools';
+	is $provider.recorded-calls.elems, 0, 'and no tool ever ran';
+
+	$session.close;
+	my $replayed = LLM::Agent::Session.load(path => $path);
+	is-deeply $replayed.messages.map({ .role ~ ':' ~ .content }).List,
+		(
+			'user:what is in a.txt?',
+			'system:' ~ LLM::Agent::Loop::LIMIT-MESSAGE,
+			'assistant:the real answer',
+		),
+		'the transcript holds the prompt, the notice and the answer — the '
+			~ 'discarded turn is not in it';
+	nok $replayed.messages.first({ .content.contains('read it for you') }).defined,
+		'not a word of what it streamed reached the file, because an '
+			~ 'assistant message carrying tool_calls that nothing answers is '
+			~ 'a conversation nobody can resume';
+};
+
+subtest 'a limit discards the assistant turn that tripped it' => {
+	plan 6;
 
 	my $backend = scripted-backend(steps => [
 		{ content => 'about to break the rules',
@@ -221,6 +516,11 @@ subtest 'a limit discards the assistant turn that tripped it' => {
 	is events-of(@events, 'limit-reached').head.limit, 'tool-rounds',
 		'the round limit fired before a single tool ran';
 	is $provider.recorded-calls.elems, 0, 'so nothing was executed';
+
+	is events-of(@events, 'turn-discarded').elems, 1,
+		'exactly one turn-discarded, for the turn that was thrown away';
+	is events-of(@events, 'turn-committed').elems, 1,
+		'and exactly one turn-committed, for the one that was kept';
 
 	my @assistant = (await $run.result)<messages>.grep({ .role eq 'assistant' });
 	is @assistant.elems, 1,
