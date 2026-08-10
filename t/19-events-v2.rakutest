@@ -24,6 +24,7 @@ my @prompt = [msg('user', 'hello'),];
 my $tmp = $*TMPDIR.add("llm-agent-t19-{$*PID}-{now.Int}");
 $tmp.mkdir;
 END {
+	close-test-sessions();
 	if $tmp.e {
 		.unlink for $tmp.dir;
 		$tmp.rmdir;
@@ -72,7 +73,7 @@ subtest 'a committed turn carries the id the transcript wrote it under' => {
 	plan 5;
 
 	my $path = $tmp.add('committed.jsonl');
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	my $backend = scripted-backend(steps => [
 		{ content => 'reading',

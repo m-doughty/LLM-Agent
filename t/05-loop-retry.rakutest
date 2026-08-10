@@ -18,6 +18,7 @@ my @prompt = [msg('user', 'hello'),];
 my $tmp = $*TMPDIR.add("llm-agent-t05-{$*PID}-{now.Int}");
 $tmp.mkdir;
 END {
+	close-test-sessions();
 	if $tmp.e {
 		.unlink for $tmp.dir;
 		$tmp.rmdir;
@@ -150,7 +151,7 @@ subtest 'a mid-stream failure retracts its tokens but never its transcript' => {
 	plan 7;
 
 	my $path = $tmp.add('midstream.jsonl');
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	my $backend = scripted-backend(steps => [
 		# Streams half a sentence, then the connection drops.
@@ -189,7 +190,7 @@ subtest 'a mid-stream failure retracts its tokens but never its transcript' => {
 		'with only the text the model really finished saying';
 
 	$session.close;
-	my $replayed = LLM::Agent::Session.load(path => $path);
+	my $replayed = reopen-session(path => $path);
 	is-deeply $replayed.messages.map({ .role ~ ':' ~ .content }).List,
 		('user:hello', 'assistant:The whole answer.'),
 		'and the transcript has no trace of the half sentence';

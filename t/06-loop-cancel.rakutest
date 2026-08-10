@@ -19,6 +19,7 @@ my @prompt = [msg('user', 'hello'),];
 my $tmp = $*TMPDIR.add("llm-agent-t06-{$*PID}-{now.Int}");
 $tmp.mkdir;
 END {
+	close-test-sessions();
 	if $tmp.e {
 		.unlink for $tmp.dir;
 		$tmp.rmdir;
@@ -97,7 +98,7 @@ subtest 'cancelling a blocked tool batch ends the run and ignores the results' =
 	plan 13;
 
 	my $path = $tmp.add('blocked.jsonl');
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	my $gate = Promise.new;
 	my $backend = scripted-backend(steps => [
@@ -143,7 +144,7 @@ subtest 'cancelling a blocked tool batch ends the run and ignores the results' =
 	sleep 0.2;
 
 	$session.close;
-	my $replayed = LLM::Agent::Session.load(path => $path);
+	my $replayed = reopen-session(path => $path);
 
 	# The assistant turn asking for the call was already committed, so
 	# the call has to be closed off: an assistant message carrying

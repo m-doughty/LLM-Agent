@@ -24,6 +24,7 @@ my @prompt = [msg('user', 'do the thing'),];
 my $tmp = $*TMPDIR.add("llm-agent-t14-{$*PID}-{now.Int}");
 $tmp.mkdir;
 END {
+	close-test-sessions();
 	if $tmp.e {
 		.unlink for $tmp.dir;
 		$tmp.rmdir;
@@ -271,7 +272,7 @@ subtest 'nothing fits: compact to the roomiest window, then it does' => {
 	# step is exercised on this path too: the loop DIES if the ids it
 	# splices and the messages the compactor returns disagree.
 	my $path = $tmp.add('forced.jsonl');
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	# 5 turns of 200 characters: 1,000 tokens. One backend, a 700-token
 	# window with a 100-token reserve — so the usable room is 600 and the

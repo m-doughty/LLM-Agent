@@ -241,10 +241,18 @@ digest, the way L<LLM::Agent::Loop>'s identical-call guard counts a
 call's name and canonicalised arguments: the arguments are reparsed, so
 key order and JSON whitespace are not part of the identity, and the
 prompt is trimmed, so a trailing newline is not either. The same spawn
-more than C<max-identical-spawns> times B<in the composer's lifetime> is
-refused with an C<is_error> saying so. A spawn that failed to start
-counts — a model retrying a spawn that cannot work is exactly the loop
-this is for.
+more than C<max-identical-spawns> times is refused with an C<is_error>
+saying so. A spawn that failed to start counts — a model retrying a
+spawn that cannot work is exactly the loop this is for.
+
+The tally is B<per parent run> by default (C<identical-spawn-scope>),
+and that default matters: the guard is about a model going round in
+circles within one turn of work. Three identical delegations across
+three unrelated runs are three occasions on which somebody asked for the
+same thing, and a composer that refused the fourth because of what
+happened an hour ago would get more broken the longer the host stayed
+up. C<< identical-spawn-scope => 'composer' >> is there for a host that
+really does mean "this much and no more, ever".
 
 B<The C<max-live> backstop> refuses a spawn while C<max-live> children
 are already running, with a message telling the model to wait for what it
@@ -257,15 +265,129 @@ section, so two spawns arriving at once cannot both take the last slot.
 
 =head2 Cancelling, and the cascade
 
-The first spawn of a given parent run registers on that run's
-C<cancellation> Promise, so cancelling the parent cancels every live
-child. That is a cascade, not a wait: the parent's own cancel path does
-not wait for the children, and a child that was mid-tool-call takes as
-long to wind down as it takes. Each cancelled child's C<task> call
-settles as an C<is_error> — the batch is never left hanging.
+The first spawn of a batch registers on the parent run's C<cancellation>
+Promise, so cancelling the parent cancels every child. That is a cascade,
+not a wait: the parent's own cancel path does not wait for the children,
+and a child that was mid-tool-call takes as long to wind down as it
+takes. Every cancelled child's C<task> call settles as an C<is_error> —
+the batch is never left hanging.
 
 C<cancel-children> is the same thing for a shutdown path, and
 C<live-agents> is what a UI renders while they run.
+
+=head3 A child's life is longer than its call
+
+Three moments, and they are all different:
+
+=begin table
+
+Moment          | What it means
+================|=========================================================
+child result    | the C<task> call is ANSWERED; the parent may carry on
+child drained   | the child has stopped PRODUCING; the composer lets go
+composer's slot | held from admission to drained, not to result
+
+=end table
+
+The parent is told as soon as the child has a result, because making a
+model wait on a call nobody is waiting for is how a run stalls. But the
+composer keeps the child — its C<max-live> slot, its place in
+C<live-agents>, and the right to cancel it — until the child's
+C<drained> Promise is kept.
+
+That gap is not theoretical. A child that abandoned a tool call to a
+deadline has a result while the abandoned call is still running, still
+writing files; L<LLM::Agent::Run> is explicit that C<result> and
+C<drained> diverge exactly there. A composer that let go at C<result>
+would free the slot to start another child beside the one still working,
+drop it out of whatever a UI is rendering, and — worst — leave
+C<cancel-children> with nothing to cancel, so a shutdown would report
+that everything had stopped while a tool call carried on.
+
+=head3 Where a child's events go, and where they do not
+
+Every event of a child is published through an emitter B<bound to the
+run that spawned it>, captured before the child exists
+(L<LLM::Agent::Loop>'s C<emitter-for>). Never through a fresh
+"what is running now?" lookup, because for a child that outlives its
+parent the answer to that question is B<the next run>:
+
+=begin code :lang<text>
+
+    run A spawns a child ─┐
+    run A is cancelled    │  the child is still winding down
+    run A finishes        │
+    run B starts          │
+                          └─► the child's last events arrive HERE
+
+=end code
+
+Published by a lookup, those events land on B: B's transcript grows
+turns from a conversation it never had, and its C<seq> ordering acquires
+events with no cause in it. Published through the captured emitter, they
+are B<dropped> — the emitter answers False once its run is over, for
+ever. The child's C<task> call still settles (as an C<is_error> when the
+child was cancelled), because settling belongs to the call and not to
+the stream.
+
+The same binding covers the two session envelopes and the C<Log> event a
+failed envelope write produces: everything the composer says about a
+child belongs to the run that started it.
+
+=head3 The window, and why there isn't one
+
+Building a child is B<somebody else's code> — the spawn callback may
+open a transcript, start a process, or queue behind three other agents —
+so there is a stretch of time in which a spawn has been admitted and no
+C<LLM::Agent::Run> exists yet. A cancel arriving in that stretch used to
+find nothing to cancel and silently do nothing, which stranded the child
+and hung its C<task> call. It is closed structurally rather than by
+narrowing:
+
+=item The B<slot is the cancellation target>, not the run. It is taken
+before the spawn callback is called, and C<cancel-children> writes
+C<cancel-requested> onto every slot — including the ones with no run yet
+— under the same lock the spawn path registers its run with.
+
+=item The parent run is captured B<once per batch>, before anything is
+spawned, and the cascade is registered on it there. C<.then> on an
+already-kept Promise fires immediately, so "cancelled before the spawn"
+and "cancelled after it" are one case. (Looking the run up later is what
+does not work: a cancelled parent has B<finished> by the time its
+detached tool call gets around to spawning, and C<Loop.live-run> quite
+correctly answers with nothing for a run that is over.)
+
+=item There are B<two interception points> and they meet in the middle:
+before the spawn callback is called (the child is never started at all),
+and in the same critical section that registers the child's run (the
+child is cancelled the moment there is something to cancel).
+
+So, for a cancel arriving at each point of a child's life:
+
+=begin table
+
+It arrives                        | What stops the child
+==================================|=========================================
+before the task call is admitted  | the pre-spawn check (the captured parent is cancelled): never started
+between the guard and the slot    | same check, one line later: never started
+between the slot and the run      | the flag on the slot; registration reads it and cancels
+after the run is registered       | cancel-children has the run and cancels it
+after the result, before drained  | the slot is still held, so cancel-children still has it
+after the child drained           | nothing to do: it has stopped
+
+=end table
+
+There is no ordering in which nothing happens, and every one of them
+ends with the C<task> call settled — as an C<is_error> for a child that
+was stopped, and as an ordinary answer for one that had already finished
+saying it.
+
+A child that is asked to stop and does not is the one case left, and it
+is a bug in that child rather than a race: a cancelled run keeps its
+result promptly, so one that has not after thirty seconds is answered
+without — an C<is_error> saying its outcome is B<unknown>, in the same
+words the loop uses for a tool call it stopped waiting for. The C<task>
+call always settles.
 
 =head2 What the transcript records
 
@@ -388,6 +510,14 @@ class LLM::Agent::Subagents {
 	    bound, not a delay. )
 	my constant STREAM-GRACE = 10;
 
+	# How often a child's result is checked while waiting for it, and how
+	# long a child that has been asked to stop is given to do so before its
+	# task call is answered without it. The poll rate is the loop's own
+	# tool poll; the grace is generous on purpose, because the only thing
+	# it can cut short is a child that is already misbehaving.
+	my constant CANCEL-POLL = 0.05;
+	my constant CANCEL-GRACE = 30;
+
 	#| The provider underneath: anything with C<tools-for-llm> and
 	#| C<execute-tool-calls>. Every call this composer does not own goes
 	#| to it untouched.
@@ -409,9 +539,22 @@ class LLM::Agent::Subagents {
 	#| How many children may run at once before a spawn is refused.
 	has Int:D $.max-live = 4;
 
-	#| How many times the same (agent-type, prompt) may be spawned in this
-	#| composer's lifetime.
+	#| How many times the same (agent-type, prompt) may be spawned within
+	#| the tally's scope. See C<identical-spawn-scope>.
 	has Int:D $.max-identical-spawns = 3;
+
+	#|( What C<max-identical-spawns> counts against: C<run> (the default —
+	    one tally per parent run, reset when the next run starts) or
+	    C<composer> (one tally for this object's whole life).
+
+	    C<run> is the default because the guard is about a model going
+	    round in circles B<inside one turn of work>. Three identical
+	    delegations across three unrelated runs are three occasions on
+	    which a user asked for the same thing, and a fourth being refused
+	    because of what happened yesterday is a composer that gets more
+	    broken the longer the host stays up. C<composer> is there for a
+	    host that means "this much and no more, ever". )
+	has Str:D $.identical-spawn-scope = 'run';
 
 	# The one lock, and a strict leaf: the spawn callback, the inner
 	# provider, the child's Supply and the loop are all called with it
@@ -424,10 +567,11 @@ class LLM::Agent::Subagents {
 	# task call has settled.
 	has %!children;
 
-	# (agent-type, prompt) digest => how many times it has been spawned.
-	# Never pruned: the cap is over the composer's lifetime, and a table
-	# with one entry per distinct delegation is not a leak.
+	# (agent-type, prompt) digest => how many times it has been spawned,
+	# within $!counted-scope. Cleared when the scope changes, which under
+	# the default (per parent run) is every new run.
 	has %!spawn-counts;
+	has Str $!counted-scope;
 
 	has Int:D $!counter = 0;
 	has Int:D $!seq = 0;
@@ -483,6 +627,11 @@ class LLM::Agent::Subagents {
 		die 'LLM::Agent::Subagents: max-identical-spawns must be at least 1'
 			unless $!max-identical-spawns >= 1;
 
+		die "LLM::Agent::Subagents: identical-spawn-scope is "
+			~ "'{$!identical-spawn-scope}'; it is 'run' (a tally per parent "
+			~ "run) or 'composer' (one tally for this object's life)"
+			unless $!identical-spawn-scope eq any('run', 'composer');
+
 		die 'LLM::Agent::Subagents: loop must be an LLM::Agent::Loop or a '
 			~ 'Callable returning one (which is what a forward-declared '
 			~ 'loop needs: `loop => { $loop }`); got a ' ~ $!loop.^name
@@ -526,43 +675,81 @@ class LLM::Agent::Subagents {
 		Nil;
 	}
 
-	#|( The children running right now, oldest first, as plain data:
-	    C<< { agent-id, agent-type, label, session-path } >>. What a UI
-	    renders beside the parent's transcript, and what a test asserts
-	    the C<max-live> backstop against. )
+	#|( The children this composer owns, oldest first, as plain data:
+	    C<< { agent-id, agent-type, label, session-path, starting,
+	    draining } >>. What a UI renders beside the parent's transcript,
+	    and what a test asserts the C<max-live> backstop against.
+
+	    An entry spans the whole of a child's life, which is B<wider at
+	    both ends> than its C<task> call:
+
+	    =item it appears the moment a spawn is B<admitted>, before the
+	    spawn callback has been called, because that is when the
+	    C<max-live> slot is taken. C<starting> is True until there is a
+	    child run behind it — those are cancellable exactly like the rest
+	    (see C<cancel-children>), they just have nothing to render yet;
+
+	    =item it survives the C<task> call's answer and disappears only
+	    when the child has B<drained>. C<draining> is True in between: the
+	    child answered, the parent has been told, and something the child
+	    detached — a tool call it abandoned to a deadline — is still
+	    running. It is still this composer's to cancel. )
 	method live-agents(--> List:D) {
 		$!lock.protect: {
 			%!children.values.sort({ $_<seq> }).map({
+				my Bool $has-run = $_<run> ~~ LLM::Agent::Run:D;
 				%(
 					agent-id     => $_<agent-id>,
 					agent-type   => $_<agent-type>,
 					label        => $_<label>,
 					session-path => $_<session-path>,
+					starting     => !$has-run,
+					# Answered, and still producing: its run is done and its
+					# `drained` is not. See cancel-children.
+					draining     => $has-run && $_<run>.is-done,
 				);
 			}).List;
 		};
 	}
 
-	#|( Ask every live child to stop, and answer how many were asked.
+	#|( Ask every child to stop, and answer how many were asked.
 	    Idempotent and safe from any thread — C<Run.cancel> is both, and
 	    is a total no-op on a child that has already finished.
 
+	    B<It reaches a child that does not exist yet.> A spawn takes its
+	    slot before the spawn callback is called, and building a child run
+	    is somebody else's code and can take as long as it likes, so
+	    "cancel everything" arriving in the middle of one has to mean
+	    something. It does: the request is B<recorded on the slot>, and
+	    the spawn path cancels the child the moment it has one to cancel —
+	    or never starts it at all, if the request got there first. Either
+	    way that C<task> call settles as an C<is_error> rather than
+	    hanging, which is the property that matters and the one a
+	    C<Run:D>-only sweep of the table quietly did not have.
+
 	    The cascade calls this on the parent's cancellation; call it
 	    yourself from a shutdown path. It does B<not> wait: each child's
-	    C<task> call settles as an C<is_error> when that child's run ends,
-	    which is as long as its tool batch takes. )
+	    C<task> call settles when that child's run ends, which is as long
+	    as its tool batch takes. )
 	method cancel-children(--> Int:D) {
-		# Snapshotted under the lock, cancelled outside it: `.cancel` runs
-		# the child driver's on-cancel hook, and this lock is a leaf.
+		# The flag and the snapshot in ONE critical section, so a spawn
+		# that registers its run concurrently either lands before this (and
+		# is in @runs) or after it (and reads the flag). Cancelled outside
+		# the lock: `.cancel` runs the child driver's on-cancel hook, and
+		# this lock is a leaf.
+		my Int $asked = 0;
 		my @runs = $!lock.protect: {
-			%!children.values.map({ $_<run> })
-				.grep({ $_ ~~ LLM::Agent::Run:D }).List;
+			my @live;
+			for %!children.values -> %child {
+				%child<cancel-requested> = True;
+				$asked++;
+				@live.push: %child<run> if %child<run> ~~ LLM::Agent::Run:D;
+			}
+			@live.List;
 		};
 
-		my Int $asked = 0;
 		for @runs -> $run {
 			try $run.cancel;
-			$asked++;
 		}
 		$asked;
 	}
@@ -601,6 +788,16 @@ class LLM::Agent::Subagents {
 		my @results;
 		my @forward;
 		my @tasks;
+
+		# THE PARENT RUN, captured ONCE, here, before anything is spawned —
+		# and held for the whole batch rather than looked up again later.
+		# `Loop.live-run` answers with nothing for a run that has finished,
+		# and a cancelled parent finishes while this batch is still being
+		# dispatched (the loop detaches the call it cancelled), so a lookup
+		# taken any later than this can legitimately come back empty and
+		# leave a child with nothing watching it. Captured, it is still the
+		# run whose `cancellation` this batch belongs to, done or not.
+		my $parent = self!parent-run;
 
 		for @tool-calls.kv -> $index, $call {
 			my $id = $call ~~ Associative ?? ($call<id> // '').Str !! '';
@@ -651,7 +848,7 @@ class LLM::Agent::Subagents {
 			my $threw;
 			{
 				CATCH { default { $threw = $_ } }
-				$answer = self!run-task(%item<call>, %item<id>);
+				$answer = self!run-task(%item<call>, %item<id>, $parent);
 			}
 
 			@results[%item<index>] = $threw.defined
@@ -671,7 +868,7 @@ class LLM::Agent::Subagents {
 	# The whole of a delegation: read it, guard it, spawn it, forward its
 	# events, wait for it, record it. Answers with a result Hash on every
 	# path; the only throws it can make are the ones the caller shields.
-	method !run-task($call, Str:D $id --> Hash:D) {
+	method !run-task($call, Str:D $id, $parent --> Hash:D) {
 		my $function = $call ~~ Associative ?? $call<function> !! Any;
 		my $arguments = parsed-arguments(
 			$function ~~ Associative ?? $function<arguments> !! Str,
@@ -719,9 +916,28 @@ class LLM::Agent::Subagents {
 		my Str $digest = data-digest(
 			%( agent-type => $type-name, prompt => $prompt.trim ),
 		);
+		# The tally's scope. Per parent run by default: three identical
+		# spawns are a model going round in circles WITHIN one run, and a
+		# fresh run asking the same question is a fresh question — the
+		# user has typed something since. `composer` keeps the old
+		# behaviour for a host that wants one cap over everything.
+		my Str $scope = $!identical-spawn-scope eq 'composer'
+			?? ''
+			!! ($parent.defined ?? $parent.id !! '');
+
 		my Str $agent-id;
 		my Str $refusal;
 		$!lock.protect: {
+			# Per-run scope keeps ONE run's tally: the previous run's is of
+			# no further interest, and a table that grew an entry per run
+			# per distinct delegation for the life of a host would be a
+			# slow leak.
+			if $!identical-spawn-scope ne 'composer'
+				&& !($!counted-scope eqv $scope) {
+				%!spawn-counts = ();
+				$!counted-scope = $scope;
+			}
+
 			if %!children.elems >= $!max-live {
 				$refusal = "There are already {%!children.elems} subagents "
 					~ "running, which is the limit ({$!max-live}). Wait for "
@@ -738,33 +954,62 @@ class LLM::Agent::Subagents {
 			else {
 				%!spawn-counts{$digest}++;
 				$agent-id = $type-name ~ '-' ~ ++$!counter;
+				# THE SLOT, and it is a cancellation target from this
+				# moment on: `run` is filled in later (building a child is
+				# somebody else's code and takes as long as it takes), and
+				# `cancel-requested` is what a cancel arriving in that gap
+				# writes instead of finding nothing to cancel.
 				%!children{$agent-id} = %(
-					seq          => $!seq++,
-					agent-id     => $agent-id,
-					agent-type   => $type-name,
-					label        => $label,
-					run          => LLM::Agent::Run,
-					session-path => '',
+					seq              => $!seq++,
+					agent-id         => $agent-id,
+					agent-type       => $type-name,
+					label            => $label,
+					run              => LLM::Agent::Run,
+					session-path     => '',
+					cancel-requested => False,
 				);
 			}
 		};
 
 		return error-result($id, $refusal) if $refusal.defined;
 
-		# The slot is held from here on, so the rest is a scope of its own
-		# whose LEAVE releases it — rather than a LEAVE up here, which
-		# would also fire on the refusal paths above it.
-		self!spawn-and-settle($id, $agent-id, $type.Hash, $type-name, $prompt, $label);
+		self!spawn-and-settle(
+			$id, $agent-id, $type.Hash, $type-name, $prompt, $label, $parent,
+		);
 	}
 
 	# The half of a task call that owns a reserved child slot: spawn,
-	# forward, wait, record — and release the slot on every exit.
+	# forward, wait, record. The slot is released HERE only on the paths
+	# where no child was ever started — once one has been, its life is the
+	# child's `drained` Promise and nothing else (see !own-child).
 	method !spawn-and-settle(
 		Str:D $id, Str:D $agent-id, %type, Str:D $type-name, Str:D $prompt,
-		$label,
+		$label, $parent,
 		--> Hash:D
 	) {
-		LEAVE { $!lock.protect: { %!children{$agent-id}:delete } }
+		# THE EMITTER, bound to the run this batch belongs to and captured
+		# before anything can start: the child may outlive this run, and
+		# publishing its events onto whatever run is live when they arrive
+		# would put another run's turns in this one's stream. See
+		# LLM::Agent::Loop's emitter-for.
+		my &emit = self!emitter-for($parent);
+
+		# BEFORE the child is built, not after: the cascade is registered
+		# on the run this batch belongs to, and `.then` on a Promise that
+		# is ALREADY kept fires immediately — so a parent cancelled before
+		# this line and one cancelled after it take the same path.
+		self!hook-cancel($parent);
+
+		# The first of the two interception points. A cancel that got here
+		# first means the cheapest possible answer: do not start a child at
+		# all. (The second is after registration, below — between them they
+		# cover every interleaving; see the module Pod.)
+		if self!stop-requested($agent-id, $parent) {
+			self!release-child($agent-id);
+			return self!cancelled-result(
+				$id, $agent-id, $type-name, &emit, :!started,
+			);
+		}
 
 		my $handle;
 		my $threw;
@@ -778,43 +1023,72 @@ class LLM::Agent::Subagents {
 			));
 		}
 
-		return error-result(
-			$id,
-			"The $type-name agent could not be started: "
-				~ ($threw.message.lines.head // $threw.^name),
-		) if $threw.defined;
+		if $threw.defined {
+			self!release-child($agent-id);
+			return error-result(
+				$id,
+				"The $type-name agent could not be started: "
+					~ ($threw.message.lines.head // $threw.^name),
+			);
+		}
 
-		return error-result(
-			$id,
-			"The $type-name agent could not be started: its spawn callback "
-				~ 'answered with '
-				~ ($handle.defined ?? 'a ' ~ $handle.^name !! 'nothing')
-				~ ', which has no run and session-path.',
-		) unless $handle.defined && $handle.can('run')
-			&& $handle.can('session-path');
+		unless $handle.defined && $handle.can('run')
+			&& $handle.can('session-path') {
+			self!release-child($agent-id);
+			return error-result(
+				$id,
+				"The $type-name agent could not be started: its spawn "
+					~ 'callback answered with '
+					~ ($handle.defined ?? 'a ' ~ $handle.^name !! 'nothing')
+					~ ', which has no run and session-path.',
+			);
+		}
 
 		my $child = $handle.run;
-		return error-result(
-			$id,
-			"The $type-name agent could not be started: its handle's .run is "
-				~ ($child.defined ?? 'a ' ~ $child.^name !! 'undefined')
-				~ ', not a live LLM::Agent::Run.',
-		) unless $child ~~ LLM::Agent::Run:D;
+		unless $child ~~ LLM::Agent::Run:D {
+			self!release-child($agent-id);
+			return error-result(
+				$id,
+				"The $type-name agent could not be started: its handle's "
+					~ '.run is '
+					~ ($child.defined ?? 'a ' ~ $child.^name !! 'undefined')
+					~ ', not a live LLM::Agent::Run.',
+			);
+		}
 
 		my $raw-path = $handle.session-path;
 		my Str $child-path = $raw-path.defined ?? $raw-path.Str !! '';
 
-		$!lock.protect: {
+		# Registration and the second interception point are ONE critical
+		# section, and that is the whole of the fix: a `cancel-children`
+		# running concurrently either sets the flag before this (and we
+		# read it here, and cancel the child ourselves) or after it (and
+		# finds the run in the table and cancels it directly). There is no
+		# third outcome and therefore no window.
+		my Bool $stop = $!lock.protect: {
 			if %!children{$agent-id}:exists {
 				%!children{$agent-id}<run> = $child;
 				%!children{$agent-id}<session-path> = $child-path;
+				?%!children{$agent-id}<cancel-requested>;
+			}
+			else {
+				# The slot is gone, which only happens if this call has
+				# already been left. Nothing owns the child but us.
+				True;
 			}
 		};
 
-		# The cancel cascade, registered on the first spawn of this parent
-		# run — before the child is tapped, so a cancel arriving in the
-		# next microsecond still reaches it.
-		self!hook-cancel;
+		# THE SLOT'S LIFE, arranged the instant there is a child to hold it
+		# for and before anything below can throw: a child is this
+		# composer's business until it has stopped PRODUCING, which is
+		# `drained` and not `result`. See !own-child.
+		self!own-child($agent-id, $child);
+
+		# Outside the lock, and belt-and-braces on the parent as well as on
+		# the flag: a parent that was cancelled while the spawn callback
+		# was running may have been cancelled before the hook above could
+		# see it as anything but Planned.
+		$child.cancel if $stop || ($parent.defined && $parent.is-cancelled);
 
 		self!append-envelope('subagent-spawned', %(
 			agent-id   => $agent-id,
@@ -822,9 +1096,39 @@ class LLM::Agent::Subagents {
 			prompt     => $prompt,
 			label      => $label,
 			child-path => $child-path,
-		));
+		), &emit);
 
-		self!settle-child($child, $id, $agent-id, $type-name, $label);
+		self!settle-child(
+			$child, $id, $agent-id, $type-name, $label, $parent, &emit,
+		);
+	}
+
+	#|( Hold this child's slot until it has B<drained>, not until it has a
+	    result.
+
+	    The two come apart, and the gap is exactly where a subagent is at
+	    its most dangerous: a child that abandoned a tool call to a
+	    deadline has its C<result> Kept — the parent gets its answer, which
+	    is right, a model should not wait on a call nobody is waiting for —
+	    while the detached call is still running somewhere, writing files.
+	    A composer that let go at C<result> would drop that child from
+	    C<live-agents>, free its C<max-live> slot to start another, and
+	    leave C<cancel-children> with nothing to cancel: a shutdown that
+	    reports everything stopped while a tool call runs on.
+
+	    So the slot — and with it the accounting and the cancellation
+	    ownership — is released by the child's own C<drained> Promise, on
+	    whatever thread keeps it. See L<LLM::Agent::Run>. )
+	method !own-child(Str:D $agent-id, LLM::Agent::Run:D $child --> Nil) {
+		$child.drained.then({ try self!release-child($agent-id); True });
+		Nil;
+	}
+
+	# Let go of one child's slot. Idempotent: the drained hook and the
+	# never-started paths can both reach it.
+	method !release-child(Str:D $agent-id --> Nil) {
+		$!lock.protect: { %!children{$agent-id}:delete };
+		Nil;
 	}
 
 	# Tap the child, wait for it, and turn what it did into a result. The
@@ -834,7 +1138,7 @@ class LLM::Agent::Subagents {
 	# there first.
 	method !settle-child(
 		LLM::Agent::Run:D $child, Str:D $id, Str:D $agent-id,
-		Str:D $type-name, $label,
+		Str:D $type-name, $label, $parent, &emit,
 		--> Hash:D
 	) {
 		my $published = Promise.new;
@@ -842,7 +1146,7 @@ class LLM::Agent::Subagents {
 
 		my $tap = $child.events.tap(
 			-> $event {
-				self!forward($agent-id, $type-name, $label, $event);
+				self!forward($agent-id, $type-name, $label, $event, &emit);
 			},
 			# `try`, because keeping a vow twice throws and a Supply that
 			# somehow did both would take the tap's thread with it.
@@ -851,7 +1155,29 @@ class LLM::Agent::Subagents {
 		);
 		LEAVE { try $tap.close }
 
-		await $child.result;
+		# The ordinary case: wait for the child for as long as it takes —
+		# the task call IS the child's runtime, and bounding that would be
+		# this layer inventing a deadline the loop already owns one of.
+		#
+		# The exception is a child that has been ASKED to stop. A cancelled
+		# run keeps its result promptly by contract (it does not wait for a
+		# detached tool batch), so one still Planned this long after being
+		# told is one that waiting longer will not settle — and a task call
+		# that hangs for ever on it is strictly worse than a call that says
+		# so. See !unstoppable-result.
+		my Instant $give-up;
+		until $child.result.status !~~ Planned {
+			await Promise.anyof($child.result, Promise.in(CANCEL-POLL));
+			last if $child.result.status !~~ Planned;
+
+			if self!stop-requested($agent-id, $parent) {
+				$give-up //= now + CANCEL-GRACE;
+				last if now > $give-up;
+			}
+		}
+
+		return self!unstoppable-result($id, $agent-id, $type-name, &emit)
+			if $child.result.status ~~ Planned;
 
 		# The result is kept BEFORE the terminal event is enqueued (see
 		# LLM::Agent::Run), so the stream is still one event behind here.
@@ -897,7 +1223,7 @@ class LLM::Agent::Subagents {
 		# child nobody was counting says nothing rather than a zero it did
 		# not measure.
 		%payload<spent> = %result<spent>.Hash if %result<spent> ~~ Associative;
-		self!append-envelope('subagent-settled', %payload);
+		self!append-envelope('subagent-settled', %payload, &emit);
 
 		%(
 			role         => 'tool',
@@ -907,26 +1233,59 @@ class LLM::Agent::Subagents {
 		);
 	}
 
-	# One child event, wrapped and published on the PARENT's stream. A
-	# no-op with no loop and with no live run — a child still winding down
-	# after its parent ended is the ordinary case, not an error.
-	method !forward(Str:D $agent-id, Str:D $agent-type, $label, $event --> Nil) {
-		my $loop = self!resolve-loop;
-		return unless $loop.defined;
+	#|( One child event, wrapped and published on the stream of the run
+	    that spawned it — B<through the emitter captured at spawn time>,
+	    never through a fresh lookup.
+
+	    A child outlives its parent often enough for this to be the whole
+	    point: it is winding down after a cancel, or it was detached at a
+	    deadline and is still working. Its events then arrive when the
+	    loop's C<live-run> is a B<different run>, and publishing them there
+	    would file one conversation's turns under another. The captured
+	    emitter answers False instead and the event is dropped, which is
+	    the only honest thing left to do with it. )
+	method !forward(
+		Str:D $agent-id, Str:D $agent-type, $label, $event, &emit,
+		--> Nil
+	) {
 		return unless $event ~~ LLM::Agent::Event:D;
 
-		$loop.emit-external(LLM::Agent::Event::Subagent.new(
+		&emit(LLM::Agent::Event::Subagent.new(
 			:$agent-id, :$agent-type, :$label, inner => $event.to-hash,
 		));
 		Nil;
 	}
 
-	# Register the cascade on this parent run's cancellation, once per run.
-	method !hook-cancel(--> Nil) {
+	# The run this batch belongs to, or an undefined Run when there is no
+	# loop, or no run in flight on it. Called ONCE per batch — see
+	# execute-tool-calls on why a later lookup is not the same thing.
+	method !parent-run() {
 		my $loop = self!resolve-loop;
-		return unless $loop.defined;
+		$loop.defined ?? $loop.live-run !! LLM::Agent::Run;
+	}
 
-		my $run = $loop.live-run;
+	#|( A publisher bound to C<$parent> for the life of one child, or a
+	    Callable that always refuses when there is no loop or no run to
+	    bind to. Everything this composer emits about a child goes through
+	    one of these — see C<!forward>. )
+	method !emitter-for($parent --> Callable:D) {
+		# The refusing stand-in, which is also what a composer with no loop
+		# at all uses: a subagent still runs, it just has nowhere to
+		# report. Same answer, same shape, no special case downstream.
+		return -> $ { False } unless $parent.defined;
+
+		my $loop = self!resolve-loop;
+		return -> $ { False } unless $loop.defined;
+
+		$loop.emitter-for($parent);
+	}
+
+	#|( Register the cascade on this parent run's cancellation, once per
+	    run. C<.then> on an already-kept Promise fires immediately, so a
+	    parent cancelled before this call and one cancelled after it are
+	    the same case — which is what lets everything else here be a
+	    check of one flag. )
+	method !hook-cancel($run --> Nil) {
 		return unless $run.defined;
 
 		my Bool $first = $!lock.protect: {
@@ -934,18 +1293,73 @@ class LLM::Agent::Subagents {
 				?? False
 				!! do { $!hooked-run-id = $run.id; True };
 		};
+		return unless $first;
 
 		# Outside the lock, and `try`-shielded: `.then` schedules our code
 		# on somebody else's thread, and a broken Promise nobody awaits is
 		# a warning at GC time in a run that ended minutes ago.
-		$run.cancellation.then({ try self.cancel-children; True }) if $first;
-
-		# And the case the registration alone cannot cover: a run that was
-		# ALREADY cancelled when this child was spawned. The hook fires
-		# once, and if an earlier spawn registered it, it has fired
-		# already — so the child started after it would never be told.
-		self.cancel-children if $run.is-cancelled;
+		$run.cancellation.then({ try self.cancel-children; True });
 		Nil;
+	}
+
+	# Whether this child has been told to stop before it could start: by
+	# `cancel-children` writing the flag on its slot, or by the parent run
+	# this batch belongs to being cancelled.
+	method !stop-requested(Str:D $agent-id, $parent --> Bool:D) {
+		my Bool $flagged = $!lock.protect: {
+			%!children{$agent-id}:exists
+				?? ?%!children{$agent-id}<cancel-requested>
+				!! True;
+		};
+		$flagged || ($parent.defined && $parent.is-cancelled);
+	}
+
+	# The answer for a child that was cancelled: never started, or started
+	# and cancelled before it could say anything. Both are the same fact
+	# from the model's side — no answer came back — and neither is a
+	# failure of the tool.
+	method !cancelled-result(
+		Str:D $id, Str:D $agent-id, Str:D $type-name, &emit,
+		Bool:D :$started = True,
+		--> Hash:D
+	) {
+		my Str $content = $started
+			?? "The $type-name agent ($agent-id) was cancelled before it "
+				~ 'finished, so it produced no answer. Whatever it had '
+				~ 'already done still happened.'
+			!! "The $type-name agent ($agent-id) was cancelled before it "
+				~ 'started. It did not run.';
+
+		self!append-envelope('subagent-settled', %(
+			agent-id => $agent-id,
+			outcome  => 'cancelled',
+			result   => $content,
+		), &emit);
+
+		error-result($id, $content);
+	}
+
+	#|( The answer for a child that was asked to stop and did not. Not a
+	    result and not a failure of the work: like the loop's own
+	    outcome-unknown tool message, it says the one honest thing —
+	    whether the child took effect is not known — because a child run
+	    that ignores its own cancellation is a bug in that child, and the
+	    parent must neither invent an answer for it nor wait for ever. )
+	method !unstoppable-result(
+		Str:D $id, Str:D $agent-id, Str:D $type-name, &emit,
+		--> Hash:D
+	) {
+		my Str $content = "The $type-name agent ($agent-id) was asked to stop "
+			~ "and did not, so this call was abandoned after {CANCEL-GRACE} "
+			~ 'seconds. Whatever it had done, or is still doing, is unknown.';
+
+		self!append-envelope('subagent-settled', %(
+			agent-id => $agent-id,
+			outcome  => 'outcome-unknown',
+			result   => $content,
+		), &emit);
+
+		error-result($id, $content);
 	}
 
 	# === Seams ===
@@ -975,7 +1389,7 @@ class LLM::Agent::Subagents {
 	# cannot be written must never be the reason a working tool call
 	# fails. The failure becomes a Log event on the run instead, which is
 	# where somebody will see it.
-	method !append-envelope(Str:D $type, %payload --> Nil) {
+	method !append-envelope(Str:D $type, %payload, &emit --> Nil) {
 		return unless $!session.defined;
 
 		my $threw;
@@ -985,9 +1399,10 @@ class LLM::Agent::Subagents {
 		}
 		return unless $threw.defined;
 
-		my $loop = self!resolve-loop;
-		return unless $loop.defined;
-		try $loop.emit-external(LLM::Agent::Event::Log.new(
+		# Through the child's own emitter, like everything else it says:
+		# a warning about run A's transcript has no business appearing in
+		# run B's stream either.
+		try &emit(LLM::Agent::Event::Log.new(
 			level  => 'warning',
 			logger => 'llm-agent.subagents',
 			data   => %(

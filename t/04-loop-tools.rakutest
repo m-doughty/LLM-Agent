@@ -18,6 +18,7 @@ my @prompt = [msg('user', 'what is in a.txt?'),];
 my $tmp = $*TMPDIR.add("llm-agent-t04-{$*PID}-{now.Int}");
 $tmp.mkdir;
 END {
+	close-test-sessions();
 	if $tmp.e {
 		.unlink for $tmp.dir;
 		$tmp.rmdir;
@@ -422,7 +423,7 @@ subtest 'a streamed tool-call turn that trips a limit is discarded whole' => {
 	plan 11;
 
 	my $path = $tmp.add('limit-discard.jsonl');
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	# The turn that trips the limit is STREAMED: its tokens are on the
 	# wire and in the event stream before anybody knows it will be thrown
@@ -481,7 +482,7 @@ subtest 'a streamed tool-call turn that trips a limit is discarded whole' => {
 	is $provider.recorded-calls.elems, 0, 'and no tool ever ran';
 
 	$session.close;
-	my $replayed = LLM::Agent::Session.load(path => $path);
+	my $replayed = reopen-session(path => $path);
 	is-deeply $replayed.messages.map({ .role ~ ':' ~ .content }).List,
 		(
 			'user:what is in a.txt?',

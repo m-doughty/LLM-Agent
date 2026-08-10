@@ -26,6 +26,7 @@ my @prompt = [msg('user', 'what is the capital of France?'),];
 my $tmp = $*TMPDIR.add("llm-agent-t03-{$*PID}-{now.Int}");
 $tmp.mkdir;
 END {
+	close-test-sessions();
 	if $tmp.e {
 		.unlink for $tmp.dir;
 		$tmp.rmdir;
@@ -327,7 +328,7 @@ subtest 'session and compactor are independent: all four combinations run' => {
 
 	# --- session AND compactor. ----------------------------------------
 	my $both-path = fresh-path();
-	my $both-session = LLM::Agent::Session.create(path => $both-path, meta => {});
+	my $both-session = test-session(path => $both-path, meta => {});
 	my $both = compacting-loop(session => $both-session);
 	my $both-run = $both.run(start-conversation().Array);
 	run-settled($both-run, 'the compacting run with a session');
@@ -339,7 +340,7 @@ subtest 'session and compactor are independent: all four combinations run' => {
 
 	my @live = (await $both-run.result)<messages>;
 	$both-session.close;
-	my $replayed = LLM::Agent::Session.load(path => $both-path);
+	my $replayed = reopen-session(path => $both-path);
 	is-deeply $replayed.messages.map({ .role ~ ':' ~ .content }).List,
 		@live.map({ .role ~ ':' ~ .content }).List,
 		'and the transcript replays exactly the conversation the run ended '
@@ -347,7 +348,7 @@ subtest 'session and compactor are independent: all four combinations run' => {
 
 	# --- session, no compactor. ----------------------------------------
 	my $session-path = fresh-path();
-	my $session-only = LLM::Agent::Session.create(path => $session-path, meta => {});
+	my $session-only = test-session(path => $session-path, meta => {});
 	my $plain-loop = compacting-loop(
 		session => $session-only, with-compactor => False,
 	);
@@ -373,7 +374,7 @@ subtest 'a conversation that cannot be made to fit ends the run cleanly' => {
 	plan 9;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	my $counter = char-counter();
 
 	# The last two turns are 900 characters each and the window is 1,000.
@@ -428,7 +429,7 @@ subtest 'a conversation that cannot be made to fit ends the run cleanly' => {
 			~ 'the old loop would have sent, and resent, was never sent';
 
 	$session.close;
-	my $replayed = LLM::Agent::Session.load(path => $path);
+	my $replayed = reopen-session(path => $path);
 	is $replayed.events.grep({ $_<type> eq 'compaction' }).elems, 1,
 		'and the compaction it did manage is in the transcript, so a resumed '
 			~ 'run starts from the smaller conversation';
@@ -438,7 +439,7 @@ subtest 'the request carries the context; the conversation never does' => {
 	plan 10;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	my $backend = scripted-backend(steps => [{ content => 'Paris.' },]);
 	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$session);
 
@@ -490,7 +491,7 @@ subtest 'a second run may say something completely different' => {
 	# every refreshable fact fossilised at index 0 and the seed check
 	# guarded the fossil.
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	my $monday = LLM::Agent::RunContext.new(facts => [date => 'Monday']);
 	my $friday = LLM::Agent::RunContext.new(facts => [date => 'Friday']);
@@ -539,7 +540,7 @@ subtest 'a context with nothing in it costs the request nothing' => {
 	# to no messages at all, and the request has to be exactly the request
 	# it would have been.
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	my $backend = scripted-backend(steps => [{ content => 'fine' },]);
 	my $context = LLM::Agent::RunContext.new(
 		head-sections => [instructions => ''],

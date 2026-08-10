@@ -25,6 +25,7 @@ sub wait-until(&condition, Str:D $what) {
 my $tmp = $*TMPDIR.add("llm-agent-t11-{$*PID}-{now.Int}");
 $tmp.mkdir;
 END {
+	close-test-sessions();
 	if $tmp.e {
 		.unlink for $tmp.dir;
 		$tmp.rmdir;
@@ -56,7 +57,7 @@ subtest 'a permission prompt becomes events, a grant, and a transcript line' => 
 	plan 11;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(
+	my $session = test-session(
 		path => $path, meta => { agent => 'test' },
 	);
 
@@ -118,7 +119,7 @@ subtest 'a permission prompt becomes events, a grant, and a transcript line' => 
 	is $policy.grants.elems, 1, 'the policy remembered the answer';
 
 	$session.close;
-	my $replayed = LLM::Agent::Session.load(path => $path);
+	my $replayed = reopen-session(path => $path);
 	is-deeply $replayed.grants.map({ $_<tool> }).List, ('fs_write',),
 		'and the grant reached the transcript, so a later run inherits it';
 	is-deeply $replayed.messages.map({ .role }).List,
@@ -133,7 +134,7 @@ subtest 'resuming pre-seeds the grants, and nobody is asked twice' => {
 
 	# --- Day one: the human says "always". -------------------------
 	{
-		my $session = LLM::Agent::Session.create(path => $path, meta => {});
+		my $session = test-session(path => $path, meta => {});
 		my $provider = ScriptedProvider.new(
 			tools => tools(), results => { fs_write => 'written' },
 		);
@@ -161,7 +162,7 @@ subtest 'resuming pre-seeds the grants, and nobody is asked twice' => {
 	}
 
 	# --- Day two: a new process, a new policy, the same file. -------
-	my $session = LLM::Agent::Session.load(path => $path);
+	my $session = reopen-session(path => $path);
 	my @messages = $session.messages;
 	is @messages.elems, 4, 'the conversation came back';
 
@@ -202,7 +203,7 @@ subtest 'a resumed run extends the transcript rather than duplicating it' => {
 	plan 4;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	my $first-backend = scripted-backend(steps => [{ content => 'one' },]);
 	my $first-loop = LLM::Agent::Loop.new(
 		backends => [$first-backend,], :$session,
@@ -210,7 +211,7 @@ subtest 'a resumed run extends the transcript rather than duplicating it' => {
 	run-settled($first-loop.run([msg('user', 'a'),]), 'the first run');
 	$session.close;
 
-	my $resumed = LLM::Agent::Session.load(path => $path);
+	my $resumed = reopen-session(path => $path);
 	my @messages = $resumed.messages;
 	my $second-backend = scripted-backend(steps => [{ content => 'two' },]);
 	my $second-loop = LLM::Agent::Loop.new(
@@ -220,7 +221,7 @@ subtest 'a resumed run extends the transcript rather than duplicating it' => {
 	run-settled($second-loop.run([|@messages, $next]), 'the second run');
 	$resumed.close;
 
-	my $final = LLM::Agent::Session.load(path => $path);
+	my $final = reopen-session(path => $path);
 	is-deeply $final.messages.map({ .role ~ ':' ~ .content }).List,
 		('user:a', 'assistant:one', 'user:b', 'assistant:two'),
 		'each message appears exactly once';
@@ -228,7 +229,7 @@ subtest 'a resumed run extends the transcript rather than duplicating it' => {
 
 	# And the loop refuses a conversation that contradicts the transcript
 	# rather than writing a file nobody can replay.
-	my $third = LLM::Agent::Session.load(path => $path);
+	my $third = reopen-session(path => $path);
 	my $loop = LLM::Agent::Loop.new(
 		backends => [scripted-backend(steps => [{ content => 'x' },]),],
 		session => $third,
@@ -247,7 +248,7 @@ subtest 'a resumed run is checked by identity, not by prose' => {
 	plan 5;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	my $system = LLM::Chat::Conversation::Message.new(
 		role => 'system', content => 'BE GOOD', sysprompt => True, sticky => True,
 	);
@@ -258,7 +259,7 @@ subtest 'a resumed run is checked by identity, not by prose' => {
 	run-settled($first-loop.run([$system, msg('user', 'a')]), 'the first run');
 	$session.close;
 
-	my $resumed = LLM::Agent::Session.load(path => $path);
+	my $resumed = reopen-session(path => $path);
 	my @messages = $resumed.messages;
 	ok @messages[0].is-sticky, 'the transcript remembers a sticky sysprompt';
 
@@ -304,7 +305,7 @@ subtest 'a resumed run is told about today, not about the day it started' => {
 	# the branch, the instruction file — is different the second time, and
 	# none of it is a contradiction.
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	my $monday = LLM::Agent::RunContext.new(
 		head-sections => [
@@ -323,7 +324,7 @@ subtest 'a resumed run is told about today, not about the day it started' => {
 	$session.close;
 
 	# A new process would do exactly this: load, rebuild, carry on.
-	my $resumed = LLM::Agent::Session.load(path => $path);
+	my $resumed = reopen-session(path => $path);
 	is $resumed.messages.map({ .role }).List, ('user', 'assistant'),
 		'the transcript replays the conversation, and only the conversation';
 	is $resumed.last-run-context<facts>.list.map({ $_[0] ~ '=' ~ $_[1] }).List,
@@ -379,7 +380,7 @@ subtest 'an "always" answer reaches the transcript before the run moves on' => {
 	# "always" answer — is gone; this subtest is what proves neither the
 	# hook nor the fallback lost the answer.
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	# The call blocks AFTER the policy has asked and been answered. That
 	# gap — answer given, tool still running — is where a crash, or a
@@ -440,7 +441,7 @@ subtest 'an "always" answer reaches the transcript before the run moves on' => {
 		'and the grant is durable by the time the run ends, whatever wrote it';
 
 	$session.close;
-	my $replayed = LLM::Agent::Session.load(path => $path);
+	my $replayed = reopen-session(path => $path);
 	is $replayed.grants.map({ $_<tool> }).List, ('fs_write',),
 		'so a new process finds it, and nobody is asked again';
 	is $replayed.events.grep({ $_<type> eq 'grants' }).elems, 1,
@@ -451,7 +452,7 @@ subtest 'a grant that was replaced rather than added is still written' => {
 	plan 4;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	# Same number of grants before and after: a loop that decided by
 	# counting would never write this, and tomorrow's run would inherit
@@ -481,7 +482,7 @@ subtest 'a grant that was replaced rather than added is still written' => {
 
 	# The other half of the same rule: an unchanged snapshot writes nothing.
 	my $steady-path = fresh-path();
-	my $steady-session = LLM::Agent::Session.create(path => $steady-path, meta => {});
+	my $steady-session = test-session(path => $steady-path, meta => {});
 	my $steady = ScriptedProviderWithGrants.new(
 		tools => tools(),
 		grants => [{ tool => 'fs_write', decision => 'allow' },],
@@ -502,7 +503,7 @@ subtest 'a grant that was replaced rather than added is still written' => {
 
 	$session.close;
 	$steady-session.close;
-	my $replayed = LLM::Agent::Session.load(path => $path);
+	my $replayed = reopen-session(path => $path);
 	is $replayed.grants.map({ $_<decision> }).List, ('deny',),
 		'and the narrowed grant is what a resumed run inherits';
 };
@@ -511,7 +512,7 @@ subtest 'compaction inside a run, replayed identically from the transcript' => {
 	plan 9;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	# One token per character: every threshold below is arithmetic.
 	my $counter = LLM::Agent::TokenCount::Heuristic.new(
@@ -575,7 +576,7 @@ subtest 'compaction inside a run, replayed identically from the transcript' => {
 	# THE invariant: what a resumed session replays is exactly the array
 	# the loop was working with. If Compactor and Session ever disagree
 	# about what a compaction keeps, this is where it shows.
-	my $replayed = LLM::Agent::Session.load(path => $path);
+	my $replayed = reopen-session(path => $path);
 	is-deeply $replayed.messages.map({ .role ~ ':' ~ .content }).List,
 		@final.map({ .role ~ ':' ~ .content }).List,
 		'and the transcript replays that same conversation, message for '

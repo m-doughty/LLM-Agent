@@ -678,6 +678,29 @@ still winding down after its parent ended is the ordinary case, not an
 error. What it will not do is end a run: a terminal event is refused
 loudly, because only C<_finish> can keep the result Promise.
 
+B<Use C<emitter-for> instead when the emitter outlives the run.>
+C<emit-external> publishes onto whatever run is live B<at the moment it
+is called>, which is right for a hook firing inside the run and wrong
+for anything that reports late: a straggler from run A, arriving after
+run B has started on the same loop, would be published onto B — a turn
+in B's transcript that never happened. C<< $loop.emitter-for($run) >>
+hands back a Callable bound to that one run, which answers False for
+ever once it ends rather than following the loop to the next one.
+
+=begin code :lang<raku>
+
+# Captured when the work starts...
+my &emit = $loop.emitter-for($loop.live-run);
+
+# ...and used for that work's whole life, wherever it ends up running.
+start {
+    for @late-events -> $event {
+        last unless &emit($event);   # False: my run is over. Stop.
+    }
+}
+
+=end code
+
 =head2 Resuming: what "the same message" means
 
 A run given a C<session> that already holds messages has to B<extend>
@@ -1470,13 +1493,48 @@ method log-hook(--> Callable:D) {
     C<RunCompleted> could leave a run whose Supply is done and whose
     result never comes. )
 method emit-external(LLM::Agent::Event:D $event --> Bool:D) {
-	die 'LLM::Agent::Loop.emit-external: ' ~ $event.kind ~ ' is a terminal '
-		~ 'event, and a run is ended only by the loop that drives it — an '
-		~ 'external emitter publishes what happened, not that the run is over'
+	self!publish(self!live-run, $event);
+}
+
+#|( A publisher B<bound to one run>: C<< &emit($event) >> publishes onto
+    C<$run> and nothing else, for as long as that run accepts events, and
+    answers False for ever afterwards.
+
+        my &emit = $loop.emitter-for($run);   # captured when work starts
+        ...
+        &emit($event);                        # much later, another thread
+
+    This is the seam for anything whose life is B<longer than the run
+    that started it> — a subagent still winding down, a detached job, a
+    background task that reports late. C<emit-external> asks "what is the
+    loop running now?", which is the right question for a hook that fires
+    inside the run and the B<wrong> one for a straggler: by the time it
+    fires, "now" can be somebody else's run, and an event from run A
+    published onto run B is worse than a lost event. It corrupts a
+    transcript with a turn that never happened.
+
+    So: capture the emitter when the work starts, use it for that work's
+    whole life, and treat False as "my run is over" — drop the event, and
+    settle whatever was waiting on it. What it will never do is publish
+    into the next run.
+
+    Same rules as C<emit-external> otherwise: stamped and ordered by the
+    run's mailbox, safe from any thread, cannot wedge C<drained>, and a
+    terminal event is refused loudly because only C<_finish> may end a
+    run. )
+method emitter-for(LLM::Agent::Run:D $run --> Callable:D) {
+	-> LLM::Agent::Event:D $event { self!publish($run, $event) };
+}
+
+# The one publication path, shared by both seams. `$run` may be undefined
+# (no live run), which is a False rather than a failure.
+method !publish($run, LLM::Agent::Event:D $event --> Bool:D) {
+	die 'LLM::Agent::Loop: ' ~ $event.kind ~ ' is a terminal event, and a '
+		~ 'run is ended only by the loop that drives it — an external '
+		~ 'emitter publishes what happened, not that the run is over'
 		if $event.is-terminal;
 
-	my $run = self!live-run;
-	return False unless $run.defined;
+	return False unless $run.defined && !$run.is-done;
 
 	# A ticket the run may refuse: it can close between the line above and
 	# this one. False means there is nothing left to attest and the paired

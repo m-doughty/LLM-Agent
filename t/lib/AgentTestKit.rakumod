@@ -156,6 +156,42 @@ C<ScriptedProviderWithGrants>, because the loop decides whether to
 synchronise grants with C<.can('grants')>. A single class with an
 always-present method could not test both sides of that branch.
 
+=head2 test-session / reopen-session / close-test-sessions
+
+C<LLM::Agent::Session> holds an open append handle for its whole life
+(C<JSONL::Writer> in handle mode with C<:flush> — see its Pod), and
+C<.close> is the only thing that lets go of it. A test that creates one
+and never closes it is therefore holding a file open when its C<END>
+block unlinks the temp directory, and on B<Windows> that unlink fails
+with "resource busy or locked": POSIX hides the bug by allowing the
+unlink of an open file, so it only ever showed up on one platform's CI.
+
+So sessions in tests go through here:
+
+=begin code :lang<raku>
+
+my $session = test-session(path => $path, meta => {});    # .create
+my $again   = reopen-session(path => $path);              # .load
+
+END {
+    close-test-sessions();          # BEFORE the unlink, always
+    if $tmp.e { .unlink for $tmp.dir; $tmp.rmdir }
+}
+
+=end code
+
+Both track the session they hand back, and C<close-test-sessions> closes
+every one of them — on the success path, the failure path and the
+cancel path alike, because an C<END> block runs whatever happened.
+C<Session.close> is idempotent and never throws, so a test that closes
+its own session (several here do, because reopening one is the thing
+being tested) is unaffected; the sweep just finds it already shut. It
+answers how many it closed, and clears the register, so it is safe to
+call more than once.
+
+Nothing here swallows the unlink error: the point is that the handles
+really are closed by then.
+
 =head2 run-settled / drained-settled / drain-events
 
 C<run-settled> B<polls> C<is-done> rather than awaiting the result
@@ -186,6 +222,7 @@ use LLM::Chat::Backend::Settings;
 use LLM::Chat::Conversation::Message;
 
 use LLM::Agent::Run;
+use LLM::Agent::Session;
 
 unit module AgentTestKit;
 
@@ -673,6 +710,55 @@ class ScriptedProviderWithGrants is ScriptedProvider is export {
 	method replace-grants(@grants --> Nil) {
 		$!grant-lock.protect: { @!grants = @grants.map({ $_.Hash }) };
 	}
+}
+
+# === Sessions, and the handles they hold ===
+
+# Every session this kit has opened. A Lock because a test may open one
+# from a thread of its own, and END runs on whichever thread got there.
+my Lock:D $session-lock .= new;
+my @sessions;
+
+my sub track(LLM::Agent::Session:D $session --> LLM::Agent::Session:D) {
+	$session-lock.protect: { @sessions.push: $session };
+	$session;
+}
+
+#|( C<LLM::Agent::Session.create>, with the handle registered for
+    C<close-test-sessions>. See the module Pod: an unclosed session is an
+    open file, and an open file is an unlink that fails on Windows. )
+sub test-session(IO(Cool) :$path!, :%meta --> LLM::Agent::Session:D) is export {
+	track(LLM::Agent::Session.create(:$path, :%meta));
+}
+
+#| C<LLM::Agent::Session.load>, registered the same way.
+sub reopen-session(IO(Cool) :$path! --> LLM::Agent::Session:D) is export {
+	track(LLM::Agent::Session.load(:$path));
+}
+
+#|( Close every session this kit opened, and forget them. Call it at the
+    top of the C<END> block that unlinks the temp directory — B<before>
+    the unlink, which is the whole point.
+
+    Answers how many it closed. Idempotent, and safe on a session a test
+    already closed itself: C<Session.close> is. )
+sub close-test-sessions(--> Int) is export {
+	my @open = $session-lock.protect: {
+		my @taken = @sessions;
+		@sessions = ();
+		@taken.List;
+	};
+
+	my Int $closed = 0;
+	for @open -> $session {
+		# Shielded per session, not per sweep: one that somehow cannot be
+		# closed must not leave the rest of them open behind it.
+		try {
+			$session.close;
+			$closed++;
+		}
+	}
+	$closed;
 }
 
 #|( Wait for a Run to finish, by POLLING C<is-done> — never by awaiting a

@@ -17,6 +17,7 @@ plan 21;
 my $tmp = $*TMPDIR.add("llm-agent-t08-{$*PID}-{now.Int}");
 $tmp.mkdir;
 END {
+	close-test-sessions();
 	if $tmp.e {
 		.unlink for $tmp.dir;
 		$tmp.rmdir;
@@ -59,7 +60,7 @@ subtest 'every field of a message survives the round trip' => {
 	plan 8;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	$session.append-message(LLM::Chat::Conversation::Message.new(
 		role => 'system', content => 'be helpful', sysprompt => True, sticky => True,
@@ -76,7 +77,7 @@ subtest 'every field of a message survives the round trip' => {
 	));
 	$session.close;
 
-	my @messages = LLM::Agent::Session.load(path => $path).messages;
+	my @messages = reopen-session(path => $path).messages;
 
 	is @messages.elems, 4, 'all four came back';
 	ok @messages[0].sysprompt, 'sysprompt survives';
@@ -93,7 +94,7 @@ subtest 'a compaction replays as the conversation the compactor produced' => {
 	plan 5;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	my $sys = $session.append-message(LLM::Chat::Conversation::Message.new(
 		role => 'system', content => 'be helpful', sysprompt => True,
@@ -112,7 +113,7 @@ subtest 'a compaction replays as the conversation the compactor produced' => {
 	);
 	$session.close;
 
-	my $replayed = LLM::Agent::Session.load(path => $path);
+	my $replayed = reopen-session(path => $path);
 	is-deeply $replayed.messages.map({ .role ~ ':' ~ .content }).List,
 		(
 			'system:be helpful',
@@ -134,7 +135,7 @@ subtest 'compactions compose: a summary can be summarized' => {
 	plan 3;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	$session.append-message(LLM::Chat::Conversation::Message.new(
 		role => 'system', content => 'be helpful', sysprompt => True));
@@ -153,7 +154,7 @@ subtest 'compactions compose: a summary can be summarized' => {
 		summary => 'everything up to now', replaces-through-id => $first);
 	$session.close;
 
-	my $replayed = LLM::Agent::Session.load(path => $path);
+	my $replayed = reopen-session(path => $path);
 	is-deeply $replayed.messages.map({ .role ~ ':' ~ .content }).List,
 		('system:be helpful', 'user:everything up to now', 'user:recent'),
 		'the second summary replaced the first';
@@ -165,13 +166,13 @@ subtest 'grants replay into a real policy, which then does not ask' => {
 	plan 4;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	$session.append-grants([
 		{ tool => 'fs_write', decision => 'allow' },
 	]);
 	$session.close;
 
-	my @grants = LLM::Agent::Session.load(path => $path).grants;
+	my @grants = reopen-session(path => $path).grants;
 	is @grants.elems, 1, 'the snapshot came back';
 
 	my $asked = 0;
@@ -207,7 +208,7 @@ subtest 'a malformed FINAL line is dropped and reported' => {
 		'{"v":1,"type":"message","payload":{"role":"assis',   # killed mid-write
 	]);
 
-	my $session = LLM::Agent::Session.load(path => $path);
+	my $session = reopen-session(path => $path);
 	is $session.warnings.elems, 1, 'the partial line is reported';
 	is $session.warnings[0].line-number, 3, 'by line number';
 	is $session.messages.elems, 1, 'and dropped from the conversation';
@@ -230,7 +231,7 @@ subtest 'a crash tail is cut off the file, not merely skipped' => {
 			'{"v":1,"type":"message","payload":{"role":"assis',
 		], :$eol);
 
-		my $session = LLM::Agent::Session.load(path => $path);
+		my $session = reopen-session(path => $path);
 		is $session.warnings.elems, 1, "$shape: the partial line is reported";
 		is $session.warnings[0].line-number, 3, "$shape: by line number";
 		is $path.lines.elems, 2,
@@ -242,7 +243,7 @@ subtest 'a crash tail is cut off the file, not merely skipped' => {
 		$session.append-message(msg('user', 'day three'));
 		$session.close;
 
-		my $again = LLM::Agent::Session.load(path => $path);
+		my $again = reopen-session(path => $path);
 		is-deeply $again.messages.map({ .content }).List,
 			('hello', 'day two', 'day three'),
 			"$shape: and the resumed transcript reads back whole";
@@ -272,7 +273,7 @@ subtest 'a crash inside a character is repaired too' => {
 	dies-ok { $fh.lines.elems }, 'the file cannot be read as text at all';
 	$fh.close;
 
-	my $session = LLM::Agent::Session.load(path => $path);
+	my $session = reopen-session(path => $path);
 	is $session.warnings.elems, 1, 'and yet it loads, with a warning';
 	like $session.warnings[0].value, /'héll'/,
 		'whose raw text is readable as far as the damage';
@@ -291,7 +292,7 @@ subtest 'a CRLF transcript keeps its line endings through a repair' => {
 		'{"v":1,"type":"message","payload":{"role":"assis',
 	], nl => "\r\n", eol => False);
 
-	my $session = LLM::Agent::Session.load(path => $path);
+	my $session = reopen-session(path => $path);
 	is $session.warnings.elems, 1, 'the partial line is reported';
 	is $session.messages.elems, 1, 'and dropped';
 	$session.close;
@@ -304,7 +305,7 @@ subtest 'a CRLF transcript keeps its line endings through a repair' => {
 	is $raw.decode('latin-1').comb("\r\n").elems, 2,
 		'with both survivors keeping their CRLF';
 
-	my $again = LLM::Agent::Session.load(path => $path);
+	my $again = reopen-session(path => $path);
 	is $again.messages.elems, 1, 'and it loads again, quietly';
 	$again.close;
 };
@@ -322,7 +323,7 @@ subtest 'a repair copy left behind by an interrupted repair is not trusted' => {
 	my $stale = repair-file($path);
 	$stale.spurt('this was never renamed over anything');
 
-	my $session = LLM::Agent::Session.load(path => $path);
+	my $session = reopen-session(path => $path);
 	is $session.messages.elems, 1, 'the transcript loads from the original';
 	is $session.warnings.elems, 0, 'having lost nothing at all';
 	nok $stale.e, 'and the leftover is cleared out of the way';
@@ -343,7 +344,7 @@ subtest 'two malformed lines at the end are not a crash artifact' => {
 
 	# Repairing one line per load would eat a damaged file backwards, a
 	# line per resume, and hand back the leftovers as a conversation.
-	throws-like { LLM::Agent::Session.load(path => $path) },
+	throws-like { reopen-session(path => $path) },
 		Exception, message => /'FINAL'/,
 		'one crash is a crash; two is damage';
 	is-deeply $path.slurp(:bin), $before,
@@ -360,13 +361,13 @@ subtest 'a malformed line anywhere else is fatal' => {
 		envelope('message', { role => 'user', content => 'hello' }),
 	]);
 
-	throws-like { LLM::Agent::Session.load(path => $path) },
+	throws-like { reopen-session(path => $path) },
 		Exception, message => /'malformed'/,
 		'a hole in the middle is not a crash artifact';
 
 	# ...and the reason it matters, spelled out in the message rather
 	# than left for somebody to work out from a short conversation.
-	throws-like { LLM::Agent::Session.load(path => $path) },
+	throws-like { reopen-session(path => $path) },
 		Exception, message => /'FINAL'/,
 		'and the error says which one is tolerated';
 };
@@ -377,7 +378,7 @@ subtest 'an envelope this version cannot read is fatal' => {
 	my $future = raw-transcript([
 		envelope('session-meta', {}, v => 2),
 	]);
-	throws-like { LLM::Agent::Session.load(path => $future) },
+	throws-like { reopen-session(path => $future) },
 		Exception, message => /'envelope version'/,
 		'a newer envelope is not guessed at';
 
@@ -385,7 +386,7 @@ subtest 'an envelope this version cannot read is fatal' => {
 		envelope('session-meta', {}),
 		'{"v":1,"id":"x","ts":"2026-08-09T12:00:00.000000Z","payload":{}}',
 	]);
-	throws-like { LLM::Agent::Session.load(path => $typeless) },
+	throws-like { reopen-session(path => $typeless) },
 		Exception, message => /'no type'/,
 		'and a line with no type is not a line';
 };
@@ -396,7 +397,7 @@ subtest 'a transcript starts with its meta line' => {
 	my $path = raw-transcript([
 		envelope('message', { role => 'user', content => 'hello' }),
 	]);
-	throws-like { LLM::Agent::Session.load(path => $path) },
+	throws-like { reopen-session(path => $path) },
 		Exception, message => /'starts with session-meta'/,
 		'anything else is not a transcript this wrote';
 };
@@ -411,7 +412,7 @@ subtest 'a compaction that names nothing is fatal' => {
 			summary => 'a summary', 'replaces-through-id' => 'no-such-id',
 		}),
 	]);
-	throws-like { LLM::Agent::Session.load(path => $dangling) },
+	throws-like { reopen-session(path => $dangling) },
 		Exception, message => /'not a message this transcript still has'/,
 		'a cut point that is not there would silently change the '
 			~ 'conversation, so it does not load at all';
@@ -420,7 +421,7 @@ subtest 'a compaction that names nothing is fatal' => {
 		envelope('session-meta', {}),
 		envelope('compaction', { summary => 'a summary' }),
 	]);
-	throws-like { LLM::Agent::Session.load(path => $idless) },
+	throws-like { reopen-session(path => $idless) },
 		Exception, message => /'no replaces-through-id'/,
 		'and so does one with no cut point at all';
 };
@@ -434,7 +435,7 @@ subtest 'unknown types survive a round trip untouched' => {
 		envelope('message', { role => 'user', content => 'hello' }),
 	]);
 
-	my $session = LLM::Agent::Session.load(path => $path);
+	my $session = reopen-session(path => $path);
 	is $session.messages.elems, 1, 'the readers skip what they do not know';
 	is $session.events.elems, 3, 'while .events keeps everything';
 	is $session.events[1]<payload><latency>, 12, 'payload and all';
@@ -444,19 +445,19 @@ subtest 'a resumed session appends to the same file' => {
 	plan 4;
 
 	my $path = fresh-path();
-	my $first = LLM::Agent::Session.create(path => $path, meta => { run => 1 });
+	my $first = test-session(path => $path, meta => { run => 1 });
 	$first.append-message(LLM::Chat::Conversation::Message.new(
 		role => 'user', content => 'day one'));
 	$first.close;
 
-	my $second = LLM::Agent::Session.load(path => $path);
+	my $second = reopen-session(path => $path);
 	is $second.meta<run>, 1, 'the meta came back';
 	$second.append-message(LLM::Chat::Conversation::Message.new(
 		role => 'assistant', content => 'day two'));
 	$second.close;
 
 	is $path.lines.elems, 3, 'the file grew rather than being rewritten';
-	my $third = LLM::Agent::Session.load(path => $path);
+	my $third = reopen-session(path => $path);
 	is-deeply $third.messages.map({ .content }).List, ('day one', 'day two'),
 		'and both days are there, in order';
 	is $third.message-ids.elems, 2, 'with an id each';
@@ -469,7 +470,7 @@ subtest 'the loop writes the turns it is handed, and the app writes none' => {
 	# prompt and the question, and appends NEITHER itself. seed-session
 	# writes both, in the order they were handed over.
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	my $system = msg('system', 'SYSPROMPT', :sysprompt, :sticky);
 	my $question = msg('user', 'make the tests pass');
 
@@ -491,7 +492,7 @@ subtest 'the loop writes the turns it is handed, and the app writes none' => {
 	# ITSELF, before the loop has written the system prompt, has put the
 	# turns in the file in an order the run then contradicts.
 	my $other = fresh-path();
-	my $eager = LLM::Agent::Session.create(path => $other, meta => {});
+	my $eager = test-session(path => $other, meta => {});
 	my $asked = msg('user', 'make the tests pass');
 	$eager.append-message($asked);
 
@@ -515,7 +516,7 @@ subtest 'a run context replays as data, and never as a conversation' => {
 	plan 9;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	$session.append-message(msg('user', 'hello'));
 
 	# Three runs of the same agent: the identity never changes, the
@@ -539,7 +540,7 @@ subtest 'a run context replays as data, and never as a conversation' => {
 	}
 	$session.close;
 
-	my $replayed = LLM::Agent::Session.load(path => $path);
+	my $replayed = reopen-session(path => $path);
 
 	is $replayed.messages.map({ .content }).List, ('hello',),
 		'a run context is not a message';
@@ -587,7 +588,7 @@ subtest 'two identical sections in one context resolve to one body' => {
 	plan 3;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	my $id = $session.append-run-context(
 		run-id   => 'r', digest => 'd',
 		facts    => [],
@@ -598,7 +599,7 @@ subtest 'two identical sections in one context resolve to one body' => {
 	);
 	$session.close;
 
-	my $replayed = LLM::Agent::Session.load(path => $path);
+	my $replayed = reopen-session(path => $path);
 	my @sections = $replayed.last-run-context<sections>.list;
 
 	is @sections[0]<rendered>, 'THE BODY', 'the first section carries the body';
@@ -633,7 +634,7 @@ subtest 'a context body the transcript no longer has is absent, not fatal' => {
 		}),
 	]);
 
-	my $session = LLM::Agent::Session.load(path => $path);
+	my $session = reopen-session(path => $path);
 	is $session.messages.elems, 1, 'the transcript loads';
 	is $session.warnings.elems, 0, 'with nothing to repair';
 
@@ -662,7 +663,7 @@ subtest 'blank lines are ignored wherever they are' => {
 		'',
 	]);
 
-	my $session = LLM::Agent::Session.load(path => $path);
+	my $session = reopen-session(path => $path);
 	is $session.messages.elems, 1, 'a blank line is not a malformed one';
 	is $session.warnings.elems, 0, 'and is not worth warning about';
 };

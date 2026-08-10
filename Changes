@@ -2,6 +2,9 @@ Revision history for LLM::Agent
 
 {{$NEXT}}
 
+0.4.1  2026-08-10T21:58:15+01:00
+    - Fix flaky t/15 test
+
 0.4.0  2026-08-10T20:17:25+01:00
     - New LLM::Agent::Subagents: a tool provider that delegates. It
       stacks over another provider the way MCP::Client::Registry and
@@ -22,15 +25,33 @@ Revision history for LLM::Agent
       child's. A Subagent event is never terminal, whatever the child
       emitted, so a child completing cannot end the parent's Supply or
       stop a consumer that quits on a terminal.
-    - New Loop.emit-external(Event): the public seam a layer above the
-      loop publishes through. Stamps and mailboxes the event like the
-      driver's own, is safe from any thread, and answers False rather
-      than throwing when there is no live run or the run has finished —
-      a child still winding down after its parent ended is ordinary, not
-      an error. It cannot wedge `drained` (the work section it opens is
-      closed by a LEAVE, and a refused ticket opens none), and it dies
-      on a terminal event, because only _finish can keep the result
-      Promise.
+    - New Loop.emit-external(Event) and Loop.emitter-for(Run): the two
+      seams a layer above the loop publishes through. Both stamp and
+      mailbox the event like the driver's own, are safe from any thread,
+      cannot wedge `drained` (the work section is closed by a LEAVE, and
+      a refused ticket opens none), and die on a terminal event because
+      only _finish can keep the result Promise. They differ in WHICH run
+      they publish onto, and the difference is load-bearing:
+      emit-external asks the loop what is running now — right for a hook
+      firing inside the run — while emitter-for binds to one Run for
+      ever and answers False once it ends. Anything that outlives its
+      run (a subagent winding down, a detached job) must use the second:
+      a straggler from run A published onto run B is a turn in B's
+      transcript that never happened.
+    - Subagents forwards every child event, session envelope and log
+      through an emitter captured at spawn time, so a child that
+      outlives its parent has its late events DROPPED rather than filed
+      under whatever run is live when they arrive.
+    - A child is owned until it has DRAINED, not until it has answered.
+      The task call still settles at the child's result — a model must
+      not wait on a call nobody is waiting for — but the max-live slot,
+      the live-agents entry and the right to cancel are held until the
+      child's `drained` Promise is kept. The gap is real: a child that
+      abandoned a tool call to a deadline has a result while that call
+      is still writing files, and letting go there freed a slot, hid the
+      child from a UI, and left cancel-children with nothing to cancel.
+      live-agents gained `starting` and `draining` to say which end of
+      that life an entry is at.
     - Two guards, both refusing in words the model can act on rather
       than by throwing: an identical-spawn cap over the (agent-type,
       prompt) digest — canonicalised, so key order and JSON whitespace
@@ -38,12 +59,22 @@ Revision history for LLM::Agent
       a max-live backstop that refuses while `max-live` children are
       running and tells the model to wait. Both checks and the child's
       slot reservation happen in one critical section, so two spawns
-      arriving at once cannot both take the last slot.
-    - Cancelling the parent cascades to every live child: the first
-      spawn of a run registers on that run's cancellation Promise. A
-      cancelled child settles its task call as an is_error rather than
-      leaving the batch hanging. cancel-children is the same thing for a
-      shutdown path; live-agents is what a UI renders while they run.
+      arriving at once cannot both take the last slot. The identical
+      tally is scoped PER PARENT RUN by default (identical-spawn-scope);
+      'composer' keeps one tally for the object's whole life. A model
+      going round in circles does it inside one run; three identical
+      delegations across three runs are three things somebody asked for.
+    - Cancelling the parent cascades to every child, at every point of a
+      child's life — including the window where the spawn callback is
+      still building one. The cancellation target is the SLOT, taken
+      before the callback is called, so cancel-children records the
+      request on children that do not exist yet and the spawn path
+      cancels (or never starts) them; registration and that check share
+      one critical section, so there is no interleaving in which nothing
+      happens. Every path settles the task call: is_error for a child
+      that was stopped, and — for a child that ignores its own
+      cancellation — an outcome-unknown is_error after a grace period,
+      rather than a call that hangs for ever.
     - Two new session envelope types on the PARENT's transcript, written
       through append-event and therefore ignored by every older reader:
       'subagent-spawned' { agent-id, agent-type, prompt, label,

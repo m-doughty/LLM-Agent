@@ -18,6 +18,7 @@ my @prompt = [msg('user', 'do the thing'),];
 my $tmp = $*TMPDIR.add("llm-agent-t18-{$*PID}-{now.Int}");
 $tmp.mkdir;
 END {
+	close-test-sessions();
 	if $tmp.e {
 		.unlink for $tmp.dir;
 		$tmp.rmdir;
@@ -54,7 +55,7 @@ subtest 'each call is dispatched, settled and recorded on its own' => {
 	plan 7;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	my $backend = scripted-backend(steps => [
 		{ content => 'two things',
@@ -113,7 +114,7 @@ subtest 'each call is dispatched, settled and recorded on its own' => {
 		'named by the dispatch envelope it closes';
 
 	$session.close;
-	my $replayed = LLM::Agent::Session.load(path => $path);
+	my $replayed = reopen-session(path => $path);
 	is-deeply $replayed.pending-tool-operations, (),
 		'so a reload finds nothing in flight: a clean run leaves nothing open';
 	$replayed.close;
@@ -123,7 +124,7 @@ subtest 'a deadline is an unknown outcome, not a failure' => {
 	plan 14;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	my $gate = Promise.new;
 	my $backend = scripted-backend(steps => [
@@ -271,7 +272,7 @@ subtest 'a cancel mid-batch splits it: unknown here, did-not-run behind' => {
 	plan 12;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	my $gate = Promise.new;
 	my $backend = scripted-backend(steps => [
@@ -330,7 +331,7 @@ subtest 'a cancel mid-batch splits it: unknown here, did-not-run behind' => {
 	drained-settled($run, 'the detached call');
 
 	$session.close;
-	my $replayed = LLM::Agent::Session.load(path => $path);
+	my $replayed = reopen-session(path => $path);
 	is-deeply $replayed.pending-tool-operations, (),
 		'and the transcript is left with nothing pending: the loop settled '
 			~ 'what it knew about before it went';
@@ -350,7 +351,7 @@ subtest 'a cancel between calls abandons everything that is left' => {
 	# a trick — and the alternative (sleep and hope) is how a suite starts
 	# flaking on a loaded machine.
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	my $run;
 	my $backend = scripted-backend(steps => [
@@ -517,7 +518,7 @@ subtest 'grant-hook writes the snapshot the moment it is told to' => {
 		'the snapshot watcher is gone — a callback replaced the poll';
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	my $gate = Promise.new;
 	my $loop;
@@ -569,7 +570,7 @@ subtest 'unwired, a grant still lands before the next call is dispatched' => {
 	# The belt-and-braces half of grants v2: no hook at all, and the loss
 	# is still bounded to one tool's runtime rather than a whole batch.
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	my $gate = Promise.new;
 	my $granting;

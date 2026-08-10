@@ -21,6 +21,7 @@ my @prompt = [msg('user', 'read the big file'),];
 my $tmp = $*TMPDIR.add("llm-agent-t15-{$*PID}-{now.Int}");
 $tmp.mkdir;
 END {
+	close-test-sessions();
 	if $tmp.e {
 		# The artifact directories are children, so this is depth-first.
 		for $tmp.dir -> $entry {
@@ -115,7 +116,7 @@ subtest 'an oversized result is excerpted once, into all three places' => {
 	plan 9;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	my Str $content = big-content();
 	my %out = oversized-run($session, $content, 2_000);
 
@@ -156,7 +157,7 @@ subtest 'the digest in the marker is the digest of the file' => {
 	plan 3;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	my Str $content = big-content(500);
 	my %out = oversized-run($session, $content, 1_000);
 
@@ -181,7 +182,7 @@ subtest 'a resumed run replays byte for byte with the artifact GONE' => {
 	plan 5;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	my Str $content = big-content();
 	my %out = oversized-run($session, $content, 2_000);
 	is (await %out<run>.result)<outcome>, 'completed', 'the first run finished';
@@ -193,7 +194,7 @@ subtest 'a resumed run replays byte for byte with the artifact GONE' => {
 	$dir.rmdir;
 	nok $dir.e, 'the artifacts are gone';
 
-	my $resumed = LLM::Agent::Session.load(path => $path);
+	my $resumed = reopen-session(path => $path);
 	my @messages = $resumed.messages;
 	is @messages.first({ .role eq 'tool' }).content,
 		(await %out<run>.result)<messages>.first({ .role eq 'tool' }).content,
@@ -241,7 +242,7 @@ subtest 'the threshold is a boundary, and it is exact' => {
 
 	# Exactly at the limit: untouched, and no file at all.
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	my Str $exact = 'x' x 500;
 	my %at = oversized-run($session, $exact, 500);
 	is events-of(%at<events>, 'tool-result').head.content, $exact,
@@ -253,7 +254,7 @@ subtest 'the threshold is a boundary, and it is exact' => {
 
 	# One character over: excerpted.
 	my $path2 = fresh-path();
-	my $session2 = LLM::Agent::Session.create(path => $path2, meta => {});
+	my $session2 = test-session(path => $path2, meta => {});
 	my %over = oversized-run($session2, 'x' x 501, 500);
 	my $content = events-of(%over<events>, 'tool-result').head.content;
 	isnt $content, 'x' x 501, 'one character over, and it is excerpted';
@@ -272,7 +273,7 @@ subtest 'a write that fails is shielded: excerpt, warning, settled op' => {
 	my $blocker = artifact-dir-for($path);
 	$blocker.spurt('not a directory');
 
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	my Str $content = big-content();
 	my %out = oversized-run($session, $content, 2_000);
 
@@ -304,7 +305,7 @@ subtest 'an orphan artifact is nobody’s problem' => {
 	plan 3;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	my Str $content = big-content();
 	my %out = oversized-run($session, $content, 2_000);
 	$session.close;
@@ -317,7 +318,7 @@ subtest 'an orphan artifact is nobody’s problem' => {
 	my $named = events-of(%out<events>, 'tool-result').head.artifact<file>;
 	$dir.add($named).unlink;
 
-	my $resumed = LLM::Agent::Session.load(path => $path);
+	my $resumed = reopen-session(path => $path);
 	is $resumed.messages.elems, (await %out<run>.result)<messages>.elems,
 		'the transcript loads with an orphan beside it and a referenced '
 			~ 'file missing';
@@ -336,7 +337,7 @@ subtest 'a pending record is the caller’s to keep' => {
 	# `.Hash` goes, so a caller poking at what it was handed cannot
 	# rewrite the session's replayed state.
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	$session.append-tool-dispatched(
 		call-id => 'c1', tool => 'fs_read',
 		arguments => { path => 'a' },
@@ -381,7 +382,7 @@ subtest 'no budget means no excerpting at all' => {
 	# behaves exactly as 0.1.x did: every byte a tool produced reaches the
 	# conversation.
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	my Str $content = big-content();
 
 	my $backend = scripted-backend(steps => [
@@ -407,11 +408,17 @@ subtest 'no budget means no excerpting at all' => {
 subtest 'the artifact directory is a sibling of the transcript' => {
 	plan 3;
 
-	is artifact-dir-for('/state/run.jsonl'.IO).Str, '/state/run.artifacts',
+	# Expected paths are built with the same IO::Path join the lib uses:
+	# a literal '/state/run.artifacts' only matches on OSes whose
+	# separator is '/', and the claim under test is siblinghood and stem
+	# handling, not the separator character.
+	is artifact-dir-for('/state/run.jsonl'.IO).Str,
+		'/state'.IO.add('run.artifacts').Str,
 		'the transcript stem plus .artifacts, beside the file';
 	is artifact-dir-for('/state/2026-08-10.run.jsonl'.IO).Str,
-		'/state/2026-08-10.run.artifacts',
+		'/state'.IO.add('2026-08-10.run.artifacts').Str,
 		'only the LAST extension is replaced';
-	is artifact-dir-for('/state/run'.IO).Str, '/state/run.artifacts',
+	is artifact-dir-for('/state/run'.IO).Str,
+		'/state'.IO.add('run.artifacts').Str,
 		'and a transcript with no extension is not handed its own path';
 };

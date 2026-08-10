@@ -17,11 +17,12 @@ use LLM::Chat::Conversation::Message;
 # that goes wrong is an is_error result and never an exception, and the
 # guards refuse in words the model can act on rather than by throwing.
 
-plan 16;
+plan 20;
 
 my $tmp = $*TMPDIR.add("llm-agent-t21-{$*PID}-{now.Int}");
 $tmp.mkdir;
 END {
+	close-test-sessions();
 	if $tmp.e {
 		.unlink for $tmp.dir;
 		$tmp.rmdir;
@@ -319,8 +320,12 @@ subtest 'a child that fails becomes an is_error result, and the run goes on' => 
 		'naming the agent that failed';
 	ok $result.content.contains('the model is on fire'),
 		'and saying why, in the words the child failed with';
+	# Released when the child DRAINED, which for a child that failed
+	# outright is a moment after its result — so this is polled rather
+	# than read once, and the poll is the assertion.
+	wait-until({ $subagents.live-agents.elems == 0 }, 'the slot to be freed');
 	is $subagents.live-agents.elems, 0,
-		'and its slot was released';
+		'and its slot was released once the child stopped producing';
 };
 
 subtest 'the arguments a model gets wrong are refused in words' => {
@@ -396,6 +401,87 @@ subtest 'the identical-spawn guard trips at the cap' => {
 			~ 'not per agent';
 };
 
+subtest 'the identical-spawn tally is per run unless the host says otherwise' => {
+	plan 4;
+
+	# Three identical delegations inside one run are a model going round
+	# in circles. Three across three runs are three occasions on which
+	# somebody asked for the same thing — and a composer that refused the
+	# fourth because of what happened an hour ago gets more broken the
+	# longer the host stays up.
+	sub across-two-runs(Str:D $scope --> List) {
+		my $gate-a = Promise.new;
+		my $gate-b = Promise.new;
+		my $inner = ScriptedProvider.new(
+			tools => [read-tool(),], results => { fs_read => 'held' },
+			block-call => { h1 => $gate-a, h2 => $gate-b },
+		);
+
+		my $loop;
+		my $subagents = LLM::Agent::Subagents.new(
+			inner => $inner, types => types(), loop => { $loop },
+			max-identical-spawns => 2, identical-spawn-scope => $scope,
+			spawn => -> %spec {
+				ChildHandle.new(
+					run => LLM::Agent::Loop.new(
+						backends => [scripted-backend(
+							steps => [{ content => 'done' },],
+						),],
+					).run([msg('user', %spec<prompt>),]),
+					session-path => '',
+				);
+			},
+		);
+
+		# Each run is held open by a blocked tool call of its own, so the
+		# task calls below are dispatched into a run that is demonstrably
+		# live rather than one this test hopes is.
+		my $backend = scripted-backend(steps => [
+			{ content => 'A holds', tool-calls => [tool-call('h1', 'fs_read', '{}'),] },
+			{ content => 'A done' },
+			{ content => 'B holds', tool-calls => [tool-call('h2', 'fs_read', '{}'),] },
+			{ content => 'B done' },
+		]);
+		$loop = LLM::Agent::Loop.new(backends => [$backend,], provider => $subagents);
+
+		my Str $same = '{"agent-type":"reviewer","prompt":"the same task"}';
+
+		my $run-a = $loop.run([msg('user', 'A'),]);
+		wait-until({ $inner.recorded-calls.elems == 1 }, "run A to park ($scope)");
+		my @in-a = (^3).map(-> $i {
+			?$subagents.execute-tool-calls(
+				[tool-call("a$i", 'task', $same),],
+			).head<is_error>;
+		}).List;
+		$gate-a.keep(True);
+		run-settled($run-a, "run A ($scope)");
+
+		my $run-b = $loop.run([msg('user', 'B'),]);
+		wait-until({ $inner.recorded-calls.elems == 2 }, "run B to park ($scope)");
+		my Bool $in-b = ?$subagents.execute-tool-calls(
+			[tool-call('b1', 'task', $same),],
+		).head<is_error>;
+		$gate-b.keep(True);
+		run-settled($run-b, "run B ($scope)");
+
+		(|@in-a, $in-b);
+	}
+
+	my @per-run = across-two-runs('run');
+	is @per-run[0 .. 2].List, (False, False, True),
+		'inside one run the cap holds: two go, the third is refused';
+	nok @per-run[3],
+		'and the next RUN starts with a clean tally — the same question '
+			~ 'asked again is a new question';
+
+	my @per-composer = across-two-runs('composer');
+	ok @per-composer[2],
+		"with identical-spawn-scope => 'composer' the cap holds the same "
+			~ 'way inside a run';
+	ok @per-composer[3],
+		'and goes on holding across runs, which is what that scope is for';
+};
+
 subtest 'the max-live backstop refuses while children are running' => {
 	plan 5;
 
@@ -453,7 +539,7 @@ subtest 'cancelling the parent cancels its children' => {
 	);
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	my $loop;
 	my $subagents = LLM::Agent::Subagents.new(
@@ -472,22 +558,23 @@ subtest 'cancelling the parent cancels its children' => {
 	);
 
 	my $run = $loop.run([msg('user', 'review this'),]);
-	wait-until({ $subagents.live-agents.elems == 1 }, 'the child to start');
+	# The slot, which is taken BEFORE the spawn callback is called — so
+	# this deliberately cancels at whichever point the runner happens to
+	# have reached, including the window where the child run does not
+	# exist yet. Every one of them has to end the same way.
+	wait-until({ $subagents.live-agents.elems == 1 }, 'the child to be admitted');
 
 	$run.cancel;
 	run-settled($run, 'the cancelled parent');
 
+	# Only now is there a child run to read: the spawner records inside
+	# the callback, which the cancel above may well have interrupted.
+	wait-until({ $spawner.count == 1 }, 'the child run to be built');
 	my $child = $spawner.runs[0];
 	wait-until({ $child.is-done }, 'the child to notice');
 	is $child.result.result<outcome>, 'cancelled',
 		'the cascade reached the child: cancelling the parent cancelled it';
 	is (await $run.result)<outcome>, 'cancelled', 'and the parent is cancelled';
-
-	wait-until({ $subagents.live-agents.elems == 0 },
-		'the child slot to be released');
-	is $subagents.live-agents.elems, 0,
-		'the slot is released even though nobody was waiting for the '
-			~ 'result any more';
 
 	# The task call still settled — the batch was detached, not left
 	# hanging — and the transcript is where that is visible.
@@ -498,11 +585,273 @@ subtest 'cancelling the parent cancels its children' => {
 	my %settled = $session.events.first({ $_<type> eq 'subagent-settled' })<payload>;
 	is %settled<outcome>, 'cancelled', 'and recorded as cancelled';
 	ok %settled<result>.contains('cancelled'),
-		'with a result that says so in words the model would have been '
+		'with a result that says so in the words the model would have been '
 			~ 'given';
 
+	# The slot outlives the answer by however long the child takes to
+	# stop producing — which here depends on whether the cancel beat the
+	# child to its tool call, so the deterministic half of that property
+	# is pinned by the "owned until it has DRAINED" subtest instead. What
+	# is unconditional is that it IS released, once the child is quiet.
 	$gate.keep(True);
+	wait-until({ $subagents.live-agents.elems == 0 },
+		'the child to drain once its tool call comes back');
+	is $subagents.live-agents.elems, 0, 'and only then is it let go';
+
 	$session.close;
+};
+
+subtest 'a cancel arriving inside the spawn window still settles the call' => {
+	plan 8;
+
+	# THE WINDOW: a spawn has taken its slot and the child run does not
+	# exist yet, because building one is the app's code and can take as
+	# long as it likes. This subtest parks the spawn callback exactly
+	# there and cancels the parent while it is parked, so the interleaving
+	# is a fact rather than something a slow runner might hit.
+	my $in-spawn = Promise.new;
+	my $release = Promise.new;
+	my $lock = Lock.new;
+	my Int $spawns = 0;
+	my @built;
+
+	# The children's own tool call never answers, so a child that is NOT
+	# cancelled would run for ever — which is what a hung task call looked
+	# like on CI, and what this must not do.
+	my $never = Promise.new;
+	my $child-tools = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'never' },
+		block-call => { fs_read => $never },
+	);
+
+	my &spawn = -> %spec {
+		$lock.protect: { $spawns++ };
+		$in-spawn.keep(True) if $in-spawn.status ~~ Planned;
+		await $release;
+
+		my $loop = LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => review-script()),],
+			provider => $child-tools,
+		);
+		my $run = $loop.run([msg('user', %spec<prompt>),]);
+		$lock.protect: { @built.push: %( :$run, :$loop ) };
+		ChildHandle.new(run => $run, session-path => '');
+	};
+
+	# A parent run held open by a blocked tool call of its own, so that
+	# "there is a live run when the batch is dispatched" is also a fact.
+	my $parent-gate = Promise.new;
+	my $parent-tools = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'held' },
+		block-call => { fs_read => $parent-gate },
+	);
+
+	my $loop;
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => $parent-tools, types => types(), :&spawn, loop => { $loop },
+	);
+	my $backend = scripted-backend(steps => [
+		{ content => 'holding', tool-calls => [tool-call('h1', 'fs_read', '{}'),] },
+		{ content => 'never reached' },
+	]);
+	$loop = LLM::Agent::Loop.new(backends => [$backend,], provider => $subagents);
+
+	my $run = $loop.run([msg('user', 'hold the run open'),]);
+	wait-until({ $parent-tools.recorded-calls.elems == 1 },
+		'the parent to park in a tool call');
+
+	# Two task calls in ONE batch — dispatched here rather than by the
+	# loop, which sends one at a time. The first parks in the window; the
+	# second is behind it and will be admitted after the cancel.
+	my $batch = start $subagents.execute-tool-calls([
+		task-call('t1', 'reviewer', 'review one'),
+		task-call('t2', 'reviewer', 'review two'),
+	]);
+
+	await Promise.anyof($in-spawn, Promise.in(TIMEOUT));
+	is $in-spawn.status, Kept, 'the first spawn is parked inside the window';
+	is $subagents.live-agents.elems, 1, 'its slot is taken';
+	ok $subagents.live-agents[0]<starting>,
+		'and it is a cancellation target with no run behind it yet';
+
+	# HERE. Nothing exists that a Run-shaped sweep of the table could find.
+	$run.cancel;
+	$release.keep(True);
+
+	await Promise.anyof($batch, Promise.in(TIMEOUT));
+	is $batch.status, Kept,
+		'the batch settles: a cancel in the window does not strand it';
+
+	my @answers = $batch.result.List;
+	ok @answers[0]<is_error> && @answers[0]<content>.contains('cancelled'),
+		'the call that was in the window is answered as cancelled';
+	ok @answers[1]<is_error> && @answers[1]<content>.contains('did not run'),
+		'and the one behind it was never started at all';
+	is $spawns, 1,
+		'which the spawn callback agrees with: it was entered exactly once';
+
+	wait-until({ @built[0]<run>.is-done }, 'the child that was started');
+	is @built[0]<run>.result.result<outcome>, 'cancelled',
+		'and the child that HAD been built was cancelled rather than left '
+			~ 'running behind a call nobody was waiting for';
+
+	$parent-gate.keep(True);
+	$never.keep(True);
+	drained-settled($run, 'the cancelled parent');
+};
+
+subtest 'a child is owned until it has DRAINED, not until it has answered' => {
+	plan 8;
+
+	# The gap this subtest exists for: a child that abandoned a tool call
+	# to a deadline has a result — the parent gets its answer, which is
+	# right — while the detached call is still running somewhere. Letting
+	# go of the child there would free its max-live slot, drop it out of
+	# live-agents, and leave cancel-children with nothing to cancel while
+	# a tool call carries on writing files.
+	my $never = Promise.new;
+	my $stuck = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'far too late' },
+		block-call => { fs_read => $never },
+	);
+
+	my @kids;
+	my $lock = Lock.new;
+	my &spawn = -> %spec {
+		my $loop = LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => [
+				{ content => 'starting',
+				  tool-calls => [tool-call('k1', 'fs_read', '{"path":"a"}'),] },
+				{ content => 'I gave up on the tool and answered anyway' },
+			]),],
+			provider => $stuck,
+			# Short, and against a call that never answers: the child WILL
+			# reach its deadline, so nothing here waits on a clock to be
+			# lucky.
+			tool-deadline => 0.15,
+		);
+		my $run = $loop.run([msg('user', %spec<prompt>),]);
+		$lock.protect: { @kids.push: %( :$run, :$loop ) };
+		ChildHandle.new(run => $run, session-path => '');
+	};
+
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), :&spawn, max-live => 1,
+	);
+
+	my %answer = $subagents.execute-tool-calls(
+		[task-call('c1', 'reviewer', 'do the thing'),],
+	).head;
+
+	nok %answer<is_error>, 'the parent gets its answer as soon as the child '
+		~ 'has one — a detached tool call is not a reason to make a model wait';
+	is %answer<content>, 'I gave up on the tool and answered anyway',
+		'and it is what the child said';
+
+	my $child = $lock.protect: { @kids[0]<run> };
+	is $child.result.status, Kept, 'the child has a result';
+	is $child.drained.status, Planned,
+		'and has NOT drained: its abandoned tool call is still running';
+
+	is $subagents.live-agents.elems, 1,
+		'so the composer still owns it — the slot is not free yet';
+	ok $subagents.live-agents[0]<draining>,
+		'and says which of the two it is';
+
+	is $subagents.cancel-children, 1,
+		'a shutdown reaches it, which is the whole point of holding on';
+
+	# And only now, when the detached call finally comes back.
+	$never.keep(True);
+	wait-until({ $subagents.live-agents.elems == 0 },
+		'the child to drain and free its slot');
+	is $subagents.live-agents.elems, 0, 'the slot frees on drained';
+};
+
+subtest 'a child that outlives its run never publishes into the next one' => {
+	plan 8;
+
+	# PROVENANCE. The child is a hand-driven Run — the driving seam
+	# LLM::Agent::Run documents — so this test decides exactly when it
+	# emits, which is what makes "after its parent ended, while the NEXT
+	# run is live" a fact rather than a hope about scheduling.
+	my $child = LLM::Agent::Run.new(id => 'child-run');
+	my &spawn = -> %spec { ChildHandle.new(run => $child, session-path => '') };
+
+	# Both parent runs are held open by a blocked tool call of their own,
+	# so "A is live" and "B is live" are things this test can wait for.
+	my $gate-a = Promise.new;
+	my $gate-b = Promise.new;
+	my $inner = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'held' },
+		block-call => { h1 => $gate-a, h2 => $gate-b },
+	);
+
+	my $loop;
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => $inner, types => types(), :&spawn, loop => { $loop },
+	);
+	# One script, consumed across both runs in order. A is cancelled while
+	# its tool call is blocked, so it takes exactly one step and never
+	# comes back for a second round; the two after it are B's.
+	my $backend = scripted-backend(steps => [
+		{ content => 'A holds', tool-calls => [tool-call('h1', 'fs_read', '{}'),] },
+		{ content => 'B holds', tool-calls => [tool-call('h2', 'fs_read', '{}'),] },
+		{ content => 'B is done' },
+	]);
+	$loop = LLM::Agent::Loop.new(backends => [$backend,], provider => $subagents);
+
+	# --- run A, and a task call inside it. ---------------------------
+	my $run-a = $loop.run([msg('user', 'first'),]);
+	wait-until({ $inner.recorded-calls.elems == 1 }, 'A to park');
+
+	my $task = start $subagents.execute-tool-calls(
+		[task-call('t1', 'reviewer', 'outlive me'),],
+	);
+	wait-until({ $subagents.live-agents.elems == 1 }, 'the child to be owned');
+
+	$child._emit(LLM::Agent::Event::Token.new(text => 'while A is live'));
+
+	# --- A ends; B starts. -------------------------------------------
+	$run-a.cancel;
+	$gate-a.keep(True);
+	run-settled($run-a, 'run A');
+	my @a-events = drain-events($run-a);
+
+	my $run-b = $loop.run([msg('user', 'second'),]);
+	wait-until({ $inner.recorded-calls.elems == 2 }, 'B to park');
+	is $loop.live-run.id, $run-b.id, 'the loop is now driving a DIFFERENT run';
+
+	# THE EVENT THAT MUST NOT LAND ON B. A lookup-at-fire-time forwarder
+	# publishes it there; a run-bound one drops it.
+	$child._emit(LLM::Agent::Event::Token.new(text => 'after A ended'));
+	$child._finish(
+		LLM::Agent::Event::RunCancelled.new(stage => 'tools'),
+		final => '', messages => (),
+	);
+
+	await Promise.anyof($task, Promise.in(TIMEOUT));
+	is $task.status, Kept, "A's task call settled rather than hanging";
+	ok $task.result.head<is_error>,
+		'as an error: the child it was waiting for was cancelled';
+
+	$gate-b.keep(True);
+	run-settled($run-b, 'run B');
+	my @b-events = drain-events($run-b);
+
+	my @on-a = @a-events.grep({ $_ ~~ LLM::Agent::Event::Subagent }).List;
+	my @on-b = @b-events.grep({ $_ ~~ LLM::Agent::Event::Subagent }).List;
+
+	is @on-a.elems, 1, 'A carries the event its child emitted while A was live';
+	is @on-a[0].inner<text>, 'while A is live', 'and it is the right one';
+	is @on-a.map({ $_.run-id }).unique.List, ($run-a.id,),
+		"stamped with A's envelope";
+	is @on-b.elems, 0,
+		"and B carries NOTHING of A's child: not the event it emitted while "
+			~ 'B was live, and not its terminal either';
+	is (await $run-b.result)<outcome>, 'completed',
+		'B is unaffected in every other way';
 };
 
 subtest 'cancel-children settles a task call as an error instead of hanging' => {
@@ -540,7 +889,7 @@ subtest 'the parent transcript records both envelopes, and replays without the c
 	plan 8;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(
+	my $session = test-session(
 		path => $path, meta => { agent => 'test' },
 	);
 
@@ -593,7 +942,7 @@ subtest 'the parent transcript records both envelopes, and replays without the c
 	# children's files to do it.
 	ok !$tmp.add('reviewer-1.jsonl').e,
 		'the child transcript was never written by this test';
-	my $replayed = LLM::Agent::Session.load(path => $path);
+	my $replayed = reopen-session(path => $path);
 	is $replayed.messages.elems, $messages,
 		'and the parent replays to exactly the same conversation';
 	$replayed.close;
@@ -608,7 +957,7 @@ subtest 'what a child spent is recorded only when somebody was counting' => {
 	# into a zero.
 	sub settled(Int $context-budget --> Hash) {
 		my $path = fresh-path();
-		my $session = LLM::Agent::Session.create(path => $path, meta => {});
+		my $session = test-session(path => $path, meta => {});
 
 		my &spawn = -> %spec {
 			my $backend = scripted-backend(steps => [

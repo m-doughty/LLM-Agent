@@ -1,5 +1,6 @@
 use Test;
 use lib 'lib', 't/lib';
+use AgentTestKit;
 use JSON::Fast;
 use LLM::Agent::Session;
 use LLM::Chat::Conversation::Message;
@@ -12,6 +13,7 @@ plan 14;
 my $tmp = $*TMPDIR.add("llm-agent-t07-{$*PID}-{now.Int}");
 $tmp.mkdir;
 END {
+	close-test-sessions();
 	if $tmp.e {
 		.unlink for $tmp.dir;
 		$tmp.rmdir;
@@ -21,15 +23,11 @@ END {
 my $n = 0;
 sub fresh-path(--> IO::Path) { $tmp.add('s' ~ $n++ ~ '.jsonl') }
 
-sub msg(Str:D $role, Str:D $content = '', *%extra) {
-	LLM::Chat::Conversation::Message.new(:$role, :$content, |%extra);
-}
-
 subtest 'the meta line comes first, and is exactly what was passed' => {
 	plan 6;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(
+	my $session = test-session(
 		path => $path, meta => { agent => 'sadna', cwd => '/srv' },
 	);
 
@@ -53,7 +51,7 @@ subtest 'every line is on disk before the method returns' => {
 	plan 3;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	# A SECOND handle on the same path, with the session still open. This
 	# is the whole point of the flushed handle-mode writer: a `kill -9`
@@ -73,7 +71,7 @@ subtest 'a message line carries the message, and the extras carry the rest' => {
 	plan 8;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	my $id = $session.append-message(
 		msg('assistant', 'thinking about it',
@@ -104,7 +102,7 @@ subtest 'an extra can never overwrite the message itself' => {
 	plan 2;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	$session.append-message(
 		msg('user', 'the real content'),
@@ -121,7 +119,7 @@ subtest 'grants are a whole snapshot, and the last one wins' => {
 	plan 3;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	is-deeply $session.grants, (), 'no grants to begin with';
 
@@ -142,7 +140,7 @@ subtest 'a run context is refused before it is written, or not at all' => {
 	plan 8;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	sub append(*%args) {
 		$session.append-run-context(
@@ -184,7 +182,7 @@ subtest 'the escape hatch writes unknown types, and refuses the known ones' => {
 	plan 5;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	$session.append-message(msg('user', 'hi'));
 	my $id = $session.append-event(
@@ -211,7 +209,7 @@ subtest 'events is a copy, nested payload included' => {
 	plan 2;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	$session.append-message(msg('assistant', '', tool-calls => [
 		{ id => 'c1', type => 'function',
@@ -234,7 +232,7 @@ subtest 'message-ids runs parallel to messages' => {
 	plan 3;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 
 	my @ids = (
 		$session.append-message(msg('user', 'one')),
@@ -254,11 +252,11 @@ subtest 'create refuses a file that already has a transcript in it' => {
 	plan 3;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	$session.append-message(msg('user', 'precious'));
 	$session.close;
 
-	throws-like { LLM::Agent::Session.create(path => $path, meta => {}) },
+	throws-like { test-session(path => $path, meta => {}) },
 		Exception, message => /'append-only'/,
 		'a transcript is never opened over';
 
@@ -268,14 +266,14 @@ subtest 'create refuses a file that already has a transcript in it' => {
 	# that is what a `touch` or a failed previous attempt leaves.
 	my $empty = fresh-path();
 	$empty.spurt('');
-	lives-ok { LLM::Agent::Session.create(path => $empty, meta => {}).close },
+	lives-ok { test-session(path => $empty, meta => {}).close },
 		'though an empty file is fair game';
 };
 
 subtest 'load refuses what it cannot read' => {
 	plan 2;
 
-	throws-like { LLM::Agent::Session.load(path => $tmp.add('nope.jsonl')) },
+	throws-like { reopen-session(path => $tmp.add('nope.jsonl')) },
 		Exception, message => /'no transcript'/,
 		'a path with nothing at it';
 
@@ -288,7 +286,7 @@ subtest 'a closed session refuses to append, but still reads' => {
 	plan 3;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	$session.append-message(msg('user', 'hello'));
 	$session.close;
 
@@ -303,7 +301,7 @@ subtest 'a line that cannot be written changes nothing in memory' => {
 	plan 7;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	$session.append-message(msg('user', 'landed'));
 
 	# The handle taken out from under it, which is the closest a test can
@@ -332,7 +330,7 @@ subtest 'keys are serialised in a stable order' => {
 	plan 2;
 
 	my $path = fresh-path();
-	my $session = LLM::Agent::Session.create(path => $path, meta => {});
+	my $session = test-session(path => $path, meta => {});
 	$session.append-message(msg('user', 'hello'));
 	$session.close;
 
