@@ -1,0 +1,468 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Agent::Session;
+use LLM::Chat::Conversation::Message;
+
+# `steer-source`: what the user says while a run is already going. The
+# thunk is asked at the top of every round, its answers become ordinary
+# user turns, and a broken one must never be able to end a run.
+
+plan 11;
+
+my @prompt = [msg('user', 'make the tests pass'),];
+
+my $tmp = $*TMPDIR.add("llm-agent-t23-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	close-test-sessions();
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+my $n = 0;
+sub fresh-path(--> IO::Path) { $tmp.add('s' ~ $n++ ~ '.jsonl') }
+
+sub read-tool(--> Hash) {
+	tool-decl('fs_read', 'Read a file', { path => { type => 'string' } },
+		required => ['path']);
+}
+
+# A tool round, then a final answer: two rounds, so there is exactly one
+# boundary between them for a steer to arrive at.
+sub two-round-backend(--> ScriptedBackend) {
+	scripted-backend(steps => [
+		{ chunks => ['Reading. '],
+		  tool-calls => [tool-call('call_1', 'fs_read', '{"path":"t/01.t"}'),] },
+		{ content => 'They pass now.' },
+	]);
+}
+
+sub read-provider(--> ScriptedProvider) {
+	ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'ok 1 - passes' },
+	);
+}
+
+#| A thunk answering C<@answers[$call - 1]> on its C<$call>th call, and
+#| nothing once the list runs out. Called on the driving thread only, one
+#| call at a time, so a plain counter is all this needs.
+sub scripted-steers(**@answers --> Callable) {
+	my Int $call = 0;
+	-> {
+		my $answer = @answers[$call++];
+		$answer.defined ?? $answer.list !! ();
+	};
+}
+
+sub roles-and-text(@messages --> List) {
+	@messages.map({ .role ~ ':' ~ .content }).List;
+}
+
+subtest 'a steer arrives at the round boundary, as an ordinary user turn' => {
+	plan 9;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => {});
+	my $backend = two-round-backend();
+	my $provider = read-provider();
+
+	# Nothing on the first pull (the ordinary case: the run started a
+	# moment ago), one line on the second.
+	my &steer-source = scripted-steers((), ['stop after the first failure'],);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$session, :&steer-source,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the steered run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'run-failed').elems, 0, 'the run did not fail';
+	is events-of(@events, 'run-completed').head.final, 'They pass now.',
+		'and finished on the final answer';
+
+	# The wire view of the second round: the steer is in the request the
+	# model is about to answer, which is the whole point of the feature.
+	is $backend.recorded-calls.elems, 2, 'two round trips';
+	is-deeply $backend.recorded-calls[1]<messages>.map({ .role }).List,
+		('user', 'assistant', 'tool', 'user'),
+		"the second request carries the steer AFTER round 1's tool result";
+	is $backend.recorded-calls[1]<messages>.tail.content,
+		'stop after the first failure',
+		'with the text the app handed over, verbatim';
+	is-deeply $backend.recorded-calls[0]<messages>.map({ .role }).List,
+		('user',),
+		'and the FIRST request carried only the question — the thunk had '
+			~ 'nothing to say yet';
+
+	my @messages = (await $run.result)<messages>;
+	is-deeply @messages.map({ .role }).List,
+		('user', 'assistant', 'tool', 'user', 'assistant'),
+		'the conversation the run answers with has the steer in it too';
+
+	# And the durable half: an ordinary user message, nothing marking it
+	# out as machine-inserted.
+	$session.close;
+	my @replayed = reopen-session(path => $path).messages;
+	is-deeply roles-and-text(@replayed),
+		(
+			'user:make the tests pass',
+			'assistant:Reading. ',
+			'tool:ok 1 - passes',
+			'user:stop after the first failure',
+			'assistant:They pass now.',
+		),
+		'and the transcript recorded it in the same position';
+	nok @replayed[3].tool-call-id.defined,
+		'a plain user turn: no envelope, no tool-call id, nothing to undo';
+};
+
+subtest 'several steers in one pull are several user turns, in order' => {
+	plan 3;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => {});
+	my $backend = two-round-backend();
+	my $provider = read-provider();
+
+	# The loop coalesces NOTHING: three answers are three messages. An app
+	# that wants one paragraph joins them itself.
+	my &steer-source = scripted-steers(
+		(), ['first thought', 'second thought', 'third thought'],
+	);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$session, :&steer-source,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the three-steer run');
+
+	my @messages = (await $run.result)<messages>;
+	is-deeply @messages.map({ .role }).List,
+		('user', 'assistant', 'tool', 'user', 'user', 'user', 'assistant'),
+		'three user turns, not one joined message';
+	is-deeply @messages[3..5].map({ .content }).List,
+		('first thought', 'second thought', 'third thought'),
+		'in the order the thunk answered them';
+
+	$session.close;
+	is-deeply reopen-session(path => $path).messages.map({ .content }).List,
+		(
+			'make the tests pass', 'Reading. ', 'ok 1 - passes',
+			'first thought', 'second thought', 'third thought',
+			'They pass now.',
+		),
+		'and the transcript agrees, line for line';
+};
+
+subtest 'a source that never has anything to say changes nothing' => {
+	plan 4;
+
+	# Two runs of the same script, one with an always-empty thunk and one
+	# with no thunk at all. Everything observable has to match.
+	my sub run-it(Bool:D :$steered --> Hash) {
+		my $path = fresh-path();
+		my $session = test-session(path => $path, meta => {});
+		my $backend = two-round-backend();
+		my $provider = read-provider();
+		my Int $calls = 0;
+
+		my $loop = LLM::Agent::Loop.new(
+			backends => [$backend,], :$provider, :$session,
+			|($steered ?? (steer-source => { $calls++; () }) !! ()),
+		);
+
+		my $run = $loop.run(@prompt);
+		run-settled($run, 'the run');
+		my @events = drain-events($run);
+		$session.close;
+		%(
+			kinds      => event-kinds(@events),
+			messages   => roles-and-text((await $run.result)<messages>),
+			transcript => roles-and-text(reopen-session(path => $path).messages),
+			calls      => $calls,
+		);
+	}
+
+	my %empty = run-it(steered => True);
+	my %none = run-it(steered => False);
+
+	is %empty<calls>, 2, 'the thunk was asked once per round';
+	is-deeply %empty<messages>, %none<messages>,
+		'and an empty answer leaves the conversation identical to a run '
+			~ 'with no steer-source at all';
+	is-deeply %empty<transcript>, %none<transcript>,
+		'the transcript too — nothing is written for an empty pull';
+	is-deeply %empty<kinds>, %none<kinds>,
+		'and not one extra event was emitted';
+};
+
+subtest 'a source that throws is shielded: the run finishes without it' => {
+	plan 7;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => {});
+	my $backend = two-round-backend();
+	my $provider = read-provider();
+
+	my Int $calls = 0;
+	my &steer-source = -> {
+		$calls++;
+		die 'the steer queue is on fire';
+	};
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$session, :&steer-source,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the run with a broken steer source');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'run-failed').elems, 0,
+		'a broken thunk is not a failed run';
+	is events-of(@events, 'run-completed').head.final, 'They pass now.',
+		'the run finished on the answer it was going to give anyway';
+	is $calls, 2,
+		'and it was asked again the next round — the fault may have been '
+			~ 'transient';
+
+	is-deeply (await $run.result)<messages>.map({ .role }).List,
+		('user', 'assistant', 'tool', 'assistant'),
+		'nothing was recorded for a pull that threw';
+	$session.close;
+	is-deeply reopen-session(path => $path).messages.map({ .role }).List,
+		('user', 'assistant', 'tool', 'assistant'),
+		'including in the transcript';
+
+	my @logs = events-of(@events, 'log').grep({
+		$_.data ~~ Str && $_.data.contains('steer source threw')
+	});
+	is @logs.elems, 2, 'and each failure was said out loud, once per pull';
+	is @logs.grep({ .level eq 'error' && .logger eq 'llm-agent.loop' }).elems,
+		@logs.elems, 'as an error Log event from the loop';
+};
+
+subtest 'no steer-source is the loop exactly as it was' => {
+	plan 3;
+
+	my $backend = two-round-backend();
+	my $provider = read-provider();
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$provider);
+
+	nok $loop.steer-source.defined,
+		'the default is a loop with no steer source';
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the unsteered run');
+
+	is-deeply (await $run.result)<messages>.map({ .role }).List,
+		('user', 'assistant', 'tool', 'assistant'),
+		'and it runs exactly as it did before the option existed';
+	is $backend.recorded-calls[1]<messages>.elems, 3,
+		'with nothing added to the request';
+};
+
+subtest 'a sessionless run steers too' => {
+	plan 3;
+
+	# `!record` answers an undefined Str when there is no transcript, and
+	# the steer path pushes that id like every other append does. A run
+	# with nowhere durable to write must still deliver the message.
+	my $backend = two-round-backend();
+	my $provider = read-provider();
+	my &steer-source = scripted-steers((), ['and hurry up'],);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :&steer-source,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the sessionless steered run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'run-failed').elems, 0, 'no crash, no failure';
+	is-deeply (await $run.result)<messages>.map({ .role }).List,
+		('user', 'assistant', 'tool', 'user', 'assistant'),
+		'the steer is in the conversation';
+	is $backend.recorded-calls[1]<messages>.tail.content, 'and hurry up',
+		'and on the wire';
+};
+
+subtest 'a steered transcript resumes: it replays and seeds a new run' => {
+	plan 5;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => {});
+	my $first = two-round-backend();
+	my $provider = read-provider();
+	my &steer-source = scripted-steers((), ['and check the docs too'],);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$first,], :$provider, :$session, :&steer-source,
+	);
+	run-settled($loop.run(@prompt), 'the first, steered run');
+	$session.close;
+
+	# What a resuming app has: the file, and nothing else.
+	my $reopened = reopen-session(path => $path);
+	my @replayed = $reopened.messages;
+	is @replayed.elems, 5, 'five messages came back';
+	is @replayed[3].role, 'user',
+		'the steer replays as an ordinary user message';
+	is @replayed[3].content, 'and check the docs too', 'with its text';
+
+	# Two consecutive user turns in the middle of the history is the shape
+	# a steer leaves behind, and the seed check has to accept it: it is a
+	# prefix digest, not an opinion about whose turn it is.
+	my $second = scripted-backend(steps => [{ content => 'The docs are fine.' },]);
+	my $resumed = LLM::Agent::Loop.new(
+		backends => [$second,], :$provider, session => $reopened,
+	);
+
+	my $run = $resumed.run([|@replayed, msg('user', 'anything else?')]);
+	run-settled($run, 'the resumed run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'run-failed').elems, 0,
+		'the seed check accepted a history with a steer in it';
+	is-deeply $second.recorded-calls[0]<messages>.map({ .role }).List,
+		('user', 'assistant', 'tool', 'user', 'assistant', 'user'),
+		'and the whole steered history went back out on the wire';
+};
+
+subtest 'the limit path restarts the round, and asks again' => {
+	plan 3;
+
+	# max-tool-rounds => 0: the model asks for a tool, the limit fires, the
+	# turn is discarded and the loop goes round again for a final answer.
+	# That `next` re-enters the top of the loop, so it is a round boundary
+	# like any other and the thunk is asked there.
+	my $backend = scripted-backend(steps => [
+		{ chunks => ['I will read it. '],
+		  tool-calls => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+		{ content => 'the real answer' },
+	]);
+	my $provider = read-provider();
+	my &steer-source = scripted-steers((), ['just answer'],);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :&steer-source,
+		max-tool-rounds => 0,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the limited, steered run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'limit-reached').head.limit, 'tool-rounds',
+		'the limit fired';
+	is-deeply (await $run.result)<messages>.map({ .role }).List,
+		('user', 'system', 'user', 'assistant'),
+		'and the steer went in after the limit notice, on the restarted '
+			~ 'round';
+	is $backend.recorded-calls[1]<messages>.tail.content, 'just answer',
+		'so the final round saw it';
+};
+
+subtest 'entries that are not Str are dropped, and said out loud' => {
+	plan 4;
+
+	# `.Str` on a Message or a Hash would put something in the transcript
+	# that no user ever typed, so the entry is skipped instead — and a
+	# skipped steer that said nothing would look exactly like an app whose
+	# queue was empty.
+	my $backend = two-round-backend();
+	my $provider = read-provider();
+	my &steer-source = scripted-steers(
+		(), ['a real steer', msg('user', 'not a Str'), Str],
+	);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :&steer-source,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the run with a malformed pull');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'run-failed').elems, 0, 'the run was unharmed';
+	my @messages = (await $run.result)<messages>;
+	is-deeply @messages.map({ .role }).List,
+		('user', 'assistant', 'tool', 'user', 'assistant'),
+		'only the one usable entry became a turn';
+	is @messages[3].content, 'a real steer', 'and it is the right one';
+
+	my @logs = events-of(@events, 'log').grep({
+		$_.data ~~ Str && $_.data.contains('not defined Str')
+	});
+	is @logs.elems, 1, 'with one error Log naming what was dropped';
+};
+
+subtest 'a lazy answer whose generator throws is shielded too' => {
+	plan 3;
+
+	# A `gather` reading a queue is a natural way to write this thunk, and
+	# it does not throw when it is CALLED — it throws when the loop drains
+	# it. So the drain has to be inside the same shield the call is, or the
+	# run dies on an app's bug.
+	my $backend = two-round-backend();
+	my $provider = read-provider();
+	my &steer-source = -> {
+		gather {
+			take 'half a steer';
+			die 'the queue broke halfway through';
+		};
+	};
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :&steer-source,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the run with a lazily broken source');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'run-failed').elems, 0, 'the run survived it';
+	is-deeply (await $run.result)<messages>.map({ .role }).List,
+		('user', 'assistant', 'tool', 'assistant'),
+		'and a pull that threw halfway delivered nothing at all — half a '
+			~ 'queue is worse than none of it';
+	ok events-of(@events, 'log').grep({
+		$_.data ~~ Str && $_.data.contains('steer source threw')
+	}).elems >= 1, 'with the failure said out loud';
+};
+
+subtest 'a thunk that cannot be called with no arguments is refused' => {
+	plan 2;
+
+	# The mistake is `-> $x { }`, and its only symptom would otherwise be a
+	# shielded throw on every round of every run: a Log event nobody is
+	# reading, and steering that silently never works.
+	throws-like
+		{
+			LLM::Agent::Loop.new(
+				backends => [scripted-backend(steps => [{ content => 'hi' },]),],
+				steer-source => -> $queue { () },
+			);
+		},
+		Exception,
+		message => /'steer-source is called with no arguments'/,
+		'a thunk wanting an argument is refused at construction';
+
+	lives-ok
+		{
+			LLM::Agent::Loop.new(
+				backends => [scripted-backend(steps => [{ content => 'hi' },]),],
+				steer-source => -> *@ { () },
+			);
+		},
+		'and one that merely tolerates arguments is fine';
+};

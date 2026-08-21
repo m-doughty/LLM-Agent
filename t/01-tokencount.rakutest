@@ -5,7 +5,7 @@ use LLM::Agent::TokenCount;
 use LLM::Chat::Conversation::Message;
 use LLM::Agent::Canonical;
 
-plan 19;
+plan 21;
 
 sub msg(Str:D $role, Str:D $content = '', :@tool-calls) {
 	LLM::Chat::Conversation::Message.new(:$role, :$content, :@tool-calls);
@@ -93,6 +93,41 @@ subtest 'Exact: delegates to whatever can get-conversation-count' => {
 	ok $exact ~~ LLM::Agent::TokenCount, 'and it is a TokenCount';
 };
 
+class RequestCountingShim is CountingShim {
+	has @.requests;
+	method get-request-count(
+		@messages, :@tools, Str :$context-head, Str :$context-tail,
+	) {
+		@!requests.push: {
+			messages => @messages.elems, tools => @tools.elems,
+			head => $context-head, tail => $context-tail,
+		};
+		9876;
+	}
+}
+
+subtest 'Exact: delegates complete request counting, with an old-counter fallback' => {
+	plan 5;
+	my @messages = [msg('user', 'hello'),];
+	my @tools = [{ type => 'function', function => { name => 'read' } },];
+	my $shim = RequestCountingShim.new;
+	my $exact = LLM::Agent::TokenCount::Exact.new(counter => $shim);
+
+	is $exact.count-request(
+		@messages, :@tools, context-head => 'HEAD', context-tail => 'TAIL',
+	), 9876, 'a request-aware tokenizer has the last word over the whole request';
+	is $shim.requests.head<messages>, 1, 'it receives the conversation';
+	is $shim.requests.head<tools>, 1, 'and the tool catalogue';
+	is-deeply $shim.requests.head<head tail>, <HEAD TAIL>,
+		'with both runtime-context halves';
+
+	my $old = LLM::Agent::TokenCount::Exact.new(counter => CountingShim.new);
+	is $old.count-request(
+		@messages, :@tools, context-head => 'HEAD', context-tail => 'TAIL',
+	), 4 * 4242,
+		'an older conversation-only tokenizer safely counts each component';
+};
+
 subtest 'Exact: a counter that cannot count is refused at construction' => {
 	plan 3;
 	throws-like { LLM::Agent::TokenCount::Exact.new(counter => 42) },
@@ -155,6 +190,38 @@ subtest 'Usage: counting text does not touch the calibration' => {
 		'and the calibration is exactly where it was';
 	is $usage.count-messages(@conversation), 812,
 		'so the provider’s own number still answers for the conversation';
+};
+
+subtest 'Usage: provider prompt calibration already includes request framing' => {
+	plan 4;
+	my $fallback = LLM::Agent::TokenCount::Heuristic.new(
+		chars-per-token => 1, per-message-overhead => 0,
+	);
+	my $usage = LLM::Agent::TokenCount::Usage.new(:$fallback);
+	my @conversation = [msg('user', 'hello'),];
+	my @tools = [{ type => 'function', function => { name => 'read' } },];
+
+	my $estimated = $fallback.count-request(
+		@conversation, :@tools, context-head => 'HEAD', context-tail => 'TAIL',
+	);
+	is $usage.count-request(
+		@conversation, :@tools, context-head => 'HEAD', context-tail => 'TAIL',
+	), $estimated, 'before usage, the complete request is estimated';
+
+	$usage.record-usage(
+		prompt-tokens => 500, message-count => 1,
+		prefix-digest => messages-digest(@conversation), backend => 'm',
+	);
+	is $usage.count-request(
+		@conversation, :@tools, context-head => 'HEAD', context-tail => 'TAIL',
+	), 500, 'the billed prompt is not charged for context and tools twice';
+
+	my @extended = (|@conversation, msg('assistant', '1234567890'));
+	is $usage.count-request(
+		@extended, :@tools, context-head => 'HEAD', context-tail => 'TAIL',
+	), 510, 'only appended conversation history is estimated on top';
+	is $usage.calibration<prompt-tokens>, 500,
+		'those request counts keep the matching calibration';
 };
 
 subtest 'invalidate drops what was learned, and nothing else has to' => {

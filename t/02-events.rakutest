@@ -9,7 +9,7 @@ use LLM::Chat::Conversation::Message;
 # because the contracts that matter — one terminal then done, nothing
 # after it, a result that is always kept — belong to the pair.
 
-plan 20;
+plan 22;
 
 sub msg(Str:D $role, Str:D $content = '', *%extra) {
 	LLM::Chat::Conversation::Message.new(:$role, :$content, |%extra);
@@ -45,8 +45,20 @@ sub every-event(--> List) {
 		),
 		LLM::Agent::Event::Subagent.new(
 			agent-id => 'reviewer-1', agent-type => 'reviewer',
+			:call-id('call_1'),
 			inner => { kind => 'token', text => 'hi', 'run-id' => 'child', seq => 3 },
 		),
+		LLM::Agent::Event::BackgroundOpStarted.new(
+			op-id => 'reviewer-1', op-kind => 'subagent',
+		),
+		LLM::Agent::Event::BackgroundOpSettled.new(
+			op-id => 'reviewer-1', op-kind => 'subagent',
+		),
+		LLM::Agent::Event::BackgroundOpDelivered.new(
+			op-kind => 'subagent-settled',
+		),
+		LLM::Agent::Event::RunParked.new(outstanding => 0),
+		LLM::Agent::Event::RunResumed.new(reason => 'completion'),
 		LLM::Agent::Event::AskPending.new(request => { kind => 'permission' }),
 		LLM::Agent::Event::AskAnswered.new(request => { kind => 'permission' }),
 		LLM::Agent::Event::Log.new(level => 'info', data => 'hello'),
@@ -68,7 +80,9 @@ subtest 'the kind strings are the ones consumers match on' => {
 		'run-started', 'round-started', 'attempt-started', 'token',
 		'attempt-failed', 'attempt-succeeded', 'assistant-message',
 		'turn-committed', 'tool-call', 'tool-started', 'tool-progress',
-		'tool-result', 'tool-abandoned', 'subagent', 'ask-pending', 'ask-answered',
+		'tool-result', 'tool-abandoned', 'subagent', 'background-op-started',
+		'background-op-settled', 'background-op-delivered', 'run-parked',
+		'run-resumed', 'ask-pending', 'ask-answered',
 		'log', 'limit-reached', 'turn-discarded', 'compaction-started',
 		'compaction-done', 'run-completed', 'run-failed', 'run-cancelled',
 	], 'every class, in run order, with its stable name';
@@ -127,6 +141,35 @@ subtest 'to-hash always carries kind and an ISO-8601 UTC ts' => {
 		text => 'hi', ts => Instant.from-posix(1_700_000_000),
 	).to-hash<ts>.substr(0, 19), '2023-11-14T22:13:20',
 		'and it renders the event’s own Instant, in UTC';
+};
+
+subtest 'a Subagent event carries the task call it came from' => {
+	plan 4;
+
+	# The join between a delegation's TOOL events and its CHILD events.
+	# Without it they are three unrelated ids and a UI draws the same act
+	# twice: a tool card for the call, an agent card for the child.
+	my $joined = LLM::Agent::Event::Subagent.new(
+		agent-id => 'reviewer-1', agent-type => 'reviewer',
+		:call-id('call_1'),
+		inner => { kind => 'run-started', 'run-id' => 'child', seq => 0 },
+	);
+	is $joined.call-id, 'call_1', 'the id of the `task` call that started it';
+	is $joined.to-hash<call-id>, 'call_1',
+		'and it survives the flattening, so a sink that never loads this '
+			~ 'module can still join the two';
+
+	# The defensive shape: a composer forwarding a child no tool call
+	# started, and an event replayed from a transcript written before the
+	# key existed. Both say nothing rather than inventing a call.
+	my $bare = LLM::Agent::Event::Subagent.new(
+		agent-id => 'reviewer-1', agent-type => 'reviewer',
+		inner => { kind => 'run-started', 'run-id' => 'child', seq => 0 },
+	);
+	nok $bare.call-id.defined, 'a child no tool call started has none';
+	nok $bare.to-hash<call-id>:exists,
+		'and no key either — a call that was never recorded is not a call '
+			~ 'with an empty id';
 };
 
 subtest 'undefined payload keys are absent, not null' => {
@@ -210,6 +253,58 @@ subtest 'present-but-empty containers stay present' => {
 	my %failed = LLM::Agent::Event::RunFailed.new(error => 'x').to-hash;
 	is %failed<attempts>, [],
 		'"it never got as far as an attempt" is an empty list';
+};
+
+subtest 'the background events frame work the run waits for' => {
+	plan 9;
+
+	# `op-kind`, not `kind`, and this is the test that says why: `kind` on
+	# an event is the WIRE NAME of the class, `to-hash` writes it first,
+	# and a payload key of the same name would overwrite it — leaving a
+	# background-op-started that serialises as a 'subagent'.
+	my %started = LLM::Agent::Event::BackgroundOpStarted.new(
+		op-id => 'reviewer-1', op-kind => 'subagent',
+		label => 'review billing/', call-id => 'c1', round => 2,
+	).to-hash;
+	is %started<kind>, 'background-op-started',
+		'the event kind is the class’s, whatever the operation’s is';
+	is %started<op-kind>, 'subagent', 'and the operation’s is beside it';
+	is %started<op-id call-id>.List, ('reviewer-1', 'c1'),
+		'with both joins: the bus key, and the tool call that acknowledged it';
+
+	# `collected` is what a consumer branches on, so it is always there
+	# rather than absent when False.
+	my %settled = LLM::Agent::Event::BackgroundOpSettled.new(
+		op-id => 'reviewer-1', op-kind => 'subagent',
+	).to-hash;
+	is %settled<collected>, False,
+		'a settle says whether a synchronous join took the answer — and '
+			~ 'False is an answer, not a missing key';
+	ok LLM::Agent::Event::BackgroundOpSettled.new(
+		op-id => 'r', op-kind => 'subagent', :collected,
+	).to-hash<collected>,
+		'True means the model already has it, and no turn is coming';
+
+	# An untracked deliverable closes nothing, so it has no operation to
+	# name — absent rather than empty, like every other optional key.
+	my %delivered = LLM::Agent::Event::BackgroundOpDelivered.new(
+		op-kind => 'job-exited',
+	).to-hash;
+	nok %delivered<op-id>:exists,
+		'a delivered turn nothing was waiting for names no operation';
+
+	my %parked = LLM::Agent::Event::RunParked.new(outstanding => 0).to-hash;
+	is %parked<ops>, [],
+		'the inventory is present-but-empty rather than absent: "nothing '
+			~ 'outstanding" and "nobody said" are different answers';
+
+	nok LLM::Agent::Event::RunParked.new(outstanding => 1).is-terminal,
+		'a park is a pause, not an ending';
+	throws-like {
+		LLM::Agent::Event::RunResumed.new(reason => 'because I felt like it')
+	}, Exception,
+		'and a resume reason is one of the four the loop can actually '
+			~ 'produce, checked where it is built';
 };
 
 subtest 'AssistantMessage flattens its Message to the wire shape' => {

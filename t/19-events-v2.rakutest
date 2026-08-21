@@ -17,7 +17,7 @@ use LLM::Chat::Conversation::Message;
 # A UI that honours it can always retract streamed text on a signal,
 # instead of leaving it on screen until the next turn paints over it.
 
-plan 8;
+plan 9;
 
 my @prompt = [msg('user', 'hello'),];
 
@@ -312,4 +312,31 @@ subtest 'the events a discarded turn is framed by are still in order' => {
 			~ 'exists to allow';
 	is @kinds.grep({ $_ eq 'turn-discarded' }).elems, 1,
 		'exactly once, however many rounds follow';
+};
+
+subtest 'AttemptSucceeded.usage carries cached-prompt-tokens when reported, and only then' => {
+	plan 2;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'the answer',
+		  usage => { prompt => 100, completion => 20, cached => 64 } },
+	]);
+	my $run = LLM::Agent::Loop.new(backends => [$backend,]).run(@prompt);
+	run-settled($run, 'the cached run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'attempt-succeeded').head.usage<cached-prompt-tokens>,
+		64, 'the cache-hit slice the provider reported rides the event';
+
+	my $silent-backend = scripted-backend(steps => [
+		{ content => 'the answer', usage => { prompt => 100, completion => 20 } },
+	]);
+	my $silent-run = LLM::Agent::Loop.new(backends => [$silent-backend,])
+		.run(@prompt);
+	run-settled($silent-run, 'the uncached run');
+	my @silent-events = drain-events($silent-run);
+
+	nok events-of(@silent-events, 'attempt-succeeded').head.usage<cached-prompt-tokens>:exists,
+		'and a provider that never mentioned caching leaves the key out '
+			~ 'entirely — absent, not a reported zero';
 };

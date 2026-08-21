@@ -718,7 +718,11 @@ subtest 'a loop with no budget observes and caps nothing' => {
 	ok &observe.defined && &caps.defined,
 		'both seams exist as methods, not as comments';
 
-	my %observed = observe(Any, Any, 'a tool result, in full');
+	# The seam takes the op id and the label as STRINGS rather than as the
+	# operation they came from, because a background completion goes
+	# through it too and has no ToolOperation behind it. Same seam, one
+	# excerpt rule, no second path to drift from this one.
+	my %observed = observe(Any, 'op-1', 'fs_read', 'a tool result, in full');
 	is %observed<content>, 'a tool result, in full',
 		'with no budget the observation seam is identity: what a tool said '
 			~ 'is what the conversation, the transcript and the event all get';

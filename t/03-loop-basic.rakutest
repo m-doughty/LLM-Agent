@@ -605,7 +605,7 @@ subtest 'an audit record never fails a working run' => {
 };
 
 subtest 'the constructor refuses what it cannot drive' => {
-	plan 10;
+	plan 12;
 
 	throws-like { LLM::Agent::Loop.new(backends => []) }, Exception,
 		message => /'backends cannot be empty'/,
@@ -694,10 +694,43 @@ subtest 'the constructor refuses what it cannot drive' => {
 		'a deadline of zero — which is not "no deadline", it is a deadline '
 			~ 'nothing can meet';
 
+	# The fourth conditional half: a compactor that ELIDES writes a second
+	# kind of line, and a session that cannot take it would leave a
+	# transcript replaying the tool results the run had already stubbed.
+	my class CompactingSession is BareSession {
+		method append-compaction(*%args --> Str:D) { 'id' }
+	}
+	throws-like {
+		LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => []),],
+			session => CompactingSession.new,
+			:$counter,
+			compactor => LLM::Agent::Compactor.new(
+				backend => scripted-backend(steps => []),
+				:$counter, context-budget => 1_000, age-observations => True,
+			),
+		)
+	}, Exception, message => /'append-elision'/,
+		'a session that cannot take an elision, under a compactor that ages '
+			~ 'observations';
+
+	lives-ok {
+		LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => []),],
+			session => CompactingSession.new,
+			:$counter,
+			compactor => LLM::Agent::Compactor.new(
+				backend => scripted-backend(steps => []),
+				:$counter, context-budget => 1_000,
+			),
+		)
+	}, 'while the same session is fine for a compactor that does not — which '
+		~ 'is every compactor by default';
+
 	lives-ok {
 		LLM::Agent::Loop.new(
 			backends => [scripted-backend(steps => []),],
 			session => BareSession.new,
 		)
-	}, 'while the same session is fine for a loop that needs neither';
+	}, 'and the barest one is fine for a loop that needs neither';
 };

@@ -1,0 +1,1158 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Agent::RequestBudget;
+use LLM::Agent::Run;
+use LLM::Agent::Session;
+use LLM::Agent::Subagents;
+use LLM::Chat::Conversation::Message;
+
+# THE QUESTION CHANNEL: a child that finds its brief incomplete asks the
+# agent that started it rather than the human, and the composer is the
+# whole of the engine that makes that possible.
+#
+# The three things this file exists to pin. A parked question RELEASES
+# every waiting task call in the group at once, as an interim result that
+# is not an error and is not the child's answer — the composer returns one
+# List per batch, so a partial settle is not a thing it can do. A question
+# is delivered IN FULL EXACTLY ONCE, whatever happens afterwards. And
+# every one of the new paths — answered, declined, collected twice,
+# cancelled, swept by a parent that ended — leaves nobody blocked: no host
+# thread waiting on a vow nobody keeps, no task call hanging, no child
+# running for a conversation that is over.
+#
+# The first subtest drives the whole cycle through a REAL loop, because
+# the design claim behind this wave is that the loop needs no changes at
+# all: an interim result is an ordinary tool result, and task_answer and
+# task_wait are ordinary tool calls.
+
+plan 9;
+
+my $tmp = $*TMPDIR.add("llm-agent-t28-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	close-test-sessions();
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+my $n = 0;
+sub fresh-path(--> IO::Path) { $tmp.add('s' ~ $n++ ~ '.jsonl') }
+
+# Poll for a condition with a loud deadline. Never one sleep long enough
+# to "probably" be right.
+sub wait-until(&condition, Str:D $what) {
+	my $deadline = now + TIMEOUT;
+	until &condition() {
+		die "Timed out after {TIMEOUT}s waiting for $what" if now > $deadline;
+		sleep 0.005;
+	}
+}
+
+sub read-tool(--> Hash) {
+	tool-decl('fs_read', 'Read a file', { path => { type => 'string' } },
+		required => ['path']);
+}
+
+sub ask-tool(--> Hash) {
+	tool-decl('user_ask', 'Ask a question',
+		{ question => { type => 'string' } }, required => ['question']);
+}
+
+sub types(--> List) {
+	(
+		{ name => 'reviewer', description => 'Reviews a diff and reports problems.' },
+		{ name => 'tester', description => 'Runs the tests and reports failures.' },
+	);
+}
+
+sub task-call(Str:D $id, Str:D $type, Str:D $prompt --> Hash:D) {
+	tool-call($id, 'task',
+		'{"agent-type":"' ~ $type ~ '","prompt":"' ~ $prompt ~ '"}');
+}
+
+sub answer-call(Str:D $id, Str:D $arguments --> Hash:D) {
+	tool-call($id, 'task_answer', $arguments);
+}
+
+sub wait-call(Str:D $id, Str:D $agent-id --> Hash:D) {
+	tool-call($id, 'task_wait', '{"agent-id":"' ~ $agent-id ~ '"}');
+}
+
+#|( The handle a spawn callback answers with: `.run` and `.session-path`,
+    duck-typed, exactly as the composer checks for. )
+class ChildHandle {
+	has LLM::Agent::Run:D $.run is required;
+	has Str:D $.session-path is required;
+}
+
+# What a child makes of the answer it was given. The child's own final
+# message is scripted and cannot depend on it, so this is what proves the
+# answer really arrived: it becomes the child's tool result, and the
+# child's NEXT request carries it.
+sub answer-text(%outcome --> Str:D) {
+	given (%outcome<action> // '').Str {
+		when 'accept' {
+			my %content = (%outcome<content> // %()).Hash;
+			%content<answer>:exists
+				?? 'the parent said: ' ~ %content<answer>
+				!! 'the parent filled in: '
+					~ %content.keys.sort.map({ $_ ~ '=' ~ %content{$_} })
+						.join(', ');
+		}
+		when 'decline' {
+			'the parent declined'
+				~ (%outcome<reason>.defined ?? ': ' ~ %outcome<reason> !! '');
+		}
+		default { 'nobody could be asked: ' ~ (%outcome<action> // 'nothing') }
+	}
+}
+
+#|( A fleet of children that ask their parent one question each — the host
+    side of the channel, in the shape an app really wires it: the ask
+    happens on the CHILD's own thread, inside one of its tool calls, and
+    that thread blocks on the Promise C<post-question> hands back.
+
+    Everything is recorded: the children, the Promises they are waiting
+    on, and what each of them was finally told. )
+class ChildFleet {
+	#| Set after the composer exists — the forward declaration the
+	#| composer's own `loop` argument needs, for the same reason.
+	has $.composer is rw;
+
+	#|( A Promise a child waits on before it asks, keyed by agent-id or by
+	    agent TYPE (id first). Absent means "ask as soon as the tool call
+	    starts".
+
+	    By type is usually the right key: ids are minted under the lock a
+	    slot is taken under, so two spawns arriving in one batch are
+	    numbered in whatever order the threads got there — which is
+	    precisely the order a concurrency test must not depend on. )
+	has %.gates is rw;
+
+	#|( A Promise every child waits on AFTER it has been answered, in a
+	    second tool call, before it finishes. What lets a test say "the
+	    child has not finished yet" without saying "probably, within
+	    200ms". )
+	has Promise $.finish-gate;
+
+	#| Agent TYPES that never ask anything: a one-round child that just
+	#| answers.
+	has @.silent;
+
+	#| What every asking child asks, and the schema it asks with.
+	has Str $.message =
+		'The brief names the payments module, and there are two of them. '
+			~ 'Which one did you mean?';
+	has %.schema;
+
+	#| What each child finally says, and what its one round cost.
+	has Str $.final = 'the child is done';
+	has Numeric $.cost;
+
+	has @.children;
+	has @.posted;
+	has @.outcomes;
+	has Lock:D $!lock .= new;
+
+	method callback(--> Callable:D) {
+		-> %spec {
+			my Str $agent-id = %spec<agent-id>;
+			my Str $type = %spec<type><name>;
+			my Bool $silent = so @!silent.first({ $_ eq $type });
+
+			my $provider = ScriptedProvider.new(
+				tools => [ask-tool(), read-tool(),],
+				responder => -> $name, $arguments, $id {
+					if $name eq 'user_ask' {
+						self!ask($agent-id, $type);
+					}
+					else {
+						await Promise.anyof($!finish-gate, Promise.in(TIMEOUT));
+						'the gate opened';
+					}
+				},
+			);
+
+			my %last = content => $!final,
+				|($!cost.defined
+					?? (usage => { prompt => 100, completion => 50,
+						cost => $!cost })
+					!! ());
+
+			my @steps = (
+				|($silent
+					?? ()
+					!! ({ content => 'I have to ask',
+						  tool-calls => [tool-call('k1', 'user_ask',
+							'{"question":"which module?"}'),] },)),
+				# The gated round, only when a test asked for one: it is
+				# what makes "the child has NOT finished yet" a fact.
+				|($!finish-gate.defined
+					?? ({ content => 'waiting to be let go',
+						  tool-calls => [tool-call('k2', 'fs_read',
+							'{"path":"a"}'),] },)
+					!! ()),
+				%last,
+			);
+
+			my $backend = scripted-backend(steps => @steps.map({ $_.Hash }).List);
+			my $loop = LLM::Agent::Loop.new(
+				backends => [$backend,], :$provider,
+				|($!cost.defined
+					?? (request-budget => LLM::Agent::RequestBudget.new(
+						default-profile =>
+							LLM::Agent::RequestBudget::Profile.new(
+								context-window => 100_000),
+					))
+					!! ()),
+			);
+			my $run = $loop.run([msg('user', %spec<prompt>),]);
+
+			$!lock.protect: {
+				@!children.push: %( :$agent-id, :$run, :$loop, :$backend );
+			};
+			ChildHandle.new(run => $run, session-path => '');
+		};
+	}
+
+	# One child, asking, on the child's own thread — and blocked there
+	# until the parent (or a cancel) answers it.
+	method !ask(Str:D $agent-id, Str:D $type --> Str:D) {
+		my $gate = $!lock.protect: {
+			%!gates{$agent-id} // %!gates{$type};
+		};
+		await Promise.anyof($gate, Promise.in(TIMEOUT)) with $gate;
+
+		my $promise = $!composer.post-question(
+			$agent-id, message => $!message, schema => %!schema,
+		);
+		$!lock.protect: { @!posted.push: %( :$agent-id, :$promise ) };
+
+		my %outcome = (await $promise).Hash;
+		$!lock.protect: { @!outcomes.push: %( :$agent-id, :%outcome ) };
+		answer-text(%outcome);
+	}
+
+	method children(--> List) { $!lock.protect: { @!children.List } }
+	method posted(--> List) { $!lock.protect: { @!posted.List } }
+	method outcomes(--> List) { $!lock.protect: { @!outcomes.List } }
+
+	method child-of(Str:D $agent-id) {
+		$!lock.protect: { @!children.first({ $_<agent-id> eq $agent-id }) };
+	}
+
+	method promise-of(Str:D $agent-id) {
+		my $found = $!lock.protect: {
+			@!posted.first({ $_<agent-id> eq $agent-id });
+		};
+		$found.defined ?? $found<promise> !! Promise;
+	}
+
+	method outcome-of(Str:D $agent-id) {
+		my $found = $!lock.protect: {
+			@!outcomes.first({ $_<agent-id> eq $agent-id });
+		};
+		$found.defined ?? $found<outcome> !! Nil;
+	}
+}
+
+# A composer wired to a fleet, with the forward declarations both ends
+# need. Answers the composer; the fleet is the caller's.
+sub composer-for(
+	ChildFleet:D $fleet, :$loop-thunk, :$session, *%args,
+	--> LLM::Agent::Subagents:D
+) {
+	my $composer = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), spawn => $fleet.callback,
+		|($loop-thunk.defined ?? (loop => $loop-thunk) !! ()),
+		|($session.defined ?? (:$session) !! ()),
+		|%args,
+	);
+	$fleet.composer = $composer;
+	$composer;
+}
+
+subtest 'a child asks, the parent answers, and the run collects it' => {
+	plan 22;
+
+	# THE WHOLE CYCLE, through a real loop and nothing else: the loop has
+	# no idea any of this is happening, which is the design claim this
+	# subtest exists to prove. An interim result is an ordinary tool
+	# result; task_answer and task_wait are ordinary tool calls.
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => { agent => 'parent' });
+
+	# The child is held open until the parent's `task_wait` has actually
+	# parked on it, so "the wait really waited" is a fact this test
+	# arranges rather than a race it hopes to win: without the gate the
+	# child could finish first and the wait would answer from the cache.
+	my $finish-gate = Promise.new;
+	my $fleet = ChildFleet.new(final => 'reviewed billing/, and it is fine',
+		cost => 0.5e0, :$finish-gate);
+
+	my @park;
+	my @unpark;
+	my $cb-lock = Lock.new;
+
+	my $loop;
+	my $subagents = composer-for(
+		$fleet, loop-thunk => { $loop }, :$session,
+		on-child-park => -> %info {
+			$cb-lock.protect: { @park.push: %info.Hash };
+			try $finish-gate.keep(True) if %info<tool> eq 'task_wait';
+		},
+		on-child-unpark => -> %info {
+			$cb-lock.protect: { @unpark.push: %info.Hash };
+		},
+	);
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'delegating',
+		  usage => { prompt => 10, completion => 5, cost => 0.1e0 },
+		  tool-calls => [task-call('c1', 'reviewer', 'review the payments module'),] },
+		{ content => 'answering it',
+		  usage => { prompt => 10, completion => 5, cost => 0.1e0 },
+		  tool-calls => [answer-call('c2',
+			'{"agent-id":"reviewer-1","answer":"the one under billing/"}'),] },
+		{ content => 'collecting it',
+		  usage => { prompt => 10, completion => 5, cost => 0.1e0 },
+		  tool-calls => [wait-call('c3', 'reviewer-1'),] },
+		{ content => 'the reviewer says billing/ is fine',
+		  usage => { prompt => 10, completion => 5, cost => 0.1e0 } },
+	]);
+	$loop = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => $subagents, :$session,
+		request-budget => LLM::Agent::RequestBudget.new(
+			default-profile => LLM::Agent::RequestBudget::Profile.new(
+				context-window => 100_000),
+		),
+	);
+
+	my $run = $loop.run([msg('user', 'get the payments module reviewed'),]);
+	run-settled($run, 'the delegating run');
+	my @events = drain-events($run);
+	my %outcome = (await $run.result).Hash;
+
+	is %outcome<outcome>, 'completed', 'the parent run completed';
+
+	my @results = events-of(@events, 'tool-result').List;
+	is @results.elems, 3, 'three tool results: the task, the answer, the wait';
+
+	# --- the interim -----------------------------------------------------
+	my $interim = @results[0];
+	nok $interim.is-error,
+		'an interim result is NOT an error: a delegation that has to ask '
+			~ 'something is one working exactly as intended';
+	ok $interim.content.starts-with('STATUS: interim'),
+		'and says so in the first four words, because the one thing a model '
+			~ 'must not do with it is read it as the child’s answer';
+	ok $interim.content.contains('Which one did you mean?'),
+		'it carries the question, in the child’s own words';
+	ok $interim.content.contains('task_answer'),
+		'tells the model how to answer';
+	ok $interim.content.contains('ask the user yourself'),
+		'and what to do when it cannot: escalate WITH the context, rather '
+			~ 'than guess';
+	ok $interim.content.contains('task_wait')
+		&& $interim.content.contains('reviewer-1'),
+		'and how to collect the agent afterwards, by id';
+
+	# --- the answer, and the collection ---------------------------------
+	nok @results[1].is-error, 'the answer was accepted';
+	ok @results[1].content.contains('carries on from where it stopped'),
+		'and says that answering is not collecting';
+
+	nok @results[2].is-error, 'the wait collected the child';
+	is @results[2].content, 'reviewed billing/, and it is fine',
+		'and IS the child’s final message — the same words the original '
+			~ 'task call would have answered with';
+
+	# --- what the child was told ----------------------------------------
+	# The outcome is recorded by the CHILD's own thread, where it wakes from
+	# the vow `task_answer` kept — never the thread that kept it.
+	wait-until({ $fleet.outcome-of('reviewer-1').defined },
+		'the child to record what it was told');
+	is $fleet.outcome-of('reviewer-1')<action>, 'accept',
+		'the child’s own ask returned an elicitation outcome';
+	is $fleet.outcome-of('reviewer-1')<content><answer>,
+		'the one under billing/',
+		'carrying exactly what the parent wrote';
+
+	my $child = $fleet.child-of('reviewer-1');
+	my @child-messages = $child<backend>.recorded-calls[1]<messages>.list;
+	ok @child-messages.first({
+		.role eq 'tool' && .content.contains('the one under billing/');
+	}).defined,
+		'and the child really went on with it: its next request carries the '
+			~ 'answer as the result of the call it was blocked in';
+
+	# --- the transcript --------------------------------------------------
+	my @types = $session.events.map({ $_<type> }).List;
+	is @types.grep({ $_ eq 'subagent-question' }).elems, 1,
+		'one question envelope: delivered once, recorded once';
+	is @types.grep({ $_ eq 'subagent-answered' }).elems, 1,
+		'one answer envelope';
+	is @types.grep({ $_ eq 'subagent-settled' }).elems, 1,
+		'and ONE settle envelope, although two calls waited on this child — '
+			~ 'the interim wait wrote none, and the terminal one wrote it '
+			~ 'exactly once';
+
+	my %question = $session.events.first({
+		$_<type> eq 'subagent-question';
+	})<payload>;
+	is-deeply %question<agent-id call-id>.List, ('reviewer-1', 'c1'),
+		'the question envelope names the agent and the call that carried it';
+
+	my %settled = $session.events.first({
+		$_<type> eq 'subagent-settled';
+	})<payload>;
+	is-deeply %settled<outcome result>.List,
+		('completed', 'reviewed billing/, and it is fine'),
+		'and the settle envelope is the TERMINAL one: the interim wave wrote '
+			~ 'none at all, so what the transcript records is the answer and '
+			~ 'never the question that came before it';
+
+	# --- the bill --------------------------------------------------------
+	is %outcome<spent><cost>, 0.9e0,
+		'the child’s spend was absorbed EXACTLY ONCE: four parent attempts '
+			~ 'at 0.1 plus one child at 0.5, and not 1.4 for a child billed '
+			~ 'twice because two calls waited on it';
+
+	# --- the rails -------------------------------------------------------
+	is-deeply
+		($cb-lock.protect({ @park.map({ $_<tool> }).List }),
+			$cb-lock.protect({ @unpark.map({ $_<outcome> }).List })),
+		(('task', 'task_wait'), ('interim', 'final')),
+		'and the host was told each time a call parked on the child and each '
+			~ 'time one came back, in balance and with what happened';
+};
+
+subtest 'task_answer, in every shape a model calls it in' => {
+	plan 18;
+
+	my $fleet = ChildFleet.new(final => 'done');
+	my $subagents = composer-for($fleet);
+
+	my $batch = start $subagents.execute-tool-calls(
+		[task-call('t1', 'reviewer', 'review it'),],
+	);
+	wait-until({ $subagents.pending-questions.elems == 1 },
+		'the child to ask');
+
+	# The wave that delivers it, so that the answers below are answering a
+	# question the parent has actually been told about.
+	await Promise.anyof($batch, Promise.in(TIMEOUT));
+	is $batch.status, Kept, 'the task call came back with the question';
+
+	sub answer(Str:D $arguments, Str:D $id = 'a1' --> Hash) {
+		$subagents.execute-tool-calls([answer-call($id, $arguments),]).head;
+	}
+
+	# --- the refusals, none of which may drop the question --------------
+	my %junk = answer('{"agent-id":"reviewer-1","answer":"x","scratch":1}');
+	ok %junk<is_error>, 'a junk key is refused, by the same generic check '
+		~ 'the task tool uses';
+	ok %junk<content>.contains(q['scratch']) && %junk<content>.contains('task_answer'),
+		'naming the key and the tool';
+	ok %junk<content>.contains('still waiting'),
+		'and saying that the agent is still blocked, which is the fact that '
+			~ 'decides what the model does next';
+
+	ok answer('{"agent-id":"reviewer-1"}')<is_error>,
+		'an answer with nothing in it is refused';
+	ok answer('{"answer":"x"}')<is_error>,
+		'and so is one that does not say who it is for';
+
+	my %unknown = answer('{"agent-id":"nobody-9","answer":"x"}');
+	ok %unknown<is_error>, 'an agent that does not exist is an error';
+	ok %unknown<content>.contains('no agent called'), 'in those words';
+
+	is $subagents.pending-questions.elems, 1,
+		'and after every one of those refusals the question is STILL parked '
+			~ '— a refused answer must never strand the child that asked';
+	is $subagents.pending-questions[0]<status>, 'delivered',
+		'still delivered, too: a question is carried in full exactly once, '
+			~ 'and a refusal is not a redelivery';
+
+	# --- the answer -----------------------------------------------------
+	my %ok = answer('{"agent-id":"reviewer-1","answer":"the one under billing/"}');
+	nok %ok<is_error>, 'a well-formed answer is accepted';
+	ok %ok<content>.contains('task_wait'),
+		'and points at the tool that collects the agent';
+	is $subagents.pending-questions.elems, 0, 'the question is gone';
+
+	# Kept here, recorded THERE: the child wakes on its own thread, so what
+	# it was told arrives after this call returned rather than during it.
+	wait-until({ $fleet.outcome-of('reviewer-1').defined },
+		'the child to record what it was told');
+	is $fleet.outcome-of('reviewer-1'),
+		%( action => 'accept', content => %( answer => 'the one under billing/' ) ),
+		'and the child was handed an elicitation outcome, in the shape its '
+			~ 'own contract expects';
+
+	my %again = answer('{"agent-id":"reviewer-1","answer":"again"}', 'a2');
+	ok %again<is_error>, 'answering it a second time is an error';
+	ok %again<content>.contains('has not asked anything that is waiting'),
+		'saying that nothing is waiting rather than throwing on a vow that '
+			~ 'has already been kept';
+
+	# --- declining -------------------------------------------------------
+	my $second = ChildFleet.new(final => 'done anyway');
+	my $declining = composer-for($second);
+	my $call = start $declining.execute-tool-calls(
+		[task-call('t1', 'tester', 'test it'),],
+	);
+	wait-until({ $declining.pending-questions.elems == 1 },
+		'the second child to ask');
+	await Promise.anyof($call, Promise.in(TIMEOUT));
+
+	my %declined = $declining.execute-tool-calls([answer-call('d1',
+		'{"agent-id":"tester-1","decline":true,"reason":"the user is asleep"}'),
+	]).head;
+	nok %declined<is_error>, 'a decline is not an error either';
+	wait-until({ $second.outcome-of('tester-1').defined },
+		'the second child to record what it was told');
+	is $second.outcome-of('tester-1')<action>, 'decline',
+		'and reaches the child as a decline, which its elicitation contract '
+			~ 'already has a meaning for';
+
+	# Let both children finish rather than leaving threads parked.
+	$declining.cancel-children;
+	$subagents.cancel-children;
+};
+
+subtest 'a form question is validated against what it asked for' => {
+	plan 8;
+
+	# A child that asked for named fields is answered with named fields,
+	# and a missing one is the model's mistake to fix — not the child's to
+	# find out about halfway through.
+	my $fleet = ChildFleet.new(
+		final => 'done',
+		message => 'Which module, and how deep should the review go?',
+		schema => %(
+			type       => 'object',
+			properties => %(
+				module => %( type => 'string',
+					description => 'The module to review' ),
+				depth  => %( type => 'string',
+					description => 'How deep to go' ),
+			),
+			required   => ('module',),
+		),
+	);
+	my $subagents = composer-for($fleet);
+
+	my $batch = start $subagents.execute-tool-calls(
+		[task-call('t1', 'reviewer', 'review it'),],
+	);
+	wait-until({ $subagents.pending-questions.elems == 1 }, 'the child to ask');
+	await Promise.anyof($batch, Promise.in(TIMEOUT));
+
+	my $interim = $batch.result.head;
+	ok $interim<content>.contains("answer it with 'fields'"),
+		'the interim result says the answer has to be a form';
+	ok $interim<content>.contains('module (string, required)')
+		&& $interim<content>.contains('depth (string)'),
+		'and renders the fields it asked for, required ones marked';
+
+	sub answer(Str:D $arguments, Str:D $id = 'a1' --> Hash) {
+		$subagents.execute-tool-calls([answer-call($id, $arguments),]).head;
+	}
+
+	my %prose = answer('{"agent-id":"reviewer-1","answer":"billing"}');
+	ok %prose<is_error>, 'prose where a form was asked for is refused';
+	ok %prose<content>.contains(q['module']),
+		'naming the fields it wants';
+
+	my %missing = answer('{"agent-id":"reviewer-1","fields":{"depth":"deep"}}');
+	ok %missing<is_error>, 'a form missing a required field is refused';
+	ok %missing<content>.contains(q['module'])
+		&& %missing<content>.contains('still waiting'),
+		'naming the field that is missing, and saying the question survives';
+	is $subagents.pending-questions.elems, 1, 'which it does';
+
+	my %filled = answer(
+		'{"agent-id":"reviewer-1","fields":{"module":"billing","depth":"deep"}}',
+		'a2',
+	);
+	nok %filled<is_error>, 'and a complete form is accepted';
+
+	$subagents.cancel-children;
+};
+
+subtest 'task_wait collects once, and answers the same way for ever' => {
+	plan 9;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => { agent => 'parent' });
+
+	my $fleet = ChildFleet.new(final => 'the tests are green');
+	my $subagents = composer-for($fleet, :$session);
+
+	my $batch = start $subagents.execute-tool-calls(
+		[task-call('t1', 'tester', 'run the tests'),],
+	);
+	wait-until({ $subagents.pending-questions.elems == 1 }, 'the child to ask');
+	await Promise.anyof($batch, Promise.in(TIMEOUT));
+	ok $batch.result.head<content>.starts-with('STATUS: interim'),
+		'the task call came back interim';
+
+	$subagents.execute-tool-calls([answer-call('a1',
+		'{"agent-id":"tester-1","answer":"just the unit ones"}'),]);
+
+	my %first = $subagents.execute-tool-calls(
+		[wait-call('w1', 'tester-1'),],
+	).head;
+	nok %first<is_error>, 'the wait collected it';
+	is %first<content>, 'the tests are green', 'with what the child said';
+	is %first<tool_call_id>, 'w1', 'answering the call that asked';
+
+	my %second = $subagents.execute-tool-calls(
+		[wait-call('w2', 'tester-1'),],
+	).head;
+	is %second<content>, 'the tests are green',
+		'a second wait answers with the same words: a model that collects '
+			~ 'twice has lost the thread, and "no such agent" for an agent '
+			~ 'that answered perfectly well would be a lie';
+	nok %second<is_error>, 'and is not an error';
+	is %second<tool_call_id>, 'w2',
+		'under the id of the call that asked, which is what keeps the '
+			~ 'conversation valid';
+
+	is $session.events.map({ $_<type> })
+		.grep({ $_ eq 'subagent-settled' }).elems, 1,
+		'and still only ONE settle envelope, for three waits on one child';
+
+	my %gone = $subagents.execute-tool-calls(
+		[wait-call('w3', 'nobody-3'),],
+	).head;
+	ok %gone<is_error> && %gone<content>.contains('survived a restart'),
+		'an id that means nothing here says what that usually means, rather '
+			~ 'than parking on something that does not exist';
+};
+
+subtest 'one question releases the whole wave, and the next one waits its turn' => {
+	plan 12;
+
+	# THE WAVE, and why it is one: execute-tool-calls returns ONE List for
+	# the whole batch, so a composer cannot hand back the asking child's
+	# call and keep the others. Every parked call comes back together — the
+	# asker's carrying the question, the rest saying they are still
+	# running and how to collect them.
+	my %gates = reviewer => Promise.new, tester => Promise.new;
+	my $fleet = ChildFleet.new(final => 'done', gates => %gates);
+	my $subagents = composer-for($fleet, max-live => 2);
+
+	my $batch = start $subagents.execute-tool-calls([
+		task-call('t1', 'reviewer', 'review it'),
+		task-call('t2', 'tester', 'test it'),
+	]);
+	wait-until({ $subagents.live-agents.elems == 2 }, 'both children to start');
+
+	# The ids as they were really minted. Two spawns in one batch take the
+	# lock in whatever order the threads got there, so which of them is
+	# `-1` is exactly the thing this test must not assume.
+	my %id-of = $subagents.live-agents
+		.map({ $_<agent-type> => $_<agent-id> }).Hash;
+	my Str $asker = %id-of<reviewer>;
+	my Str $other = %id-of<tester>;
+
+	%gates<reviewer>.keep(True);
+	await Promise.anyof($batch, Promise.in(TIMEOUT));
+	is $batch.status, Kept, 'the batch settled';
+
+	my @results = $batch.result.List;
+	is @results.elems, 2, 'both calls answered, in one List';
+	is @results.map({ $_<tool_call_id> }).List, ('t1', 't2'),
+		'in the caller’s order';
+	nok @results[0]<is_error> || @results[1]<is_error>,
+		'neither is an error';
+	ok @results[0]<content>.starts-with('STATUS: interim')
+		&& @results[1]<content>.starts-with('STATUS: interim'),
+		'and BOTH came back interim: one question releases every call '
+			~ 'parked in the group, because a partial List is not a thing '
+			~ 'this layer can return';
+
+	# WHICH of the two carries it is a scheduling detail — a question from
+	# a child nobody is parked on is delivered by whoever else is waiting —
+	# so what is pinned here is that exactly one of them does.
+	my @carrying = @results.grep({ $_<content>.contains('QUESTION from') });
+	is @carrying.elems, 1,
+		'exactly one of the two delivers the question in full: it is carried '
+			~ 'once, whoever else is waiting';
+	ok @carrying[0]<content>.contains("QUESTION from $asker:")
+		&& @carrying[0]<content>.contains('Which one did you mean?'),
+		'naming the agent that asked, and saying what it asked';
+	ok @results.grep({ $_<content>.contains('Questions still waiting') })
+		.grep({ $_<content>.contains($asker) }).elems == 1,
+		'and the other lists it as still open, so a parent that lost track '
+			~ 'of one turn still has the whole picture';
+	ok @results[0]<content>.contains($asker)
+		&& @results[1]<content>.contains('task_wait')
+		&& @results[1]<content>.contains($other),
+		'each of them says how to collect the child it was waiting for';
+
+	# --- the second question, asked while NOBODY is parked --------------
+	%gates<tester>.keep(True);
+	wait-until({
+		$subagents.pending-questions.grep({ $_<agent-id> eq $other }).elems == 1;
+	}, 'the second child to ask');
+	sub tester-question(--> Hash) {
+		$subagents.pending-questions.first({ $_<agent-id> eq $other });
+	}
+
+	is tester-question()<status>, 'pending',
+		'a question asked while the parent is mid-generation stays PENDING '
+			~ '— there is no call parked to carry it';
+
+	my %collected = $subagents.execute-tool-calls(
+		[wait-call('w1', $other),],
+	).head;
+	ok %collected<content>.starts-with('STATUS: interim')
+		&& %collected<content>.contains('Which one did you mean?'),
+		'and it is delivered at the next park, in full, by the wait that '
+			~ 'would otherwise have blocked on the agent asking it';
+	is tester-question()<status>, 'delivered', 'exactly once';
+
+	$subagents.cancel-children;
+};
+
+subtest 'a mixed batch keeps its inner results and its order' => {
+	plan 5;
+
+	my $fleet = ChildFleet.new(final => 'done');
+	my $inner = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'the file says hello' },
+	);
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => $inner, types => types(), spawn => $fleet.callback,
+		max-live => 2,
+	);
+	$fleet.composer = $subagents;
+
+	my @results = $subagents.execute-tool-calls([
+		tool-call('i1', 'fs_read', '{"path":"a"}'),
+		task-call('t1', 'reviewer', 'review it'),
+		tool-call('i2', 'fs_read', '{"path":"b"}'),
+		task-call('t2', 'tester', 'test it'),
+	]).List;
+
+	is @results.map({ $_<tool_call_id> }).List, ('i1', 't1', 'i2', 't2'),
+		'every call answered, in the caller’s order, whatever order they '
+			~ 'were dispatched in';
+	is @results[0]<content>, 'the file says hello',
+		'the inner results are untouched';
+	is @results[2]<content>, 'the file says hello', 'both of them';
+	ok @results[1]<content>.starts-with('STATUS: interim')
+		&& @results[3]<content>.starts-with('STATUS: interim'),
+		'and both delegations came back interim, because one of the children '
+			~ 'asked while they were both parked';
+	nok @results.grep({ $_<is_error> }).elems,
+		'and nothing in the batch is an error';
+
+	$subagents.cancel-children;
+};
+
+subtest 'every terminal answers the question that was waiting on it' => {
+	plan 12;
+
+	# A parked question is a HOST THREAD blocked on a Promise. Every way
+	# this composer can stop caring about a child has to keep that vow, or
+	# the host waits for ever.
+
+	# --- cancel-children, with a question parked -------------------------
+	my $fleet = ChildFleet.new(final => 'never got there');
+	my $subagents = composer-for($fleet);
+
+	my $batch = start $subagents.execute-tool-calls(
+		[task-call('t1', 'reviewer', 'review it'),],
+	);
+	wait-until({ $subagents.pending-questions.elems == 1 }, 'the child to ask');
+
+	is $subagents.cancel-children, 1, 'the shutdown reaches the child';
+
+	# The composer has the question before the fleet has the Promise it
+	# came back on — two statements on the child's thread, and the sweep
+	# above only needs the first. Reading between them answers a Promise
+	# TYPE OBJECT, which `Promise.anyof` refuses.
+	wait-until({ $fleet.promise-of('reviewer-1') ~~ Promise:D },
+		'the child to record the question it is blocked on');
+	my $posted = $fleet.promise-of('reviewer-1');
+	await Promise.anyof($posted, Promise.in(TIMEOUT));
+	is $posted.status, Kept, 'and the question it was blocked on is settled';
+	is $posted.result<action>, 'cancel',
+		'as a cancel — the one outcome an elicitation contract already means '
+			~ '"nobody answered this"';
+	is $subagents.pending-questions.elems, 0, 'and the table is empty';
+
+	await Promise.anyof($batch, Promise.in(TIMEOUT));
+	is $batch.status, Kept, 'the task call settled rather than hanging';
+
+	# --- a parent that ENDS without collecting ---------------------------
+	my $second = ChildFleet.new(final => 'never got there either');
+	my $loop;
+	my $abandoning = composer-for($second, loop-thunk => { $loop });
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'delegating',
+		  tool-calls => [task-call('c1', 'reviewer', 'review it'),] },
+		# The model reads the interim result and answers the USER instead
+		# of answering the child. The run ends with a child still going.
+		{ content => 'I will get back to you' },
+	]);
+	$loop = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => $abandoning,
+	);
+
+	my $run = $loop.run([msg('user', 'review this'),]);
+	run-settled($run, 'the abandoning run');
+	drain-events($run);
+
+	is (await $run.result)<outcome>, 'completed',
+		'the parent finished, having been told the child was still running';
+
+	wait-until({ $second.promise-of('reviewer-1') ~~ Promise:D },
+		'the abandoned child to record the question it is blocked on');
+	my $stranded = $second.promise-of('reviewer-1');
+	await Promise.anyof($stranded, Promise.in(TIMEOUT));
+	is $stranded.status, Kept,
+		'and the question nobody answered is settled by the run ending: '
+			~ 'nothing can reach that child once its parent’s run is over, '
+			~ 'so a host thread blocked on it would block for ever';
+	is $stranded.result<action>, 'cancel', 'as a cancel';
+
+	my $child = $second.child-of('reviewer-1')<run>;
+	wait-until({ $child.is-done }, 'the abandoned child to stop');
+	ok $child.is-cancelled,
+		'and the child itself was cancelled rather than left running for a '
+			~ 'conversation that is over';
+
+	# --- the benign race: everything settled, and the hook does nothing --
+	my $quiet = ChildFleet.new(final => 'all green', silent => ['tester']);
+	my $tidy-loop;
+	my $tidy = composer-for($quiet, loop-thunk => { $tidy-loop });
+	my $tidy-backend = scripted-backend(steps => [
+		{ content => 'delegating',
+		  tool-calls => [task-call('c1', 'tester', 'test it'),] },
+		{ content => 'the tester says all green' },
+	]);
+	$tidy-loop = LLM::Agent::Loop.new(
+		backends => [$tidy-backend,], provider => $tidy,
+	);
+
+	my $tidy-run = $tidy-loop.run([msg('user', 'test this'),]);
+	run-settled($tidy-run, 'the tidy run');
+	drain-events($tidy-run);
+
+	is (await $tidy-run.result)<outcome>, 'completed', 'the tidy run completed';
+	is (await $quiet.child-of('tester-1')<run>.result)<outcome>, 'completed',
+		'its child completed and was collected in the ordinary way';
+	wait-until({ $tidy.owned-count == 0 }, 'the tidy child to be released');
+	is $tidy.cancel-children, 0,
+		'and the terminal hook found nothing to do: no child, no question, '
+			~ 'nothing cancelled — which is the common case and has to be a '
+			~ 'complete no-op';
+};
+
+subtest 'the park callbacks balance, and post-question refuses as a value' => {
+	plan 12;
+
+	my @park;
+	my @unpark;
+	my $cb-lock = Lock.new;
+	my $fleet = ChildFleet.new(final => 'done');
+	# A grace that is not a race: the wait below wants the child's TERMINAL
+	# outcome, and the poll it sits in reads the result every 50ms. Nothing
+	# waits this long — the poll leaves the moment the result keeps — but a
+	# tenth of a second of margin is a machine's bad afternoon away from
+	# answering 'unstoppable' for a child that stopped exactly as asked.
+	my $subagents = composer-for(
+		$fleet, cancel-grace => 5,
+		on-child-park => -> %info { $cb-lock.protect: { @park.push: %info.Hash } },
+		on-child-unpark => -> %info { $cb-lock.protect: { @unpark.push: %info.Hash } },
+	);
+
+	# --- interim, then a cancelled child --------------------------------
+	my $batch = start $subagents.execute-tool-calls(
+		[task-call('t1', 'reviewer', 'review it'),],
+	);
+	wait-until({ $subagents.pending-questions.elems == 1 }, 'the child to ask');
+	await Promise.anyof($batch, Promise.in(TIMEOUT));
+
+	is $cb-lock.protect({ @park.elems }), 1, 'one park for the task call';
+	is $cb-lock.protect({ @unpark.elems }), 1, 'and one unpark';
+	is $cb-lock.protect({ @unpark[0]<outcome> }), 'interim',
+		'saying the call came back with a question rather than an answer';
+	is $cb-lock.protect({ @park[0]<agent-id> }), 'reviewer-1',
+		'both naming the child';
+	is $cb-lock.protect({ @park[0]<call-id> }), 't1',
+		'and the call that was waiting, which is what joins them to a tool '
+			~ 'card a UI already drew';
+
+	$subagents.cancel-children;
+	my %collected = $subagents.execute-tool-calls(
+		[wait-call('w1', 'reviewer-1'),],
+	).head;
+	ok %collected<is_error>, 'collecting a cancelled child is an error';
+	is $cb-lock.protect({ @park.elems }), 2, 'the wait parked';
+	is $cb-lock.protect({ @unpark.elems }), 2, 'and came back';
+	is $cb-lock.protect({ @unpark[1]<outcome> }), 'final',
+		'with a terminal outcome: the child had a result, cancelled though '
+			~ 'it was';
+
+	# --- a child that is asked to stop and does not ----------------------
+	my $stubborn = LLM::Agent::Run.new(id => 'stubborn-child');
+	my @stubborn-park;
+	my $wedged = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), cancel-grace => 0.15,
+		spawn => -> %spec {
+			ChildHandle.new(run => $stubborn, session-path => '');
+		},
+		on-child-park => -> %info {
+			$cb-lock.protect: { @stubborn-park.push: %info.Hash };
+		},
+		on-child-unpark => -> %info {
+			$cb-lock.protect: { @stubborn-park.push: %info.Hash };
+		},
+	);
+
+	my $stuck = start $wedged.execute-tool-calls(
+		[task-call('t1', 'reviewer', 'review it'),],
+	);
+	wait-until({ $wedged.live-agents.elems == 1 }, 'the stubborn child to start');
+	$wedged.cancel-children;
+	await Promise.anyof($stuck, Promise.in(TIMEOUT));
+
+	ok $stuck.result.head<content>.contains('asked to stop and did not'),
+		'a child that ignores its cancellation is answered without it';
+	is $cb-lock.protect({ @stubborn-park.tail<outcome> }), 'unstoppable',
+		'and the host is told that is what happened, so its accounting '
+			~ 'balances on that path too';
+
+	# --- post-question, refusing as a VALUE ------------------------------
+	my @refusals = (
+		$subagents.post-question('nobody-9', message => 'anyone there?'),
+		$subagents.post-question('reviewer-1', message => '   '),
+	);
+	is-deeply
+		@refusals.map({
+			%( status => $_.status, action => $_.result<action> );
+		}).List,
+		(%( status => Kept, action => 'cancel' ),
+			%( status => Kept, action => 'cancel' )),
+		'a question for an agent nobody owns, and an empty one, come back as '
+			~ 'ALREADY-KEPT cancels: a child asking into the void has to '
+			~ 'carry on or give up, and nothing here can hand it an accept '
+			~ 'it never got';
+};
+
+#|( A session stand-in — which is all the composer asks for: something
+    with C<append-event>. It records every envelope, and, when armed,
+    runs a latch on the question envelope.
+
+    That envelope is written from B<inside> a parked call, after it has
+    read the child's result and decided to come back interim, which is
+    the one place a test can stand in the window the subtest below
+    exists for. )
+class LatchSession {
+	has &.latch is rw;
+	has Bool $.armed is rw = False;
+	has @!events;
+	has Int $!seq = 0;
+	has Lock:D $!lock .= new;
+
+	method append-event(Str:D :$type!, :%payload --> Str:D) {
+		my Str $id = $!lock.protect: {
+			@!events.push: %( :$type, payload => %payload.Hash );
+			'evt-' ~ $!seq++;
+		};
+
+		if $!armed && $type eq 'subagent-question' && &!latch.defined {
+			$!armed = False;
+			&!latch();
+		}
+
+		$id;
+	}
+
+	method events(--> List) { $!lock.protect: { @!events.List } }
+
+	method envelopes(Str:D $type --> List) {
+		self.events.grep({ $_<type> eq $type }).List;
+	}
+}
+
+#|( A loop that remembers what it was billed. The composer type-checks
+    what its `loop` seam answers with, so this is a subclass rather than
+    a duck — and nothing here is ever run: `live-run` is undefined, the
+    emitter refuses, and the composer is driven call by call, which is
+    exactly the shape of a host that owns its own conversation. )
+class RecordingLoop is LLM::Agent::Loop {
+	has @!absorbed;
+	has Lock:D $!absorb-lock .= new;
+
+	method absorb-spend(%spent, Str :$run-id --> Bool:D) {
+		$!absorb-lock.protect: { @!absorbed.push: %spent.Hash };
+		True;
+	}
+
+	method absorbed(--> List) { $!absorb-lock.protect: { @!absorbed.List } }
+}
+
+subtest 'a child that settles under a parked call still writes its terminal' => {
+	plan 11;
+
+	# THE DEFERRAL WINDOW, closed.
+	#
+	# The poll a waiting call sits in reads the child's result BEFORE the
+	# question table, so a child whose result keeps between those two
+	# reads hands its call back with a QUESTION rather than an answer. The
+	# drain that follows then defers its own record to that very call —
+	# the call is still counted as parked, and a parked call is assumed to
+	# be writing the terminal itself — and releases the child a line
+	# later. Nothing else is ever going to write it.
+	#
+	# What that costs, without the re-check on the way out of the park: no
+	# settle envelope for a child that finished, its spend never on the
+	# parent's bill, nothing in the collected cache, and the `task_wait`
+	# the interim just told the model to make answering "no such live
+	# agent" for a child that answered perfectly well.
+	#
+	# The interleaving is ARRANGED, not hoped for: the session latch fires
+	# on the question envelope, which is written from inside the parked
+	# call after it has decided to come back interim, and it does not
+	# return until the child has settled AND been released.
+
+	my $session = LatchSession.new;
+	my $loop = RecordingLoop.new(
+		backends => [scripted-backend(steps => [{ content => 'unused' },]),],
+	);
+
+	my %runs;
+	my $runs-lock = Lock.new;
+	my @park;
+	my $cb-lock = Lock.new;
+
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), max-live => 2, :$session, :$loop,
+		# Children that never answer on their own: this test decides when
+		# a result keeps, down to the statement.
+		spawn => -> %spec {
+			my $run = LLM::Agent::Run.new(id => %spec<agent-id>);
+			$runs-lock.protect: { %runs{%spec<agent-id>} = $run };
+			ChildHandle.new(run => $run, session-path => '');
+		},
+		on-child-park => -> %info {
+			$cb-lock.protect: { @park.push: %info.Hash };
+		},
+	);
+
+	my $batch = start $subagents.execute-tool-calls([
+		task-call('t1', 'reviewer', 'review it'),
+		task-call('t2', 'tester', 'test it'),
+	]);
+	wait-until({ $subagents.live-agents.elems == 2 }, 'both children to start');
+
+	my %id-of = $subagents.live-agents
+		.map({ $_<agent-type> => $_<agent-id> }).Hash;
+	# The child that settles under the park, and the child whose question
+	# releases the call that was parked on it.
+	my Str $settling = %id-of<reviewer>;
+	my Str $asking = %id-of<tester>;
+
+	# Both calls are parked on children that will not answer by themselves,
+	# so a question is the only thing that can hand them back.
+	my $first-question = $subagents.post-question(
+		$asking, message => 'which module did you mean?',
+	);
+	await Promise.anyof($batch, Promise.in(TIMEOUT));
+	is $batch.status, Kept, 'the delegating batch came back';
+
+	# And answered, because a wait that starts with a question already open
+	# comes straight back without ever parking on anything.
+	$subagents.execute-tool-calls([answer-call('a1',
+		'{"agent-id":"' ~ $asking ~ '","answer":"billing"}'),]);
+	is $subagents.pending-questions.elems, 0,
+		'and the question that released it was answered, so the wait below '
+			~ 'really parks';
+
+	my $released = Promise.new;
+	$session.latch = -> {
+		my $child = $runs-lock.protect: { %runs{$settling} };
+		$child._finish(
+			LLM::Agent::Event::RunCompleted.new(final => 'the review is clean'),
+			final => 'the review is clean',
+			spent => %( cost => 0.5e0, prompt-tokens => 100,
+				completion-tokens => 50 ),
+		);
+		# The drain hook defers to the call this is running on — it is
+		# still counted as parked — and then releases the child. Both are
+		# done by the time this returns, which is what makes the window
+		# a fact of this test rather than a coincidence.
+		wait-until({ $subagents.owned-count == 1 },
+			'the settled child to be released under the parked call');
+		$released.keep(True);
+	};
+	$session.armed = True;
+
+	my $wait = start $subagents.execute-tool-calls(
+		[wait-call('w1', $settling),],
+	);
+	wait-until({
+		$cb-lock.protect({ @park.grep({ $_<tool> eq 'task_wait' }).elems == 1 });
+	}, 'the wait to park on the settling child');
+
+	my $second-question = $subagents.post-question(
+		$asking, message => 'and how deep should the review go?',
+	);
+
+	await Promise.anyof($wait, Promise.in(TIMEOUT));
+	is $wait.status, Kept, 'the wait came back';
+	ok $wait.result.head<content>.starts-with('STATUS: interim'),
+		'with the other child’s question rather than with an answer, because '
+			~ 'the poll read the result before the question table and the '
+			~ 'result was still Planned when it did';
+	is $released.status, Kept,
+		'and its own child settled and was released while it was still '
+			~ 'parked, which is the whole of the window';
+
+	my @settled = $session.envelopes('subagent-settled')
+		.grep({ $_<payload><agent-id> eq $settling }).List;
+	is @settled.elems, 1,
+		'ONE settle envelope for the child that settled under the park: the '
+			~ 'call that came back with a question wrote it on the way out, '
+			~ 'because the drain that released the child had already deferred '
+			~ 'to that call and nothing else was ever going to';
+	is-deeply @settled[0]<payload><outcome result>.List,
+		('completed', 'the review is clean'),
+		'the terminal one, in the child’s own words';
+
+	is $loop.absorbed.elems, 1,
+		'and the child’s spend reached the parent’s bill exactly once: a '
+			~ 'terminal that is lost takes the billing with it, and a parent '
+			~ 'whose budget does not see what its subtree spent has no budget';
+	is $loop.absorbed[0]<cost>, 0.5e0, 'all of it, and once';
+
+	# THE POINT OF ALL OF IT: the interim result told the model to collect
+	# this agent with task_wait, and that call has to work.
+	my %collected = $subagents.execute-tool-calls(
+		[wait-call('w2', $settling),],
+	).head;
+	nok %collected<is_error>,
+		'the task_wait the interim told the model to make is answered rather '
+			~ 'than refused';
+	is %collected<content>, 'the review is clean',
+		'from the collected cache, with the child’s final message — not "no '
+			~ 'such live agent" for a child that finished perfectly well';
+
+	$subagents.cancel-children;
+};

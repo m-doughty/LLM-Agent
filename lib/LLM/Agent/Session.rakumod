@@ -126,9 +126,26 @@ depth        | C<$message.depth>, when defined
 =end table
 
 C<:%extra> is how the loop records the things that are worth reading but
-are not part of what gets sent back to a model: C<reasoning> (the
-thinking trace), C<usage> (what the provider billed for the turn),
-C<is-error> (a tool result that failed). They are B<replay-visible> —
+are not part of what gets sent back to a model:
+
+=begin table
+
+Extra         | On           | What it is
+==============|==============|=================================================
+reasoning     | assistant    | the thinking trace, when the model exposed one
+finish-reason | assistant    | how the provider said generation ended ('stop', 'tool_calls', …)
+usage         | assistant    | what the provider billed for the turn
+is-error      | tool result  | True when the tool answered with a failure
+
+=end table
+
+C<finish-reason> is the provider's own account of why the turn stopped,
+kept because a transcript is the only place a truncation nobody caught
+can still be seen afterwards. A turn only reaches the transcript once the
+loop's clip gate has cleared it (see L<LLM::Agent::Loop>), so the reason
+recorded here is one the billed tokens agree with.
+
+They are B<replay-visible> —
 C<events> shows them — and B<dropped when rebuilding Messages>, because a
 Message has nowhere to put them and inventing somewhere would change what
 the next request looks like.
@@ -151,12 +168,41 @@ C<replaces-through-id> (the envelope id of the last message it replaces),
 C<tokens-before>, C<tokens-after>, C<fallback> (True when the summarizer
 could not be reached and the middle was hard-trimmed instead).
 
+=head3 type: elision
+
+The record that replaces the B<content> of messages already in this
+transcript with stubs, and changes nothing else about them:
+C<< items => [ { id, stub }, ... ] >>, where C<id> is the envelope id of
+the message being stubbed.
+
+This is what L<LLM::Agent::Compactor>'s observation aging produces — old
+tool results elided in place rather than summarized away, at a fraction of
+the cost and with no risk to C<tool_calls> pairing (see that class's Pod).
+The message stays where it is, keeps its role, its C<tool_call_id> and its
+stickiness flags, and only its content is lighter.
+
+Unlike a compaction, an elision B<adds and removes nothing>: C<messages>
+has the same length afterwards, and C<message-ids> is untouched. It is
+therefore the one envelope that rewrites something the file already said,
+which is exactly why it names ids rather than positions — and why an id it
+cannot resolve is fatal, for the same reason a compaction's
+C<replaces-through-id> naming nothing is.
+
+The original result is B<still in the file>, on the C<message> line it was
+written on. A transcript is a record of what happened; the elision is a
+record of what the model was shown afterwards, and reading the file tells
+you both.
+
 =head3 type: tool-dispatched / tool-settled
 
 The two halves of one B<tool operation> (see
-L<LLM::Agent::ToolOperation>): the moment a call was handed to the
-provider, and the moment the loop found out — or gave up finding out —
-what it did.
+L<LLM::Agent::ToolOperation>): the moment a call was prepared for provider
+dispatch, and the moment the loop found out — or gave up finding out — what
+it did. C<tool-dispatched> does B<not> prove the provider received the call:
+the envelope is deliberately durable immediately before the call crosses that
+boundary, and a process death between those operations is indistinguishable
+from one immediately after it. It therefore means “may have reached the
+provider”, never “definitely ran”.
 
 C<tool-dispatched> carries C<call-id> (the model's C<tool_calls> id),
 C<tool>, C<arguments> (canonicalised), C<arguments-digest>,
@@ -333,6 +379,35 @@ written by a newer LLM::Agent still replays as far as this one
 understands it. An unknown C<v> is fatal: the envelope itself is the one
 thing that cannot be guessed at.
 
+=head2 Reading one without opening it
+
+C<load> is for carrying a conversation on: it repairs the crash tail,
+replays every envelope, and keeps an append handle. Two callers want
+neither half of that.
+
+=item A B<crash repair> reading a I<child's> transcript to find out
+whether the agent that was working when the lights went out ever
+finished. It has no business appending to somebody else's file, and a
+transcript it cannot parse is a fact to report rather than an exception
+to throw.
+
+=item A B<viewer> watching a transcript that is B<still being written>.
+Repairing that file would truncate the line its own writer is halfway
+through, and a second append handle on one transcript is how a
+conversation ends up interleaved with itself.
+
+C<peek> is for those: C<< Session.peek(:$path) >> reads the bytes, parses
+what parses, and answers
+C<< { path, size, meta, envelopes, messages, warnings, error? } >>
+without writing a byte. C<envelopes> is every line that parsed, in the
+shape C<events> gives; C<messages> is the C<message> lines as Messages.
+
+B<In file order, with no replay>: a compaction is not applied, an elision
+is not applied, and a malformed line is skipped with a warning rather
+than being cut off the end of the file. C<load> answers "what would the
+model be sent next?"; C<peek> answers "what does this file actually
+say?", which is the question a repair and a viewer are both asking.
+
 =head2 How compaction replays
 
 C<messages> is not "every message line". Applying a compaction means:
@@ -355,6 +430,29 @@ with when it stopped.
 
 A compaction whose C<replaces-through-id> names nothing is fatal, for the
 same reason a mid-file malformed line is.
+
+=head3 ...and how an elision replays beside it
+
+An C<elision> line replaces the content of the messages its C<items> name,
+by B<id>, wherever they are in the conversation as it stands B<at that
+point in the file>. Both kinds of envelope are applied in B<file order>,
+which is what makes them compose in either direction:
+
+=item an elision, then a compaction: the compaction summarizes a middle
+that already holds the stubs, which is precisely what the live run's
+summarizer was shown;
+
+=item a compaction, then an elision: the elision may name a message the
+compaction kept — including, in principle, the summary itself, which
+replays under the compaction envelope's own id.
+
+An elision naming an id the live message set does not have is B<fatal>,
+with the same posture and for the same reason as a compaction naming
+nothing: the alternative is a resumed conversation that silently differs
+from the one the run was working with. Note that this is a statement about
+the messages that are B<still there> — an id that a later compaction
+replaced is gone, so an elision must be written B<before> it, which is the
+order L<LLM::Agent::Loop> writes them in.
 
 =head2 Ids, and why you may want them
 
@@ -395,8 +493,8 @@ our constant ENVELOPE-VERSION = 1;
 #| The types this class understands. Anything else is preserved by
 #| C<events> and ignored by the readers.
 our constant KNOWN-TYPES =
-	<session-meta message grants compaction tool-dispatched tool-settled
-		run-context>.Set;
+	<session-meta message grants compaction elision tool-dispatched
+		tool-settled run-context>.Set;
 
 #|( The outcomes a C<tool-settled> line may carry. C<outcome-unknown> is
     not an error and never becomes one: see L<LLM::Agent::ToolOperation>. )
@@ -598,6 +696,117 @@ method load(
 	$session;
 }
 
+#|( Look at a transcript B<without touching it>: nothing is repaired,
+    nothing is opened for append, and nothing is written. The answer is
+    plain data —
+
+    =item C<path> — the C<IO::Path> it was read from.
+    =item C<size> — its size in bytes at the moment it was read.
+    =item C<meta> — the C<session-meta> payload, or an empty Hash.
+    =item C<envelopes> — every line that parsed, in B<file order>, in the
+          shape C<events> hands back.
+    =item C<messages> — the C<message> lines as Messages, in B<file
+          order>.
+    =item C<warnings> — one line per line that would not parse.
+    =item C<error> — present B<only> when there is nothing to read at
+          all: no file, an empty one, or a first line that is not a
+          C<session-meta>. The other keys are still there and still safe.
+
+    B<Raw file order, and no replay.> C<messages> here is every message
+    line the file holds — a compaction is B<not> applied, an elision is
+    B<not> applied, and nothing is refused. That is the difference
+    between this and C<load>, and it is the point of it: C<load> answers
+    "what would the model be sent next?", and this answers "what does
+    this file actually say?".
+
+    B<Never throws>, and tolerant by design. A malformed line is skipped
+    with a warning rather than being repaired off the end of the file,
+    because the two callers this exists for are precisely the ones that
+    must not write: a B<crash repair> reading a dead child's transcript
+    to find out whether it finished (see the C<tool-dispatched> taxonomy
+    above — the same not-knowing, one layer out), and a B<viewer> on a
+    transcript that is still being written, where the half-line at the
+    end is the writer mid-append and not damage.
+
+    Use C<load> when you mean to carry the conversation on. Use this when
+    you mean to look. )
+method peek(
+	LLM::Agent::Session:U:
+	IO(Cool) :$path!,
+	--> Hash:D
+) {
+	my %read =
+		path      => ($path.defined ?? $path.IO !! IO::Path),
+		size      => 0,
+		meta      => %(),
+		envelopes => (),
+		messages  => (),
+		warnings  => (),
+	;
+
+	unless $path.defined && $path.IO.e && $path.IO.f {
+		%read<error> = 'there is no transcript at '
+			~ ($path.defined ?? $path.Str !! '(nowhere)');
+		return %read;
+	}
+
+	my @lines;
+	my @bad;
+	{
+		# A file that is deleted, replaced or made unreadable between the
+		# test above and the read is an ordinary race with another
+		# terminal, not an exception for the caller to handle.
+		CATCH {
+			default {
+				%read<error> = 'the transcript could not be read: '
+					~ (.message.lines.head // .^name);
+			}
+		}
+		%read<size> = ($path.IO.s // 0).Int;
+		my $reader = JSONL::Reader.new(path => $path.IO, :lenient);
+		@lines = $reader.list;
+		# Populated only once the lazy Seq has been walked, which the
+		# `.list` above has just done.
+		@bad = $reader.warnings.list;
+	}
+	return %read if %read<error>.defined;
+
+	my @envelopes;
+	my @messages;
+	for @lines -> $line {
+		my $value = $line.value;
+		# A line that is not a JSON object, or has no type, is not an
+		# envelope. `load` dies on one; this is not the reader that gets
+		# to decide a file is broken.
+		next unless $value ~~ Associative;
+		my %envelope = $value.Hash;
+		next unless %envelope<type> ~~ Str:D;
+
+		@envelopes.push: %envelope;
+		given %envelope<type>.Str {
+			when 'session-meta' {
+				%read<meta> = payload-of(%envelope) unless %read<meta>.elems;
+			}
+			when 'message' {
+				@messages.push: message-from(payload-of(%envelope));
+			}
+		}
+	}
+
+	%read<envelopes> = @envelopes.List;
+	%read<messages>  = @messages.List;
+	%read<warnings>  = @bad.map({
+		'line ' ~ $_.line-number ~ ' could not be read, and was skipped';
+	}).List;
+
+	%read<error> = 'this is not a transcript: its first line is not a '
+		~ 'session-meta line'
+		unless @envelopes.elems
+			&& @envelopes[0]<type>.Str eq 'session-meta';
+
+	%read;
+}
+
 # Where the good prefix is staged during a repair. A sibling, so the
 # rename that follows stays inside one directory — and therefore inside
 # one filesystem, which is what makes it atomic.
@@ -633,7 +842,25 @@ method !repair-tail(--> Int:D) {
 	my Int $start = last-break($text, $end - 1) + 1;
 
 	my Str $tail = $text.substr($start, $end - $start);
-	return $count if line-is-whole($tail);
+	if line-is-whole($tail) {
+		return $count if $ends-broken;
+
+		# A complete JSON envelope without its trailing line break is valid
+		# JSON but not yet append-safe: JSONL::Writer would put the next
+		# envelope directly against its closing brace. Stage the exact bytes
+		# plus the transcript's established EOL and atomically replace the
+		# original before append mode is opened.
+		my Int $previous-lf = (^$size).reverse.first({ $bytes[$_] == 0x0A })
+			// -1;
+		my @eol = $previous-lf > 0 && $bytes[$previous-lf - 1] == 0x0D
+			?? (0x0D, 0x0A)
+			!! (0x0A,);
+		my $mode = $!path.mode;
+		$repair.spurt(Buf.new(|$bytes.list, |@eol), :bin);
+		$repair.chmod($mode);
+		$repair.rename($!path);
+		return $count;
+	}
 
 	# One malformed line is a crash; two is damage. Repairing a line per
 	# load would eat a damaged file backwards, one resume at a time, and
@@ -782,6 +1009,40 @@ method append-compaction(
 	%payload<tokens-after>  = $tokens-after  if $tokens-after.defined;
 
 	self!append('compaction', %payload);
+}
+
+#|( Record that the B<content> of messages already in this transcript has
+    been replaced by stubs — L<LLM::Agent::Compactor>'s observation aging.
+    Returns the envelope id.
+
+    C<@items> is a list of C<< { id, stub } >> hashes, where C<id> is the
+    envelope id of the message being stubbed: exactly what
+    C<< %result<elisions> >> becomes once a caller has turned its indices
+    into ids. Nothing but the content changes — the message keeps its
+    place, its role, its C<tool_call_id> and its stickiness.
+
+    Refused, B<before anything is written>, if an item is not a
+    C<< { id, stub } >> pair or if its id is not a message this transcript
+    still has: an elision that cannot be applied on replay would make a
+    resumed conversation silently differ from the one the run had. An empty
+    C<@items> is refused too — a line that changes nothing is not worth the
+    bytes, and an aging pass that elided nothing should not be writing one. )
+method append-elision(:@items! --> Str:D) {
+	die 'LLM::Agent::Session.append-elision: items cannot be empty — an '
+		~ 'elision that stubs nothing changes nothing'
+		unless @items.elems;
+
+	self!append('elision', %(
+		items => @items.map(-> $item {
+			die 'LLM::Agent::Session.append-elision: every item is a '
+				~ '{ id, stub } hash; got a ' ~ $item.^name
+				unless $item ~~ Associative;
+			%(
+				id   => ($item<id> // '').Str,
+				stub => ($item<stub> // '').Str,
+			);
+		}).List,
+	));
 }
 
 #|( Record that a tool call has been handed to the provider, and return
@@ -1118,6 +1379,9 @@ method !validate(%envelope, Int :$line-number --> Nil) {
 	if %envelope<type> eq 'compaction' {
 		self!compaction-cut(%envelope, payload-of(%envelope), :$line-number);
 	}
+	if %envelope<type> eq 'elision' {
+		self!elision-targets(%envelope, payload-of(%envelope), :$line-number);
+	}
 	if %envelope<type> eq 'tool-settled' {
 		self!settle-target(%envelope, payload-of(%envelope), :$line-number);
 	}
@@ -1147,6 +1411,22 @@ method !apply(%envelope --> Nil) {
 		}
 		when 'compaction' {
 			self!apply-compaction(%envelope, %payload);
+		}
+		when 'elision' {
+			# `!validate` has already proved every id resolves — in
+			# `!append` before the write, in `!replay` a line earlier.
+			#
+			# `.clone`, not a rebuilt Message: an elision changes the
+			# content and NOTHING else, and cloning is the only version of
+			# that sentence which stays true when LLM::Chat's Message grows
+			# an attribute. The checksum is cleared because it is a memo of
+			# the content that has just gone.
+			for self!elision-targets(%envelope, %payload).list -> %target {
+				@!entries[%target<index>]<message> =
+					@!entries[%target<index>]<message>.clone(
+						content => %target<stub>, checksum => Str,
+					);
+			}
 		}
 		when 'tool-dispatched' {
 			# Into %!tool-ops, never into @!entries: an operation is not a
@@ -1245,6 +1525,51 @@ method !compaction-cut(%envelope, %payload, Int :$line-number --> Int:D) {
 		unless $cut.defined;
 
 	$cut;
+}
+
+#|( Which entries an C<elision> line stubs, as
+    C<< [ { index, stub }, ... ] >> — or a death saying why it stubs
+    nothing. The C<!compaction-cut> precedent again: one place decides,
+    so C<!validate> and the fold in C<!apply> can never disagree about
+    whether an elision is legal.
+
+    An id that is not in the live message set is fatal. Structurally
+    unrecognisable C<items> are fatal too, but an B<empty> list is not: the
+    appender refuses one, and a line some other tool wrote with nothing in
+    it applies nothing — the same posture the rest of replay takes towards
+    payload shape. )
+method !elision-targets(%envelope, %payload, Int :$line-number --> List:D) {
+	my $where = $line-number.defined
+		?? "line $line-number of {$!path}"
+		!! 'this session';
+
+	my $items = %payload<items>;
+	die "LLM::Agent::Session: the elision at $where has no items list"
+		unless $items ~~ Positional;
+
+	$items.list.kv.map(-> Int $position, $item {
+		die "LLM::Agent::Session: item $position of the elision at $where is "
+			~ 'not a { id, stub } object'
+			unless $item ~~ Associative;
+
+		my $id = $item<id>;
+		die "LLM::Agent::Session: item $position of the elision at $where has "
+			~ 'no id'
+			unless $id ~~ Str:D && $id.chars;
+
+		die "LLM::Agent::Session: item $position of the elision at $where has "
+			~ 'no stub'
+			unless $item<stub> ~~ Str:D;
+
+		my $index = @!entries.first({ $_<id> eq $id }, :k);
+		die "LLM::Agent::Session: the elision at $where stubs '$id', which is "
+			~ 'not a message this transcript still has — either the id was '
+			~ 'never written, or a compaction replaced it before this line '
+			~ 'claimed to rewrite it'
+			unless $index.defined;
+
+		%( index => $index, stub => $item<stub>.Str );
+	}).eager.List;
 }
 
 #|( Which tool operation a C<tool-settled> line settles — or a death

@@ -11,7 +11,7 @@ use LLM::Chat::Conversation::Message;
 # what the conversation looks like afterwards, and the four ways the loop
 # refuses to go round for ever.
 
-plan 15;
+plan 18;
 
 my @prompt = [msg('user', 'what is in a.txt?'),];
 
@@ -127,7 +127,8 @@ subtest 'a composed provider reaches the backend as one catalogue' => {
 	run-settled($run, 'the composed run');
 
 	my @declared = $backend.recorded-calls[0]<tools>.list;
-	is @declared.map({ $_<function><name> }).List, ('fs_read', 'task'),
+	is @declared.map({ $_<function><name> }).List,
+		('fs_read', 'task', 'task_answer', 'task_wait'),
 		"the backend is declared the inner provider's tools AND the "
 			~ "composer's own, in one list";
 	is @declared[1]<function><parameters><properties><agent-type><enum>.List,
@@ -649,4 +650,182 @@ subtest 'malformed calls from the model do not derail the loop' => {
 	ok events-of(@events, 'tool-result').head.is-error,
 		'and the provider refuses it rather than throwing';
 	is (await $run.result)<outcome>, 'completed', 'the run finishes normally';
+};
+
+subtest 'the guard’s default is thirty, and thirty is a number with a reason' => {
+	plan 4;
+
+	# Nothing set: this is the DEFAULT, and the point of pinning it here
+	# is that three could not tell a loop from patience. Thirty-one
+	# identical calls in one batch still trip it, because a model really
+	# going round in circles does it as happily thirty times as four.
+	my $backend = scripted-backend(steps => [
+		{ content => 'reading it thirty-one times',
+		  'tool-calls' => (^31).map({
+			tool-call("c$_", 'fs_read', '{"path":"a.txt"}');
+		  }).List },
+		{ content => 'answering from what I have' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'hello' },
+	);
+
+	my $run = LLM::Agent::Loop.new(backends => [$backend,], :$provider).run(@prompt);
+	run-settled($run, 'the thirty-one-times run');
+
+	my $limit = events-of(drain-events($run), 'limit-reached').head;
+	ok $limit.defined, 'a batch past the default trips the guard';
+	is $limit.limit, 'identical-calls', 'by name';
+	is $limit.max, 30,
+		'and the default is 30 — three fired on the fourth honest repeat of '
+			~ 'a lease retry or a verification re-read';
+	is $provider.recorded-calls.elems, 0, 'the batch is refused whole';
+};
+
+subtest 'a tool whose repetition is a protocol is exempt from the guard' => {
+	plan 8;
+
+	my sub lock-tool(--> Hash) {
+		tool-decl('lock_acquire', 'Take a lease',
+			{ path => { type => 'string' } }, required => ['path']);
+	}
+
+	# --- Forty of the same exempt call, in one batch. -------------------
+	#
+	# The batch counts against ITSELF, so forty identical calls in one
+	# turn is the hardest case there is: at the default of 30 this is ten
+	# past the limit, and an exemption that only skipped the trip (and
+	# still counted) would fire on the thirty-first.
+	my $backend = scripted-backend(steps => [
+		{ content => 'polling the lease',
+		  'tool-calls' => (^40).map({
+			tool-call("c$_", 'lock_acquire', '{"path":"a.txt"}');
+		  }).List },
+		{ content => 'got it' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [lock-tool(),], results => { lock_acquire => 'taken' },
+	);
+
+	my $run = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider,
+		identical-call-exempt => ['lock_acquire',],
+	).run(@prompt);
+	run-settled($run, 'the polling run');
+
+	is events-of(drain-events($run), 'limit-reached').elems, 0,
+		'forty identical calls to an exempt tool are forty polls, not a loop';
+	is $provider.recorded-calls.elems, 40, 'and every one of them ran';
+
+	# --- The tool next to it is counted exactly as it was. --------------
+	#
+	# Five exempt calls and three identical fs_reads at a limit of 2. The
+	# fs_reads trip; the exempt calls neither trip nor walk the tally up
+	# under them (they are skipped BEFORE the counting), which is what
+	# makes the count reported the fs_reads' own.
+	my $mixed-backend = scripted-backend(steps => [
+		{ content => 'a lock and some reads',
+		  'tool-calls' => (
+			|(^5).map({ tool-call("l$_", 'lock_acquire', '{"path":"a.txt"}') }),
+			|(^3).map({ tool-call("r$_", 'fs_read', '{"path":"a.txt"}') }),
+		  ).List },
+		{ content => 'answering' },
+	]);
+	my $mixed = ScriptedProvider.new(
+		tools => [lock-tool(), read-tool(),],
+		results => { lock_acquire => 'taken', fs_read => 'hello' },
+	);
+
+	my $mixed-run = LLM::Agent::Loop.new(
+		backends => [$mixed-backend,], provider => $mixed,
+		max-identical-calls => 2,
+		identical-call-exempt => ['lock_acquire',],
+	).run(@prompt);
+	run-settled($mixed-run, 'the mixed batch');
+
+	my $limit = events-of(drain-events($mixed-run), 'limit-reached').head;
+	ok $limit.defined, 'the non-exempt tool in the batch still trips';
+	is $limit.count, 3,
+		'counting ITS repeats — the five exempt calls beside it are not in '
+			~ 'the tally';
+	is $mixed.recorded-calls.elems, 0,
+		'and the batch is refused whole, exempt calls and all: a limit is '
+			~ 'checked before anything is committed';
+
+	# --- A glob, and the tools it does not reach. -----------------------
+	my $glob-backend = scripted-backend(steps => [
+		{ content => 'polling twice',
+		  'tool-calls' => [
+			tool-call('l1', 'lock_acquire', '{"path":"a.txt"}'),
+			tool-call('l2', 'lock_acquire', '{"path":"a.txt"}'),
+		  ] },
+		{ content => 'done' },
+	]);
+	my $glob-provider = ScriptedProvider.new(
+		tools => [lock-tool(),], results => { lock_acquire => 'taken' },
+	);
+	my $glob-run = LLM::Agent::Loop.new(
+		backends => [$glob-backend,], provider => $glob-provider,
+		max-identical-calls => 1,
+		identical-call-exempt => ['lock_*',],
+	).run(@prompt);
+	run-settled($glob-run, 'the globbed run');
+
+	is events-of(drain-events($glob-run), 'limit-reached').elems, 0,
+		'a trailing-* prefix glob exempts the family, as every pattern here does';
+
+	# --- And the option left out is the loop nobody changed. ------------
+	my $control-backend = scripted-backend(steps => [
+		{ content => 'polling twice',
+		  'tool-calls' => [
+			tool-call('l1', 'lock_acquire', '{"path":"a.txt"}'),
+			tool-call('l2', 'lock_acquire', '{"path":"a.txt"}'),
+		  ] },
+		{ content => 'done' },
+	]);
+	my $control = ScriptedProvider.new(
+		tools => [lock-tool(),], results => { lock_acquire => 'taken' },
+	);
+	my $control-run = LLM::Agent::Loop.new(
+		backends => [$control-backend,], provider => $control,
+		max-identical-calls => 1,
+	).run(@prompt);
+	run-settled($control-run, 'the unexempted run');
+
+	is events-of(drain-events($control-run), 'limit-reached').head.limit,
+		'identical-calls',
+		'with no exemption the same two calls are the loop they always were';
+	is $control.recorded-calls.elems, 0, 'and neither of them ran';
+};
+
+subtest 'the exemption refuses a rule hash at construction' => {
+	plan 3;
+
+	my $backend = scripted-backend(steps => [{ content => 'hi' },]);
+	my $provider = ScriptedProvider.new(tools => [read-tool(),]);
+
+	throws-like {
+		LLM::Agent::Loop.new(
+			backends => [$backend,], :$provider,
+			identical-call-exempt => [{ tool => 'lock_acquire' },],
+		);
+	}, Exception, message => /'not a tool-name pattern'/,
+		'a rule hash — the shape idempotency-rules takes — is refused while '
+			~ 'somebody is looking at the config';
+
+	throws-like {
+		LLM::Agent::Loop.new(
+			backends => [$backend,], :$provider,
+			identical-call-exempt => ['',],
+		);
+	}, Exception, message => /'not a tool-name pattern'/,
+		'and so is an empty pattern, which would match nothing and look '
+			~ 'exactly like the option being ignored';
+
+	lives-ok {
+		LLM::Agent::Loop.new(
+			backends => [$backend,], :$provider,
+			identical-call-exempt => ['lock_acquire', 'lock_*'],
+		);
+	}, 'a list of names and globs is what it takes';
 };

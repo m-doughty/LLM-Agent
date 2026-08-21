@@ -44,7 +44,7 @@ a seam rather than a function.
 
 =head2 The role
 
-One required method, and three with an answer already:
+One required method, and four with an answer already:
 
 =item C<count-messages(@messages --> Int)> — required. How many tokens
 this conversation is worth.
@@ -67,13 +67,23 @@ C<count-messages> and is right for any counter that is a pure function of
 its input; C<Usage> overrides it (see below), and so must any other
 implementation that keeps state per call.
 
+=item C<count-request(@messages, :@tools, :$context-head, :$context-tail
+--> Int)> — the complete request the provider tokenizes. The default keeps
+older counters source-compatible by composing C<count-messages> with
+C<count-text> over each defined context half and the compact JSON tool
+catalogue. C<Exact> delegates to the wrapped tokenizer's
+C<get-request-count> when it provides one, retaining the component fallback
+for older tokenizer objects. C<Usage> treats calibrated provider prompt
+tokens as the whole request already and estimates only an appended history
+tail, so context and tools are never charged twice.
+
 =item C<invalidate(--> Nil)> — throw away whatever has been learned. A
-no-op on C<Heuristic> and C<Exact>, which learn nothing. The loop calls it
-at the start of a run whose B<run context differs from the previous
-run's>: a calibration recorded against a request carrying yesterday's
-context is a confident number about a prompt nobody is sending any more,
-and one round of honest estimation beats it. At most one drop per run
-boundary, and none at all for a run that reuses the same context.
+no-op on C<Heuristic> and C<Exact>, which learn nothing. Before each backend
+preflight the loop compares the selected counter's request shape: model,
+runtime context and tool catalogue. A change invalidates the calibration;
+rewritten or compacted history is detected independently by the calibrated
+prefix digest. Appended history deliberately keeps the calibration and is
+estimated as a delta.
 
 The loop owns exactly one counter instance and hands the B<same> one to
 its compactor, so the calibration a run accumulates is not thrown away at
@@ -104,10 +114,11 @@ inside a per-round compaction check is not free.
 
 C<record-usage> remembers one record: the message count C<N> and the
 prompt tokens C<P> the provider charged for it, B<the digest of the
-messages it charged for>, and B<which model charged>. C<P> covers
-C<@messages[0 ..^ N]> — every message that existed when the request went
-out, including the system prompt and the provider's own template framing,
-which is precisely the part a heuristic is worst at.
+messages it charged for>, and B<which model charged>. C<P> covers the
+whole request whose history prefix is C<@messages[0 ..^ N]> — including
+runtime context, tools and the provider's own template framing, precisely
+the parts a heuristic is worst at. The loop therefore invalidates it when
+those non-history parts change.
 
 C<count-messages(@messages)> then answers:
 
@@ -238,6 +249,26 @@ role LLM::Agent::TokenCount {
 		]);
 	}
 
+	#|( How many tokens one complete provider request is worth: conversation,
+	    runtime context and tool catalogue together. The default composes the
+	    older public counting surface, so existing counters remain valid and
+	    stateful counters may keep C<count-text> calibration-neutral.
+
+	    Tokenizer-backed implementations should override this when their
+	    tokenizer can render the provider's real request template; see
+	    C<Exact>. Undefined context halves and an empty tool list cost zero. )
+	method count-request(
+		@messages, :@tools = (), Str :$context-head, Str :$context-tail,
+		--> Int
+	) {
+		my Int $tokens = self.count-messages(@messages);
+		$tokens += self.count-text($context-head) if $context-head.defined;
+		$tokens += self.count-text($context-tail) if $context-tail.defined;
+		$tokens += self.count-text(to-json(@tools.List, :!pretty))
+			if @tools.elems;
+		$tokens;
+	}
+
 	#|( Throw away whatever this counter has learned, if it learns
 	    anything. A no-op by default.
 
@@ -284,6 +315,27 @@ class LLM::Agent::TokenCount::Exact does LLM::Agent::TokenCount {
 
 	method count-messages(@messages --> Int) {
 		$!counter.get-conversation-count(@messages).Int;
+	}
+
+	method count-request(
+		@messages, :@tools = (), Str :$context-head, Str :$context-tail,
+		--> Int
+	) {
+		return $!counter.get-request-count(
+			@messages, :@tools,
+			|($context-head.defined ?? (:$context-head) !! ()),
+			|($context-tail.defined ?? (:$context-tail) !! ()),
+		).Int if $!counter.can('get-request-count');
+
+		# Older LLM::Chat counters know only conversations. Keep their exact
+		# conversation answer and weigh the framing through the same
+		# backwards-compatible component fallback as the role default.
+		my Int $tokens = self.count-messages(@messages);
+		$tokens += self.count-text($context-head) if $context-head.defined;
+		$tokens += self.count-text($context-tail) if $context-tail.defined;
+		$tokens += self.count-text(to-json(@tools.List, :!pretty))
+			if @tools.elems;
+		$tokens;
 	}
 }
 
@@ -441,6 +493,48 @@ class LLM::Agent::TokenCount::Usage does LLM::Agent::TokenCount {
 			else {
 				$!known-tokens
 					+ $!fallback.count-messages(@messages[$!known-messages .. *-1].List);
+			}
+		};
+	}
+
+	#|( Count a full request without charging its unchanged context and tool
+	    framing twice. Provider prompt usage already includes both. While a
+	    calibration matches, only appended conversation messages are added;
+	    without one (or after a history mismatch) the fallback weighs the
+	    complete request. The loop invalidates this counter when the selected
+	    model, runtime context or tool catalogue changes. )
+	method count-request(
+		@messages, :@tools = (), Str :$context-head, Str :$context-tail,
+		--> Int
+	) {
+		my Int $elems = @messages.elems;
+
+		$!lock.protect: {
+			if !$!known-messages.defined {
+				$!fallback.count-request(
+					@messages, :@tools, :$context-head, :$context-tail,
+				);
+			}
+			elsif $elems < $!known-messages {
+				self!forget;
+				$!fallback.count-request(
+					@messages, :@tools, :$context-head, :$context-tail,
+				);
+			}
+			elsif $!known-digest.defined
+				&& messages-digest(@messages[0 ..^ $!known-messages].List)
+					ne $!known-digest
+			{
+				self!forget;
+				$!fallback.count-request(
+					@messages, :@tools, :$context-head, :$context-tail,
+				);
+			}
+			else {
+				$!known-tokens
+					+ $!fallback.count-messages(
+						@messages[$!known-messages .. *-1].List,
+					);
 			}
 		};
 	}

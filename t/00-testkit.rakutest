@@ -12,7 +12,7 @@ use LLM::Chat::Conversation::Message;
 # the response it claims to, a scripted failure must look like a real one,
 # and the helpers must not hang.
 
-plan 15;
+plan 16;
 
 my @prompt = [msg('user', 'hello'),];
 
@@ -101,6 +101,52 @@ subtest 'an error class defaults rather than being guessed' => {
 	is $resp.error-class, 'unknown',
 		'an unclassified failure is "unknown" (which classify-error retries)';
 	is $resp.error-status, Int, 'and carries no invented status';
+};
+
+subtest 'a failing step still carries its finish reason and its usage' => {
+	plan 8;
+
+	# The failure a provider reports through the finish reason rather than
+	# through a status: the prompt was accepted, the answer was cut off, and
+	# the tokens were billed. LLM::Chat stamps all of that on the Response
+	# BEFORE it quits, and LLM::Agent::Loop reads it off the quit Response
+	# to tell a truncation from an anonymous stream failure — so the kit has
+	# to reproduce the same order.
+	my $backend = scripted-backend(steps => [
+		{
+			chunks => ['I will start by ', 'reading the'],
+			finish-reason => 'length',
+			error => 'Hit max tokens', error-class => 'response',
+			usage => { prompt => 198_000, completion => 590 },
+		},
+	]);
+
+	my $resp = settled($backend.chat-completion-stream(@prompt));
+
+	nok $resp.is-success, 'the call failed';
+	is $resp.finish-reason, 'length',
+		'and the finish reason survives the quit — the whole point';
+	is $resp.err.Str, 'Hit max tokens', 'beside the provider’s message';
+	is $resp.error-class, 'response', 'and its class';
+	is $resp.prompt-tokens, 198_000,
+		'the prompt it billed for is readable too';
+	is $resp.completion-tokens, 590, 'and the fragment it did generate';
+	is $resp.latest, 'I will start by reading the',
+		'and the fragments really were emitted before the cut';
+
+	# Same three facts through the mid-stream path, which builds its own
+	# step hash and used to drop both of them.
+	my $mid = scripted-backend(steps => [
+		{
+			chunks => ['one ', 'two ', 'three'], fail-after-chunks => 1,
+			finish-reason => 'length', error => 'Hit max tokens',
+			error-class => 'response', usage => { prompt => 900 },
+		},
+	]);
+	my $cut = settled($mid.chat-completion-stream(@prompt));
+	is ($cut.finish-reason, $cut.prompt-tokens, $cut.latest).List,
+		('length', 900, 'one '),
+		'fail-after-chunks forwards them as well';
 };
 
 subtest 'fail-after-chunks fails in the middle of the text' => {

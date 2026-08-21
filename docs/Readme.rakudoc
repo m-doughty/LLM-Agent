@@ -107,7 +107,8 @@ C<ToolResult>, a C<ToolAbandoned> with C<< reason => 'deadline' >>, and a
 C<tool> message telling the model that whether it took effect is unknown.
 It is never an error: a local clock knows nothing about a remote side
 effect, and a model told its C<fs_write> failed will write it again. The
-run carries on; C<< $run.drained >> waits for the detached call even
+later calls in that assistant batch are not dispatched and the run carries
+on with a fresh model round; C<< $run.drained >> waits for the detached call even
 though C<< $run.result >> did not.
 
 The deadline B<pauses while a human is being asked>. Dispatch is
@@ -413,7 +414,7 @@ RunStarted        | run-started        | run-id, message-count
 RoundStarted      | round-started      | round, tokens?
 AttemptStarted    | attempt-started    | round, attempt, backend-index, model
 Token             | token              | text, round?, attempt?
-AttemptFailed     | attempt-failed     | round, attempt, backend-index, model?, error, error-class?, error-status?, disposition, backoff?
+AttemptFailed     | attempt-failed     | round, attempt, backend-index, model?, error, error-class?, error-status?, disposition, backoff?, usage?
 AttemptSucceeded  | attempt-succeeded  | round, attempt, backend-index, model-used?, finish-reason?, usage, latency-ms?
 AssistantMessage  | assistant-message  | message, reasoning?, round?
 TurnCommitted     | turn-committed     | message-id?, round?

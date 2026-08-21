@@ -2,6 +2,560 @@ Revision history for LLM::Agent
 
 {{$NEXT}}
 
+0.6.0  2026-08-21T22:50:40+01:00
+    - A TOOL CALL CAN NOW ANSWER TWICE: once immediately, and once with
+      what it actually did. New LLM::Agent::CompletionBus is the register
+      of background work that has been acknowledged and not yet reported,
+      and the queue of the reports themselves. Given one (`completion-bus`
+      on the Loop), two things change and nothing else does: whatever is
+      on the bus at a round boundary becomes framed user turns at the top
+      of that round, and a model that stops asking for tools with work
+      still outstanding PARKS rather than ending the run. The round-top
+      order is completions, then steers, then the caps — a steer is very
+      often the user reacting to a completion, and the caps must weigh
+      both. Completion content goes through the same observation excerpt
+      seam a tool result does, so a child that answers with a megabyte
+      lands as an excerpt with the rest in an artifact file; the framing
+      that says "this is an automated event, not the user" is never
+      excerpted. A park wakes on a completion, a steer or a cancel, ends
+      the run when the bus goes quiet, and is bounded by a new
+      `park-idle-timeout` (1800s) whose expiry closes what is outstanding
+      and fails the run with `reason => 'park-idle'`, naming what never
+      answered. New `park-poll`, `on-park` and `on-unpark` (balanced on
+      every exit path, for a host that lends a concurrency slot for the
+      duration of a park). `max-wall-clock` now bounds the time a run
+      spent WORKING: parked seconds are subtracted, and reported as
+      `spent<parked-seconds>`. Five new events —
+      BackgroundOpStarted/Settled/Delivered, RunParked, RunResumed — all
+      non-terminal.
+    - Subagents gained `completion-bus`, and with it BACKGROUND
+      DELEGATION. A `task` call acknowledges and returns instead of
+      waiting; the child reports itself through the paths that already
+      existed for a child nobody was waiting on, and the settle goes onto
+      the bus from inside the same once-guard that writes the transcript
+      envelope. An answer is presented exactly once whichever way round
+      the settle and a `task_wait` happened: a parked join closes the
+      operation `collected` and enqueues nothing, and a join that arrives
+      after the settle withdraws the turn it would have been. A child's
+      question reaches its parent as an untracked turn of its own — the
+      child stays outstanding, because it is stopped rather than
+      finished — and stays in the question table until it is ANSWERED, so
+      the deliberately blunt interrupt predicate is unchanged. A wedged
+      child now leaves the outstanding count as well as the admission
+      count. `subagent-settled` gained `call-id`; the acknowledgement's
+      tool message is recorded with `background => True` so crash repair
+      can tell an acknowledged-but-unreported operation from a tool call
+      that finished. The `task` / `task_wait` / `task_answer` descriptions
+      and guidance texts change with the mode. WITHOUT a bus, every path
+      and every word is exactly what it was.
+    - Request-budget preflight and provider-length verdicts now count the
+      complete request through the selected model profile's counter:
+      conversation, runtime context, tool catalogue and tokenizer-specific
+      request framing. TokenCount gained `count-request`; Exact delegates to
+      a tokenizer's `get-request-count` when available and safely composes
+      the older counting API otherwise, while Usage treats billed prompt
+      tokens as already including unchanged context/tools and estimates only
+      appended history. Usage calibration is invalidated per selected
+      counter when model, context, tools or the calibrated history changes.
+      Heterogeneous forced compaction now carries the chosen target with its
+      model counter, uses that counter for every before/after, summary and
+      hard-trim check (and emitted count), then re-preflights each fallback in
+      its own units. Single-counter loops retain their existing behaviour.
+    - Loop admission now waits for the previous Run.drained, provider
+      callbacks are attributed to the dispatched run/operation, and a tool
+      deadline prevents every later call in that assistant batch from being
+      dispatched. Those later calls receive ordered, explicit never-ran
+      results so the model can reassess an unknown side effect.
+    - Failed provider attempts now contribute their reported usage and cost,
+      AttemptFailed exposes that usage, and spent.complete states whether
+      every started attempt reported a total or both token halves. Usage
+      calibration is learned by the selected backend profile's counter.
+    - Session.load makes a complete final JSON envelope without an EOL
+      append-safe before reopening it, preserving an existing LF/CRLF
+      convention. tool-dispatched now explicitly means “may have reached the
+      provider”, not proof that it ran.
+    - Subagents gained configurable cancel-grace and drain-grace. A child
+      that exceeds drain-grace is visible as wedged but remains fail-closed:
+      its slot and cancellation/resource ownership are retained until it
+      actually drains (what a wedge no longer holds is admission capacity —
+      see the live/owned split below).
+    - OLD TOOL RESULTS CAN NOW BE ELIDED INSTEAD OF SUMMARIZED. New
+      LLM::Agent::Compactor options `age-observations` (Bool, default
+      False), `age-min-chars` (2,048) and `age-reclaim-min` (49,152).
+      With aging on, a compaction pass tries the cheap thing first: the
+      content of a fat `tool` message in the middle region is replaced IN
+      PLACE with a deterministic stub — `[elided by the harness: NNNN-char
+      <tool> result; re-run the call if you need it again]` — and nothing
+      else about the message changes. Same position, same role, same
+      tool_call_id, so there is no pair alignment to get wrong and no
+      assistant turn left holding tool_calls that nothing answers. Old
+      observations are the bulk of every agent transcript and are almost
+      never re-read; a model that wants the bytes back re-runs the call,
+      which is cheaper than the summary that would have described them.
+      Two ways a pass is entered, and ONE predicate decides:
+      `needs-compaction` now answers for both reasons, and takes an
+      optional `:$tokens` for a caller that has already counted (or that
+      knows a bigger number the same window has to hold). Over the trigger:
+      the middle is aged FIRST, recounted, and if that was enough the pass
+      ends there — no summarization request, no synthetic message, nothing
+      dropped; if it was not, the summarizer runs as it always did over the
+      stubbed middle, so one enormous fs_read no longer dominates the
+      transcript it is asked to summarize. BELOW the trigger: a
+      reclaimable-batch epoch, entered as soon as the eligible pool reaches
+      `age-reclaim-min` characters, and always elision-only. The floor is
+      not a threshold for its own sake — providers cache the prompt prefix,
+      any change below the tail invalidates it, and eliding one result per
+      round would pay a full cache miss to reclaim a few thousand
+      characters. One miss per batch instead.
+      Eligibility is deliberately conservative. A result must be a `tool`
+      message in the middle region (the same cut the summarizer works from —
+      never sticky, never inside the recent window), longer than
+      `age-min-chars`, not already a stub, and it must have at least
+      `age-reclaim-min` characters of conversation content AFTER it: the
+      keep-recent window is positional, and one tool-heavy round can push
+      eight messages and evict something the model is mid-sentence about, so
+      recency is measured in content instead. On top of that, call identity
+      — the tool name plus its canonicalised arguments, joined back through
+      tool_call_id to the assistant turn that asked — is counted: where the
+      same call was answered more than once, the NEWEST answer is protected
+      permanently and every older copy becomes eligible whatever its size or
+      age. That is the loop breaker. Elision is a bet, and a lost bet costs
+      one re-read; without the rule a lost bet costs a re-read and a cache
+      epoch every turn, for ever.
+      The failure ladder is untouched: classify, retry, hard trim, and the
+      `exhausted` verdict all behave exactly as they did, and a summary is
+      still only accepted if it is smaller than the conversation it
+      replaces — measured against the AGED conversation, which is the
+      stronger test. `%result<elisions>` is new (`[ { index, stub }, ... ]`,
+      indices into the input array) and empty unless aging is on.
+    - New LLM::Agent::Session envelope `type: elision`, payload
+      `{ items: [ { id, stub } ] }`, and `append-elision`. It is the one
+      envelope that rewrites something the file already said, which is why
+      it names messages by envelope id: replay applies the stubs in FILE
+      ORDER alongside compactions, so the two compose in either direction —
+      a compaction can fold away messages an elision stubbed (which is what
+      the live run's summarizer was shown), and an elision can stub a
+      message a compaction kept, including the summary itself. An id the
+      live message set does not hold is FATAL, before the write and on
+      replay, exactly as a compaction naming nothing is; an empty `items` is
+      refused by the appender. The original tool result stays in the file on
+      the `message` line it was written on: a transcript records what
+      happened, and the elision records what the model was shown afterwards.
+    - LLM::Agent::Loop's compaction consult now asks the compactor
+      `needs-compaction(@conversation, :$tokens)` rather than comparing
+      against `compactor.trigger` itself — every reason to make a pass lives
+      in the compactor, and the loop learns none of them. It writes the
+      `elision` line where it writes the `compaction` line (elisions first,
+      so a compaction that folds them in cannot invalidate the ids they
+      name), and swaps the working array for an elision-only pass, which
+      reports `dropped => 0` and moves no ids. A compactor with
+      `age-observations` on and a session that cannot `append-elision` is
+      now refused at construction, for the same reason a compactor with a
+      session that cannot `append-compaction` always was. There are no new
+      constructor options and no new event types: an elision-only pass is
+      framed by the CompactionStarted / CompactionDone pair, with
+      `dropped => 0`.
+    - A TRUNCATED COMPLETION IS NO LONGER RETRIED WITH AN IDENTICAL
+      REQUEST. A provider that accepts the prompt, runs out of room and
+      reports `finish_reason: 'length'` arrives at the loop as an
+      error-class of 'response', which classify-error buckets as `advance`,
+      which on a single-backend chain degrades into a `retry-same`. So a
+      conversation flush against its window was re-sent, byte for byte,
+      three to seven times — a full prompt each, hundreds of thousands of
+      tokens and real money per run — to be truncated identically every
+      time, and then the run failed anyway. The outcome of a cap is
+      deterministic; there was never anything to retry.
+      A `length` is now intercepted BEFORE the retry buckets get it, read
+      off `$resp.finish-reason` (LLM::Chat stamps the reason before it
+      quits, so this is structured rather than sniffed) and split into the
+      two failures it really is. NEAR THE WINDOW it is context overflow the
+      preflight's counter missed, and it joins the existing degradation
+      path exactly where a preflight refusal goes: it counts as that
+      backend's window refusal, it is the second advance that does NOT
+      degrade into a retry, the chain still gets to try a backend with a
+      bigger window, and when every backend has refused, the loop compacts
+      ONCE and tries again — RunFailed with `reason => 'context-exhausted'`
+      if that does not help. NOWHERE NEAR IT, `max_tokens` was the binding
+      constraint, compaction cannot help and no other backend truncates the
+      same answer differently: the round ends with RunFailed and a new
+      `reason => 'completion-truncated'`, whose error names the cap that
+      bound and what to raise.
+      The judgement leans towards "the window", deliberately: the counter
+      is the thing that let the doomed request through, so a `length`
+      arriving where the budget thought there was room is evidence that the
+      count was low. The counted request has to clear the window by more
+      than a QUARTER of itself before the cheerful reading is believed, and
+      a truncated response that carried `usage` is judged on the provider's
+      own numbers with no tolerance at all. The compaction it forces aims
+      at the size that would still fit if the counter were as wrong as it
+      is allowed to be — not at the preflight's number, which the counter
+      has just been proved wrong about and which would ask the compactor to
+      drop nothing.
+      Nothing else about the retry buckets moves: an ordinary 'response'
+      failure (a malformed body, an empty completion) retries exactly as it
+      did, and LLM::Chat is unchanged.
+    - AND NEITHER IS A TRUNCATED COMPLETION THE PROVIDER DID NOT ADMIT TO.
+      A provider decoding tool call arguments under a grammar can reach
+      `max_tokens` with the JSON closed — every brace balanced, every string
+      terminated — and report `finish_reason: 'tool_calls'` rather than
+      'length'. What arrived was a syntactically perfect call missing
+      whatever the model had not written yet: a subagent brief that stopped
+      mid-sentence, the rest of it railroaded into keys nobody declared, and
+      a loop that dispatched it because nothing about the response looked
+      wrong. One witness was left, and it was the provider's own: a
+      completion billed AT (or past) the backend's `max_tokens` was stopped
+      by `max_tokens`, whatever the finish reason claimed.
+      So every successful streamed turn — prose as much as tool calls — is
+      now checked against the cap the backend declares, and
+      `completion-tokens >= max_tokens` is treated as the truncation it is:
+      no AttemptSucceeded, and the failure path from there is exactly the
+      one a reported 'length' takes — the same verdict, so a clip on a
+      request near the window compacts once and a clip on a small one ends
+      the run with `reason => 'completion-truncated'`, and the same refusal
+      to re-send identical bytes. One Log at `warning` names the
+      disagreement (the reason the provider gave, the tokens it billed, the
+      cap they met); there is deliberately no event class of its own,
+      because the round did not fail in a new way. `>=` rather than `==`,
+      because usage that includes reasoning tokens overshoots the cap, and
+      no tolerance in the other direction: a completion that stopped short
+      of the cap stopped because it was finished. The check is BEST-EFFORT
+      and documented as such — a provider that reports no usage leaves
+      nothing to check and the gate is inert, and asking for usage on a
+      stream is deliberately not done (it hangs at least one gateway in the
+      header phase). The honest `finish_reason: 'length'` path above stays
+      primary; this is the one for providers that do not say so.
+    - A committed assistant turn's session extras now carry
+      `finish-reason`, beside `reasoning` and `usage`. A transcript is the
+      only place a truncation nobody caught can still be seen afterwards,
+      and a turn only gets written once the clip check above has cleared
+      it — so the reason recorded is one the billed tokens agree with.
+      Extras remain replay-visible and dropped when Messages are rebuilt,
+      so nothing about a resumed conversation changes.
+    - The context-exhausted terminals reached through a forced compaction
+      now carry their `attempts` instead of an empty list. It never mattered
+      much when nothing had been sent; it matters now that one of the ways
+      in is a truncation somebody paid for, and the record of it was being
+      dropped on the way out.
+    - A `task` CALL IS NOW CHECKED STRICTLY, AND THE UNKNOWN KEYS ARE THE
+      DIAGNOSIS. The clip above has a second signature: what was left of a
+      brief when the decoder ran out of room becomes KEY NAMES — a key
+      called `sh_run.\n\nCONTEXT` whose name is a fragment of the sentence
+      that was being written. Such a call parses, carries both required
+      arguments, and hands over a `prompt` that is a stump of what was
+      meant; the composer used to ignore the junk and spawn a subagent on
+      it, with nothing anywhere saying that most of the brief was gone.
+      LLM::Agent::Subagents now refuses a `task` call carrying any key its
+      declaration does not name — `agent-type`, `prompt`, `label`, plus
+      `reason` — as an is_error result, checked BEFORE agent-type and
+      before prompt so a mangled call is diagnosed as mangled rather than
+      as whichever required key the clip happened to eat. Nothing is
+      started on that path: no child, no slot, no entry in the
+      identical-spawn tally. The refusal names the offending keys
+      (whitespace flattened and long ones cut, because they can carry
+      newlines and a paragraph of the prompt), names the keys that are
+      allowed, and says what this usually means and what to do — re-emit
+      the whole call with the complete task in `prompt`. `reason` is
+      tolerated whether or not a reasons layer is in the stack, by literal
+      rather than by import: that layer strips the parameter when it is
+      there, and a model asked for a reason on every call for a whole
+      conversation will write one here regardless. Matching is exact and
+      case-sensitive — `Agent-Type` is a key no schema declared. This
+      strictness is deliberately confined to `task`, whose arguments are a
+      whole conversation's worth of instructions; every other tool goes
+      through untouched.
+    - The `task` tool's description now says that A BRIEF IS WORTH ITS
+      LENGTH: write it in full, and when several long briefs are queued,
+      splitting the spawns across turns is fine. The batching guidance it
+      sits beside is unchanged — a batch of long briefs is exactly the
+      shape that provokes the clip, and telling a model to batch without
+      telling it that length is allowed is telling it to compress, which
+      is the same lost context arrived at on purpose.
+    - The summarizer's transcript now MARKS a truncated tool CALL, as it
+      has always marked a truncated tool result: `... [N more characters
+      of tool-call arguments, truncated for summarization]`. Arguments
+      over `tool-result-cap` were being cut silently, so a call whose JSON
+      stopped mid-string read to the summarizer like a call the model
+      really made that way — and "the model wrote a truncated tool call"
+      is precisely the kind of thing a summary then repeats as fact. The
+      cap itself is unchanged, and still applies only to what the
+      summarizer is shown.
+    - A USER CAN NOW SAY SOMETHING WHILE A RUN IS STILL GOING. New
+      LLM::Agent::Loop option `steer-source`: a thunk taking no arguments
+      and answering a (possibly empty) list of Str, called at the top of
+      every round, each answer appended to the conversation as an ordinary
+      user message. Undefined by default, and a loop without one behaves
+      exactly as it did. Before this the only way to react to a run that
+      had gone the wrong way was to cancel it and start again, losing ten
+      rounds of tool results to say one sentence.
+      The placement is the whole feature: the thunk is asked at a round
+      boundary with NOTHING in flight — no stream open, no tool call
+      dispatched — so an injected turn can never land between an assistant
+      turn carrying tool_calls and the tool messages that answer it, which
+      is the malformed conversation every provider rejects. It goes in
+      before the caps check, before a compaction and before the request is
+      built, so the preflight weighs it, a compaction can move it,
+      RoundStarted counts it, and the wire carries it. It is history, not a
+      sidecar: the transcript records it as a plain user turn, and a
+      resumed session replays it as one.
+      There is no new event and no push method. The thunk IS the delivery
+      notification — the loop asked, and what the app handed over is on its
+      way — and the queue behind it, its thread safety, and whether three
+      queued lines are three messages or one paragraph are all the app's
+      business. What is handed over is recorded exactly: three answers are
+      three user messages, in order.
+      A thunk that throws is shielded — an error Log event, no steers this
+      round, and the next round asks again — and an answer that is not a
+      defined Str is dropped with a Log event rather than stringified into
+      somebody's transcript. A broken queue cannot end a run. One that
+      cannot be called with no arguments (`-> $x { }`) is refused at
+      construction, where the closure is still on screen.
+    - THE IDENTICAL-CALL GUARD'S DEFAULT IS NOW 30, NOT 3. Three could
+      not tell a loop from patience. Repeating one call with one set of
+      arguments is the DESIGNED flow for a great many honest things — an
+      agent contending for a file lease retries the same `lock_acquire`
+      until the holder gives it back, an agent that has just written a
+      file reads it back to check, a poll is a poll — and at 3 the guard
+      fired on the fourth honest repeat, the loop disabled tools, and the
+      agent reported half a job to whatever was supervising it, which
+      then started the whole thing again. A model that really is going
+      round in circles will do it thirty times as happily as four; thirty
+      repeats cost some tokens, a false positive costs the task.
+      `max-tool-rounds` and `max-tool-calls` are UNCHANGED — they were
+      never the limit anybody was hitting.
+    - New LLM::Agent::Loop option `identical-call-exempt`: a list of
+      tool-name patterns (exact names or trailing-* prefix globs, the
+      same shape `concurrent-tools` takes) whose calls the identical-call
+      guard ignores entirely. Empty by default. A matching call is
+      skipped BEFORE it is counted, so it neither trips the limit nor
+      walks the batch's own tally up under a call that is not exempt;
+      everything else in the batch is counted exactly as it was. What
+      qualifies is a tool whose repetition is a PROTOCOL rather than a
+      loop — `lock_acquire` against a contended lease, where the
+      arguments cannot vary and the thing that ends the repetition is
+      another agent finishing. `max-tool-rounds` and `max-tool-calls`
+      still bound an exempt tool, so an exemption is not a licence for an
+      unbounded run.
+    - ADVANCE WITH NOWHERE TO GO IS NO LONGER A DEATH SENTENCE. When a
+      failure is classified `advance` — "this is a property of THIS
+      backend, ask a different one" — and the backend that failed is the
+      LAST link of the chain, the loop now degrades that advance to a
+      `retry-same`: it waits out the normal backoff and asks the same
+      backend again, spending the same per-backend budget a retry-same
+      would have. On a single-backend config, which is most of them, the
+      old behaviour was to exhaust the chain and end the run having made
+      exactly one call. The arithmetic is one-sided: if the retry fails
+      the chain is over exactly as it was, one backoff later.
+      The AttemptFailed says `retry-same` with its `backoff`, because
+      `disposition` reports what the loop DOES; when the budget is spent
+      the next one says `advance` and the chain ends, unchanged. A real
+      next backend still advances at once, with no wait — pinned.
+      The ONE advance that does not degrade is the context-overflow
+      seatbelt (a 400 saying the conversation does not fit): that is a
+      deterministic refusal of these exact bytes, and re-sending them
+      buys an identical 400 and a wait on top of it.
+    - New LLM::Agent::Loop option `backoff-cap` (default 30, unchanged
+      behaviour): the ceiling `LLM::Chat::Retry::retry-backoff` is
+      clamped to, which the loop used to leave on the library default
+      with no way to say otherwise. It is also the test seam for the
+      retry path — a few milliseconds of cap exercises the whole ladder
+      without a mocked clock or a real wait.
+    - New LLM::Agent::Loop option `concurrent-tools`: a list of tool-name
+      patterns (exact names or trailing-* prefix globs, the same shape
+      `idempotency-rules` matches with) whose CONSECUTIVE calls are
+      dispatched as ONE batch. Empty by default, and an empty one is the
+      loop exactly as it was — one call at a time, per-call envelopes,
+      per-call blast radius. Group formation only ever merges NEIGHBOURS:
+      the batch is walked in the model's order and the first call whose
+      tool does not match ends the run being built, so `task, task,
+      fs_read, task` is three groups and the read still happens between
+      them. A group's N dispatch envelopes and N ToolStarted events are
+      written BEFORE the batch goes down, and each call then settles with
+      the result at its own index — its own tool message, its own
+      tool-settled envelope, its own ToolResult, in model order.
+      What a group trades is stated in the Pod and is real: a crash mid
+      group leaves N dispatched-unsettled operations rather than one (a
+      resume repairs all N), a cancel or a deadline takes the whole
+      group, and a policy in front of it decides every call in the group
+      before any of it runs. A tool qualifies when its side effects are
+      confined to its own resources and its result is a report — `task`
+      is the argument's shape; fs_* and sh_* are not.
+    - LLM::Agent::Subagents runs a batch's `task` calls CONCURRENTLY —
+      one thread each, results reassembled in the caller's order. A task
+      call returns only when its child has settled, so the previous
+      `for @tasks` loop made N delegations strictly serial however many
+      the host could really run. Every guard is unchanged and still
+      holds under concurrent entry: max-live, the identical-spawn tally,
+      the id counter and the slot table are one critical section per
+      spawn, so N concurrent calls mint N distinct ids and admit exactly
+      as many children as there was room for. The visible consequence is
+      that every permission question for a fan-out arrives up front —
+      which is why the loop only hands this provider a batch when the app
+      has named `task` in `concurrent-tools`.
+    - New LLM::Agent::Loop.absorb-spend(%spent, :$run-id): add spend that
+      happened somewhere else — another run's settled record, in exactly
+      the shape a finished run hands back — into this run's accumulators,
+      so the request budget's caps see it. Optional keys stay optional
+      ("nobody counted" is still not zero), `wall-clock` is deliberately
+      IGNORED (this run's elapsed time is its own, and a child ran inside
+      it), and `:$run-id` is how a caller says "drop this if that run is
+      over" so a late child cannot be billed to whatever run started
+      next. It never checks a cap and never ends a run: the next round or
+      operation boundary does that, in the ordinary way.
+    - LLM::Agent::Subagents feeds a settled child's `spent` into the
+      parent loop through that seam, which closes the known limitation
+      that a parent's max-cost / max-total-tokens could see only the
+      parent's own turns. A parent's budget is now the budget of its
+      WHOLE SUBTREE, recursively: a composer under a child bills that
+      child, whose settled record already carries its own children's. A
+      child that pushes its parent over is refused on the parent's NEXT
+      attempt, with the ordinary `budget-exhausted` reason — there is no
+      separate subtree cap and no new refusal shape. Shielded and
+      duck-typed throughout: a loop without the method, a stand-in in a
+      test, or an accumulator that has moved on all mean "nothing
+      happens", and the task call still returns.
+    - A run's `spent` Map gains the `prompt-tokens` / `completion-tokens`
+      split beside `total-tokens`, accumulated across every attempt that
+      reported one. Both keys follow the same rule `cost` already
+      followed: present only when SOMETHING reported that number, absent
+      when nothing did — a backend that publishes only a total leaves the
+      split out rather than claiming zero tokens went each way. Caps are
+      unchanged; no cap is written against half a turn.
+    - LLM::Agent::Event::Subagent gains `call-id`: the provider's id for
+      the `task` call that started the child, constant for that child's
+      whole life and carried on EVERY wrapped event. It is the only
+      thing joining a delegation's tool events (ToolCall / ToolResult /
+      ToolAbandoned, all keyed by that id) to the child events it
+      produced, so a UI can draw one card per delegation instead of an
+      orphan tool card beside an orphan agent card. Optional: a composer
+      forwarding a child no tool call started leaves it undefined, and
+      `to-hash` omits the key entirely rather than writing a null.
+    - The `subagent-spawned` transcript envelope gains the same `call-id`
+      key, beside `child-path`, which joins the spawn line to the
+      `tool-dispatched` line for the same call. Replay is unchanged and
+      unconditionally tolerant: a transcript written before the key
+      existed has spawn lines without it and loads exactly as it always
+      did (nothing reads the key back).
+    - The stream, tool-batch and settle-child waits now poll with a bare
+      timer instead of `Promise.anyof` over long-lived promises. Every
+      anyof pass registered a continuation on `Run.cancellation` (and, in
+      the composer, on the child's result) which the runtime keeps until
+      that promise settles — some forty a second, and unbounded on a run
+      nobody cancels — and a cancel that did arrive woke every one of
+      them at once. The end of a stream, of a tool batch and of a child's
+      run is now noticed on the next poll tick (at most 50ms later);
+      cancel promptness is unchanged, because it never came from the
+      wait — the on-cancel poke aborts the in-flight stream directly.
+      Run's Pod now warns against re-awaiting `cancellation` inside a
+      poll loop.
+    - Subagents admission counts only the children that can still answer.
+      A wedged child — one whose result was kept and whose `drained`
+      never came — keeps its place in `live-agents`, in the new
+      `owned-count`, and in `cancel-children`'s reach, so ownership stays
+      fail-closed; what it no longer does is refuse new spawns against
+      `max-live`, which would have let one abandoned tool call cost the
+      composer a slot for the rest of the host's life. The refusal
+      message reports the live count for the same reason: telling a model
+      to wait for a child that is never going to answer is telling it to
+      wait for ever. New `live-count` and `owned-count` methods expose
+      the two numbers.
+    - A SUBAGENT CAN NOW ASK THE AGENT THAT STARTED IT. A child given a
+      brief it cannot act on had three options — guess, give up, or ask
+      the human, who did not write the brief and cannot see the
+      conversation it came from. The agent that wrote it is the one that
+      knows what it meant, so LLM::Agent::Subagents grew the engine half
+      of a child→parent ask channel.
+      New `post-question(agent-id, :message!, :schema)` parks a question
+      and answers with the Promise the host's ask thread blocks on; it is
+      kept with an elicitation outcome (`{ action, content }`), so a host
+      hands it straight back to the server that asked. Every refusal is a
+      VALUE, never an exception: an agent-id this composer does not own,
+      one that has already finished, a second question while the first is
+      still waiting, or an empty question all come back as an
+      already-kept `{ action => 'cancel' }`. Nothing can hand a child an
+      accept nobody wrote. `pending-questions` is the snapshot beside it,
+      for a UI drawing "waiting on its parent" against an agent.
+      A parked question RELEASES EVERY `task` CALL WAITING IN THAT GROUP,
+      at once, as an interim result — `is_error` False, content starting
+      `STATUS: interim`. That is forced rather than chosen:
+      `execute-tool-calls` answers a batch with one List, so there is no
+      way to hand back the asking child's call and go on waiting for the
+      others, and holding them open would mean a parent that cannot
+      answer until unrelated children happen to finish. The asking
+      child's own call carries the question in full, with what to do
+      about it; the others say their child is still running and name the
+      tool that collects it; all of them list whatever else is open. A
+      question is delivered in full EXACTLY ONCE — later waves mention it
+      as a line and never repeat the text, because a model shown the same
+      question three times answers it three times, and a long question
+      repeated in every result is a context window spent on nothing.
+      While ANY question is open — delivered or not, from any child — a
+      `task` or `task_wait` call comes straight back with an interim
+      result instead of parking. A parent that waits on one child while
+      another is blocked on an answer only it can give is the same
+      deadlock arriving a moment later, and the cost of the blunt rule is
+      one turn spent clearing the table, which the interim result says
+      how to do.
+      A question asked while the parent is mid-generation stays pending
+      and is delivered at the next park; a question from a child nobody is
+      waiting on is delivered by whichever other waiting call gets there
+      first, which is not an edge (a child whose call already came back
+      interim has nobody parked on it).
+      Two new tools, published beside `task` and checked by the same
+      strict unknown-key check. `task_answer(agent-id, answer?, fields?,
+      decline?, reason?)` resolves a parked question: prose for a
+      question asked in prose, `fields` for one that asked for named
+      fields (validated against the ones it REQUIRED), or a decline with
+      a reason. Every refusal on that path leaves the question parked —
+      an answer the model got the shape of wrong must not strand the
+      agent that asked. Answering is not collecting: the child carries on
+      from where it stopped. `task_wait(agent-id)` collects it, answering
+      with exactly what the original `task` call would have, and is
+      idempotent: a child already collected answers from a cache in the
+      same words however many times a model asks. Neither is a spawn —
+      no slot, no id, no entry in the identical-spawn tally — but a host
+      should name both in Loop's `identical-call-exempt`, because
+      collecting the same agent twice is by design.
+      The settle envelope and the child's spend absorption are now ONCE
+      PER CHILD whoever was waiting, and a child that finishes
+      UNCOLLECTED records itself as it drains, before its slot is
+      released: otherwise its answer would go with it and the `task_wait`
+      the parent was told to make would find no such agent. EVERY way out
+      of a park counts as having waited — a call released by a question
+      re-reads its child on the way out and writes the terminal itself if
+      the child settled underneath it, because the drain that follows can
+      only see that the call was parked and defers its own record to it.
+      An interim wave writes no settle envelope and absorbs no spend for
+      a child that is still running.
+      Two new transcript envelopes, `subagent-question` (agent-id, token,
+      call-id, message, schema) and `subagent-answered` (agent-id, token,
+      call-id, action, content, reason?), on the parent's session through
+      `append-event` — so a reader that has never heard of them replays
+      the file exactly as it always did.
+      Cancellation reaches the questions too, because a parked one is a
+      host thread blocked on a Promise: `cancel-children` sweeps the whole
+      table (every vow kept `cancel`), a child that settles, refuses to
+      stop, or is released takes its own question with it, and the
+      parent's TERMINAL — not just its cancellation — now cascades. A run
+      that ends with a child still going leaves that child working for a
+      conversation that is over and a host thread blocked on a question
+      nobody will ever see; nothing can reach either once the run is
+      finished, so both are ended. When everything settled normally the
+      hook finds nothing and does nothing.
+      New constructor callbacks `on-child-park` / `on-child-unpark` fire
+      when a `task` or `task_wait` call starts and stops waiting on a
+      child (`{ agent-id, call-id, tool }`, plus an `outcome` of
+      `interim` / `final` / `unstoppable` / `error` on the way out),
+      balanced on every path and shielded. They are the host's accounting
+      rails: a parent parked on a child is doing nothing, and the asking
+      child is itself suspended, so the two together hold one slot rather
+      than two.
+      The `task` description now tells the model that an agent which
+      finds its brief incomplete asks IT rather than guessing, that an
+      interim result is never the task's answer, and how to get back to
+      the agent. The loop needed no changes at all: an interim result is
+      an ordinary tool result, and both new tools are ordinary tool
+      calls.
+
 0.4.1  2026-08-10T21:58:15+01:00
     - Fix flaky t/15 test
 

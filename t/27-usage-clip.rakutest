@@ -1,0 +1,456 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Compactor;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Agent::RequestBudget;
+use LLM::Agent::Session;
+use LLM::Agent::TokenCount;
+use LLM::Chat::Backend::Settings;
+use LLM::Chat::Conversation::Message;
+
+# THE LENGTH THE PROVIDER DOES NOT REPORT.
+#
+# A provider decoding tool call arguments under a grammar reached
+# max_tokens with the JSON closed — every brace balanced — and reported
+# `finish_reason: 'tool_calls'`. LLM::Chat's length gate is correct and
+# never fired, because there was no length to fire on. What the loop
+# received was a syntactically perfect `task` call whose prompt stopped
+# mid-sentence and whose remaining text had been railroaded into junk
+# keys, and it dispatched it: a subagent spawned on a stump of a brief.
+#
+# The one witness is the provider's own usage. A completion billed at (or
+# past) the backend's max_tokens was stopped by max_tokens, whatever the
+# finish reason claims — so a successful turn whose completion-tokens
+# reach the cap is treated as the truncation it is, and takes the failure
+# path a reported `length` takes.
+
+plan 8;
+
+# One token per character, no per-message overhead: every number below is
+# arithmetic a reader can check.
+sub counter(--> LLM::Agent::TokenCount) {
+	LLM::Agent::TokenCount::Heuristic.new(
+		chars-per-token => 1, per-message-overhead => 0,
+	);
+}
+
+#| The cap every backend here declares, so the numbers are the test's own
+#| rather than whatever L<LLM::Chat> happens to default to.
+constant CAP = 256;
+
+sub capped-backend(Int:D :$cap = CAP, *%args --> ScriptedBackend) {
+	scripted-backend(
+		settings => LLM::Chat::Backend::Settings.new(max_tokens => $cap),
+		|%args,
+	);
+}
+
+sub window-budget(*%windows --> LLM::Agent::RequestBudget) {
+	LLM::Agent::RequestBudget.new(
+		profiles => %windows.map(-> $pair {
+			$pair.key => LLM::Agent::RequestBudget::Profile.new(
+				context-window      => $pair.value,
+				completion-reserve  => 100,
+				input-safety-margin => 0,
+			);
+		}).Hash,
+	);
+}
+
+#|( The task call the incident produced: valid JSON, closed at the cap,
+    with the brief cut off mid-sentence and the rest of it railroaded into
+    keys nobody declared. Nothing about it parses badly — which is the
+    whole problem. )
+constant MANGLED-TASK = '{"prompt":"Investigate the streaming path and '
+	~ 'report on the","the":"","reason":"","and_then":""}';
+
+# The streaming calls a backend received, in order — the blocking ones are
+# the compactor summarizing and are not round trips.
+sub streams(ScriptedBackend $backend --> List) {
+	$backend.recorded-calls.grep({ $_<kind> eq 'stream' }).List;
+}
+
+sub request-size(%call --> Int) {
+	counter().count-messages(%call<messages>.list);
+}
+
+# The one Log the clip gate emits. Matched on what it is about rather
+# than on its whole wording, so the sentence can be improved without
+# rewriting the suite.
+sub clip-logs(@events --> List) {
+	events-of(@events, 'log').grep({
+		($_.data ~~ Associative)
+			&& ($_.data<message> // '').contains('clipped at max_tokens')
+	}).List;
+}
+
+sub task-tool(--> Hash) {
+	tool-decl('task', 'Spawn a subagent', { prompt => { type => 'string' } },
+		required => ['prompt']);
+}
+
+#|( 898 counted tokens: a sticky system line plus four 224-character
+    turns. Under a 1,200-token window it passes the preflight (898 + 100
+    reserve) and is inside a 1,200-budget compactor's trigger — the shape
+    of a request the budget thought had room for an answer. )
+sub near-window-conversation(--> List) {
+	(
+		msg('system', 'SY', sticky => True, sysprompt => True),
+		|(1 .. 4).map({ msg($_ %% 2 ?? 'assistant' !! 'user', 'm' ~ ('.' x 223)) }),
+	).List;
+}
+
+my $tmp = $*TMPDIR.add("llm-agent-t27-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	close-test-sessions();
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+subtest 'the incident: a clipped task call is never dispatched' => {
+	plan 9;
+
+	my $backend = capped-backend(model => 'orchestrator', steps => [
+		{
+			chunks => ['Spawning researcher-3. '],
+			tool-calls => [tool-call('c3', 'task', MANGLED-TASK),],
+			'finish-reason' => 'tool_calls',
+			usage => { prompt => 4_000, completion => CAP },
+		},
+		{ content => 'this must never be asked for' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [task-tool(),], results => { task => 'spawned' },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, counter => counter(),
+		request-budget => window-budget(orchestrator => 100_000),
+	);
+
+	my $run = $loop.run([msg('user', 'research the streaming path'),]);
+	run-settled($run, 'the clipped run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is $provider.recorded-calls.elems, 0,
+		'NOTHING was dispatched: a brief the provider cut off at the cap is '
+			~ 'not a brief, however well-formed the JSON around it is';
+	is %outcome<outcome>, 'failed', 'the round fails instead';
+	is %outcome<reason>, 'completion-truncated',
+		'under the name a truncated completion already had — a small prompt '
+			~ 'against a small max_tokens, whatever the finish reason said';
+	like %outcome<attempts>.head<error>, /'finish_reason'/,
+		'and the attempt record quotes the reason the provider claimed';
+
+	is streams($backend).elems, 1,
+		'the request was sent exactly ONCE — the never-identical-resend '
+			~ 'doctrine holds for a clip as it does for a reported length';
+	is events-of(@events, 'attempt-succeeded').elems, 0,
+		'no AttemptSucceeded: the transport worked, and the answer still did '
+			~ 'not arrive whole';
+	is events-of(@events, 'attempt-failed').head.disposition, 'abort',
+		'the attempt aborts — another backend truncates this answer just as '
+			~ 'flatly';
+	is events-of(@events, 'turn-discarded').map({ .reason }).List, ('failed',),
+		'and the fragments it streamed are retracted, once';
+
+	my @logs = clip-logs(@events);
+	is (@logs.elems, @logs.head.level).List, (1, 'warning'),
+		'with one warning Log naming the disagreement, and no event class of '
+			~ 'its own: the round did not fail in a new way';
+};
+
+subtest 'a clip at the window compacts once, exactly as a length does' => {
+	plan 6;
+
+	# The provider's own numbers put prompt + completion at the window, so
+	# this clip is the window running out rather than the answer outgrowing
+	# max_tokens — and the verdict path it enters is the untouched one.
+	my $summarizer = capped-backend(
+		model => 'summarizer', steps => [{ content => 'THE SUMMARY' },],
+	);
+	my $backend = capped-backend(model => 'only', steps => [
+		{
+			chunks => ['I will start by ', 'reading the'],
+			'finish-reason' => 'stop',
+			usage => { prompt => 1_000, completion => CAP },
+		},
+		{ content => 'after compacting', usage => { prompt => 300, completion => 20 } },
+	]);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], counter => counter(),
+		compactor => LLM::Agent::Compactor.new(
+			backend => $summarizer, counter => counter(),
+			context-budget => 1_200, keep-recent => 2,
+		),
+		request-budget => window-budget(only => 1_200),
+	);
+
+	my $run = $loop.run(near-window-conversation());
+	run-settled($run, 'the clipped near-window run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'completed',
+		'the conversation gets smaller and the second request answers';
+	is %outcome<final>, 'after compacting', 'with the answer it produced';
+	is events-of(@events, 'compaction-done').elems, 1,
+		'ONE compaction — the near-window outcome is reused unchanged';
+
+	my @sizes = streams($backend).map({ request-size($_) });
+	is @sizes.elems, 2, 'two round trips, not a retry of identical bytes';
+	ok @sizes[1] < @sizes[0],
+		"and the second request is smaller (@sizes[1] < @sizes[0] tokens)";
+	is clip-logs(@events).elems, 1,
+		'one clip warning: the first turn, and only the first';
+};
+
+subtest 'the boundary: at the cap it fires, one token short it commits' => {
+	plan 8;
+
+	sub run-with(Int:D $completion --> Hash) {
+		my $backend = capped-backend(model => 'only', steps => [
+			{
+				chunks => ['Spawning. '],
+				tool-calls => [tool-call('c1', 'task', '{"prompt":"a whole brief"}'),],
+				usage => { prompt => 100, completion => $completion },
+			},
+			{ content => 'all done', usage => { prompt => 200, completion => 10 } },
+		]);
+		my $provider = ScriptedProvider.new(
+			tools => [task-tool(),], results => { task => 'spawned' },
+		);
+		my $loop = LLM::Agent::Loop.new(
+			backends => [$backend,], :$provider, counter => counter(),
+			request-budget => window-budget(only => 100_000),
+		);
+
+		my $run = $loop.run([msg('user', 'delegate it'),]);
+		run-settled($run, "the run billed $completion completion tokens");
+		my @events = drain-events($run);
+		my %outcome = await $run.result;
+		%(
+			outcome    => %outcome<outcome>,
+			reason     => %outcome<reason>,
+			dispatched => $provider.recorded-calls.elems,
+			succeeded  => events-of(@events, 'attempt-succeeded').elems,
+			clips      => clip-logs(@events).elems,
+		);
+	}
+
+	my %at = run-with(CAP);
+	is %at<outcome>, 'failed', 'billed exactly at the cap: the turn is refused';
+	is %at<reason>, 'completion-truncated', 'as a truncated completion';
+	is %at<dispatched>, 0, 'with nothing dispatched';
+	is %at<succeeded>, 0, 'and no AttemptSucceeded';
+
+	my %under = run-with(CAP - 1);
+	is %under<outcome>, 'completed',
+		'one token short of it, the answer is a finished answer';
+	is %under<dispatched>, 1,
+		'the tool call is dispatched — there is no tolerance band below the '
+			~ 'cap, because a completion that stopped short of it stopped '
+			~ 'because it was done';
+	is %under<succeeded>, 2, 'and both round trips report an AttemptSucceeded';
+	is %under<clips>, 0, 'with nothing to warn about';
+};
+
+subtest 'usage that overshoots the cap is still a clip' => {
+	plan 4;
+
+	# Models that bill reasoning tokens report a completion LARGER than the
+	# text cap they stopped at, which is why the gate is `>=` and not `==`.
+	my $backend = capped-backend(model => 'thinker', steps => [
+		{
+			chunks => ['half an ans'],
+			'finish-reason' => 'stop',
+			usage => { prompt => 500, completion => CAP + 40 },
+		},
+		{ content => 'this must never be asked for' },
+	]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], counter => counter(),
+		request-budget => window-budget(thinker => 100_000),
+	);
+
+	my $run = $loop.run([msg('user', 'think about it'),]);
+	run-settled($run, 'the overshooting run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<reason>, 'completion-truncated',
+		'a completion billed past the cap was still stopped by the cap';
+	is streams($backend).elems, 1, 'and it is not sent again';
+	is clip-logs(@events).elems, 1, 'one warning';
+	is clip-logs(@events).head.data<completion-tokens>, CAP + 40,
+		'which reports the number the provider actually billed, not the cap';
+};
+
+subtest 'prose is checked too: a lying "stop" at the cap' => {
+	plan 5;
+
+	# The gate is not about tool calls. A prose answer clipped mid-sentence
+	# and labelled 'stop' is the same lie, and committing it would put a
+	# half-finished turn into the transcript as a finished one.
+	my $backend = capped-backend(model => 'only', steps => [
+		{
+			chunks => ['The three things to do are: one, read the ', 'config; two, '],
+			'finish-reason' => 'stop',
+			usage => { prompt => 50, completion => CAP },
+		},
+		{ content => 'this must never be asked for' },
+	]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], counter => counter(),
+		request-budget => window-budget(only => 100_000),
+	);
+
+	my $run = $loop.run([msg('user', 'what should I do?'),]);
+	run-settled($run, 'the clipped prose run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'failed', 'the turn is not committed';
+	is %outcome<reason>, 'completion-truncated', 'with the truncation name';
+	is events-of(@events, 'assistant-message').elems, 0,
+		'no AssistantMessage: half an answer never becomes a turn';
+	is events-of(@events, 'turn-discarded').map({ .reason }).List, ('failed',),
+		'and what was streamed is retracted';
+	like clip-logs(@events).head.data<message>, /"finish_reason 'stop'"/,
+		'the warning quotes the reason the provider gave';
+};
+
+subtest 'no usage reported: the gate is inert, and says so' => {
+	plan 4;
+
+	# The blind spot, pinned deliberately. There is nothing to check
+	# without the provider's numbers, and asking for them on a stream
+	# (stream_options.include_usage) hangs OpenRouter in the header phase —
+	# so a provider that reports no usage keeps the honest
+	# `finish_reason: 'length'` gate and nothing else.
+	my $backend = capped-backend(model => 'silent', steps => [
+		{
+			chunks => ['Spawning. '],
+			tool-calls => [tool-call('c1', 'task', MANGLED-TASK),],
+			'finish-reason' => 'tool_calls',
+		},
+		{ content => 'all done' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [task-tool(),], results => { task => 'spawned' },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, counter => counter(),
+		request-budget => window-budget(silent => 100_000),
+	);
+
+	my $run = $loop.run([msg('user', 'research the streaming path'),]);
+	run-settled($run, 'the unmeasured run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'completed',
+		'the turn commits: a provider that reports nothing cannot be caught '
+			~ 'out by its own numbers';
+	is $provider.recorded-calls.elems, 1, 'and the call is dispatched';
+	is clip-logs(@events).elems, 0, 'with no warning, because nothing was seen';
+	is events-of(@events, 'attempt-succeeded').elems, 2,
+		'both turns report the transport worked — which is all an unmeasured '
+			~ 'turn can ever say';
+};
+
+subtest 'the finish reason rides the committed turn, and stops at replay' => {
+	plan 5;
+
+	my $path = $tmp.add('envelope.jsonl');
+	my $session = test-session(path => $path, meta => {});
+	my $backend = capped-backend(model => 'only', steps => [
+		{ content => 'a whole answer', usage => { prompt => 40, completion => 12 } },
+	]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], counter => counter(), :$session,
+	);
+
+	my $run = $loop.run([msg('user', 'answer me'),]);
+	run-settled($run, 'the sessioned run');
+	is (await $run.result)<outcome>, 'completed', 'the run completes';
+
+	my @assistant = $session.events.grep({
+		$_<type> eq 'message' && $_<payload><role> eq 'assistant'
+	});
+	is @assistant.elems, 1, 'one assistant turn reached the transcript';
+	is @assistant.head<payload><finish-reason>, 'stop',
+		'and its envelope records how the provider said generation ended — '
+			~ 'the only place a truncation nobody caught could still be seen';
+	is @assistant.head<payload><usage><completion-tokens>, 12,
+		'beside the usage it already carried';
+
+	nok $session.messages.tail.can('finish-reason'),
+		'while the rebuilt Message drops it, as every extra is dropped: a '
+			~ 'replayed conversation must look exactly like the one that was '
+			~ 'sent';
+
+	$session.close;
+};
+
+subtest 'an honest length that had already assembled a call' => {
+	plan 6;
+
+	# The truthful shape of the same round: the provider cut the answer off
+	# AND said so, with a half-assembled tool call on the response. The
+	# length gate is what fires — the calls are not read, let alone
+	# dispatched.
+	my @prompt = [msg('user', 'delegate it'),];
+	my $kit = capped-backend(model => 'kit', steps => [
+		{
+			chunks => ['Spawning: '],
+			tool-calls => [tool-call('c1', 'task', '{"prompt":"do the'),],
+			'finish-reason' => 'length',
+			error => 'Hit max tokens', 'error-class' => 'response',
+		},
+	]);
+	my $direct = $kit.chat-completion-stream(@prompt);
+	my $deadline = now + TIMEOUT;
+	until $direct.is-done {
+		die 'the scripted length never settled' if now > $deadline;
+		sleep 0.002;
+	}
+	nok $direct.is-success, 'the scripted round failed, as a length does';
+	is $direct.finish-reason, 'length', 'carrying the reason the provider gave';
+	is $direct.tool-calls.head<function><name>, 'task',
+		'and the call it had assembled before the cut';
+
+	my $backend = capped-backend(model => 'only', steps => [
+		{
+			chunks => ['Spawning: '],
+			tool-calls => [tool-call('c1', 'task', '{"prompt":"do the'),],
+			'finish-reason' => 'length',
+			error => 'Hit max tokens', 'error-class' => 'response',
+			usage => { prompt => 50, completion => CAP },
+		},
+		{ content => 'this must never be asked for' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => [task-tool(),], results => { task => 'spawned' },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, counter => counter(),
+		request-budget => window-budget(only => 100_000),
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the honest length run');
+	my %outcome = await $run.result;
+
+	is %outcome<reason>, 'completion-truncated',
+		'the reported length reaches the verdict path it always did';
+	is $provider.recorded-calls.elems, 0,
+		'and the partial call on the failed response is never dispatched';
+	is streams($backend).elems, 1, 'one send, as before';
+};

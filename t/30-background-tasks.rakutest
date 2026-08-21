@@ -1,0 +1,1070 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::CompletionBus;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Agent::RequestBudget;
+use LLM::Agent::Run;
+use LLM::Agent::Session;
+use LLM::Agent::Subagents;
+use LLM::Chat::Conversation::Message;
+
+# BACKGROUND DELEGATION, end to end: a `task` call that acknowledges and
+# returns, a run that parks instead of ending, and an answer that arrives
+# later as a framed user turn.
+#
+# The claims this file exists to pin, in the order they matter:
+#
+#   the run does not END with work outstanding — it PARKS, and the answer
+#   starts a fresh round;
+#
+#   an answer is presented EXACTLY ONCE, whichever way round the child
+#   settling and a `task_wait` for it happened;
+#
+#   the park is interruptible and safe — a cancel, a steer and a child
+#   that will never answer each end it, and none of them leaves an
+#   operation open on a bus the next run would park on;
+#
+#   time spent parked is not time spent WORKING, so a wall-clock cap
+#   measures the parent and not its children's patience;
+#
+#   and with no bus, none of this exists. A composer without one behaves
+#   exactly as it did before any of it was written.
+#
+# Every child here is deterministic: it settles when a Promise this file
+# keeps says so, and never on a sleep that is "probably long enough".
+
+plan 13;
+
+my $tmp = $*TMPDIR.add("llm-agent-t30-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	close-test-sessions();
+	if $tmp.e {
+		# The artifact directories are children, so this is depth-first.
+		for $tmp.dir -> $entry {
+			if $entry.d {
+				.unlink for $entry.dir;
+				$entry.rmdir;
+			}
+			else {
+				$entry.unlink;
+			}
+		}
+		$tmp.rmdir;
+	}
+}
+
+my $n = 0;
+sub fresh-path(--> IO::Path) { $tmp.add('s' ~ $n++ ~ '.jsonl') }
+
+# Poll for a condition with a loud deadline. Never one sleep long enough
+# to "probably" be right.
+sub wait-until(&condition, Str:D $what) {
+	my $deadline = now + TIMEOUT;
+	until &condition() {
+		die "Timed out after {TIMEOUT}s waiting for $what" if now > $deadline;
+		sleep 0.005;
+	}
+}
+
+sub read-tool(--> Hash) {
+	tool-decl('fs_read', 'Read a file', { path => { type => 'string' } },
+		required => ['path']);
+}
+
+sub ask-tool(--> Hash) {
+	tool-decl('user_ask', 'Ask a question',
+		{ question => { type => 'string' } }, required => ['question']);
+}
+
+sub gate-tool(--> Hash) {
+	tool-decl('slow_work', 'Work that takes a while');
+}
+
+sub types(--> List) {
+	(
+		{ name => 'reviewer', description => 'Reviews a diff and reports problems.' },
+		{ name => 'tester', description => 'Runs the tests and reports failures.' },
+	);
+}
+
+sub task-call(Str:D $id, Str:D $type, Str:D $prompt --> Hash:D) {
+	tool-call($id, 'task',
+		'{"agent-type":"' ~ $type ~ '","prompt":"' ~ $prompt ~ '"}');
+}
+
+sub wait-call(Str:D $id, Str:D $agent-id --> Hash:D) {
+	tool-call($id, 'task_wait', '{"agent-id":"' ~ $agent-id ~ '"}');
+}
+
+sub answer-call(Str:D $id, Str:D $agent-id, Str:D $answer --> Hash:D) {
+	tool-call($id, 'task_answer',
+		'{"agent-id":"' ~ $agent-id ~ '","answer":"' ~ $answer ~ '"}');
+}
+
+sub read-call(Str:D $id --> Hash:D) {
+	tool-call($id, 'fs_read', '{"path":"a"}');
+}
+
+#|( The handle a spawn callback answers with: `.run` and `.session-path`,
+    duck-typed, exactly as the composer checks for. )
+class ChildHandle {
+	has LLM::Agent::Run:D $.run is required;
+	has Str:D $.session-path is required;
+}
+
+#|( A fleet of deterministic children.
+
+    A child does at most three things, in order, and each of them is a
+    thing this file can hold open: it asks its parent a question (and
+    blocks on the answer), it runs one gated tool call (and blocks until a
+    Promise here is kept), and it answers. Which of the three it does is
+    the fleet's configuration, so "the child has NOT finished yet" is a
+    fact a test arranges rather than a race it hopes to win. )
+class Fleet {
+	#| Set after the composer exists — the same forward declaration the
+	#| composer's own `loop` argument needs.
+	has $.composer is rw;
+
+	#|( A Promise a child's one gated tool call waits on, keyed by agent-id
+	    or by agent TYPE (id first). Absent means the child has no gated
+	    round and finishes as fast as it can. )
+	has %.gates;
+
+	#| Agent TYPES whose children ask their parent a question first.
+	has @.asking;
+
+	#|( A Promise an asking child waits on B<before> it asks. Absent means
+	    it asks the moment its first tool call runs, which is usually
+	    while the parent is still mid-generation — fine, and deliberately
+	    not fine when the point of a test is that the question arrived
+	    while the run was already parked. )
+	has Promise $.ask-gate;
+
+	has Str $.question =
+		'The brief names the payments module, and there are two of them. '
+			~ 'Which one did you mean?';
+
+	#| What each child finally says: by type, then the fallback.
+	has %.finals;
+	has Str $.final = 'the child is done';
+
+	#| What one child's round cost, when a test is about the bill.
+	has Numeric $.cost;
+
+	has @.children;
+	has @.outcomes;
+	has Lock:D $!lock .= new;
+
+	method callback(--> Callable:D) {
+		-> %spec {
+			my Str $agent-id = %spec<agent-id>;
+			my Str $type = %spec<type><name>;
+			my Bool $asks = so @!asking.first({ $_ eq $type });
+			my $gate = %!gates{$agent-id} // %!gates{$type};
+
+			my $provider = ScriptedProvider.new(
+				tools => [ask-tool(), gate-tool()],
+				responder => -> $name, $arguments, $id {
+					if $name eq 'user_ask' {
+						self!ask($agent-id);
+					}
+					else {
+						await Promise.anyof($gate, Promise.in(TIMEOUT))
+							with $gate;
+						'the gate opened';
+					}
+				},
+			);
+
+			my @steps = (
+				|($asks
+					?? ({ content => 'I have to ask',
+						  tool-calls => [tool-call('k1', 'user_ask',
+							'{"question":"which module?"}'),] },)
+					!! ()),
+				|($gate.defined
+					?? ({ content => 'working on it',
+						  tool-calls => [tool-call('k2', 'slow_work', '{}'),] },)
+					!! ()),
+				%(
+					content => (%!finals{$type} // $!final),
+					|($!cost.defined
+						?? (usage => { prompt => 100, completion => 50,
+							cost => $!cost })
+						!! ()),
+				),
+			);
+
+			my $backend = scripted-backend(
+				steps => @steps.map({ $_.Hash }).List,
+			);
+			my $loop = LLM::Agent::Loop.new(
+				backends => [$backend,], :$provider,
+				|($!cost.defined
+					?? (request-budget => LLM::Agent::RequestBudget.new(
+						default-profile =>
+							LLM::Agent::RequestBudget::Profile.new(
+								context-window => 100_000),
+					))
+					!! ()),
+			);
+			my $run = $loop.run([msg('user', %spec<prompt>),]);
+
+			$!lock.protect: {
+				@!children.push: %( :$agent-id, :$run, :$loop, :$backend );
+			};
+			ChildHandle.new(run => $run, session-path => '');
+		};
+	}
+
+	# One child, asking, on the child's own thread — and blocked there
+	# until the parent (or a sweep) answers it.
+	method !ask(Str:D $agent-id --> Str:D) {
+		await Promise.anyof($!ask-gate, Promise.in(TIMEOUT)) with $!ask-gate;
+
+		my %outcome = (await $!composer.post-question(
+			$agent-id, message => $!question,
+		)).Hash;
+		$!lock.protect: { @!outcomes.push: %( :$agent-id, :%outcome ) };
+
+		(%outcome<action> // '') eq 'accept'
+			?? 'the parent said: ' ~ ((%outcome<content> // %())<answer> // '')
+			!! 'nobody could be asked: ' ~ (%outcome<action> // 'nothing');
+	}
+
+	method children(--> List) { $!lock.protect: { @!children.List } }
+	method outcome-of(Str:D $agent-id) {
+		my $found = $!lock.protect: {
+			@!outcomes.first({ $_<agent-id> eq $agent-id });
+		};
+		$found.defined ?? $found<outcome> !! Nil;
+	}
+}
+
+#|( A composer and a loop, wired to each other and to a fleet, with the
+    forward declarations both ends need. Answers
+    C<< { loop, composer, backend } >>. )
+sub wire(
+	Fleet:D $fleet,
+	:$bus, :$session, :$inner, :@steps!,
+	:%composer-args = %(), :%loop-args = %(),
+	--> Hash:D
+) {
+	my $loop;
+	my $composer = LLM::Agent::Subagents.new(
+		inner => ($inner // ScriptedProvider.new(
+			tools => [read-tool(),],
+			results => { fs_read => 'the file says hello' },
+		)),
+		types => types(), spawn => $fleet.callback,
+		loop => { $loop },
+		|($session.defined ?? (:$session) !! ()),
+		|($bus.defined ?? (completion-bus => $bus) !! ()),
+		|%composer-args,
+	);
+	$fleet.composer = $composer;
+
+	my $backend = scripted-backend(steps => @steps.map({ $_.Hash }).List);
+	$loop = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => $composer,
+		|($session.defined ?? (:$session) !! ()),
+		|($bus.defined ?? (completion-bus => $bus) !! ()),
+		# What a host really names: delegation batches, and a collect that
+		# is repeated BY DESIGN.
+		concurrent-tools      => ['task', 'task_wait'],
+		identical-call-exempt => ['task_wait'],
+		# Fast enough that a park is not most of this file's runtime, slow
+		# enough that it is still a poll and not a spin.
+		park-poll             => 0.02e0,
+		|%loop-args,
+	);
+
+	%( :$loop, :$composer, :$backend );
+}
+
+# The user turns of one recorded request, in order.
+sub user-turns(@messages --> List) {
+	@messages.grep({ .role eq 'user' }).map({ .content }).List;
+}
+
+# The framed turn a request carries, if it carries one.
+sub background-turn(@calls) {
+	for @calls -> %call {
+		with %call<messages>.list.first({
+			.role eq 'user' && .content.starts-with('[background event]');
+		}) -> $turn {
+			return $turn;
+		}
+	}
+	Nil;
+}
+
+subtest 'a task acknowledges, the run parks, and the answer arrives as a turn' => {
+	plan 21;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => { agent => 'parent' });
+	my $bus = LLM::Agent::CompletionBus.new;
+	my $gate = Promise.new;
+	my $fleet = Fleet.new(
+		gates => { reviewer => $gate },
+		finals => { reviewer => 'reviewed billing/, and it is fine' },
+	);
+
+	# The park itself is the signal. The child is held until the run has
+	# actually parked on it, so "the run parked and THEN the answer came"
+	# is arranged rather than hoped for.
+	my @parked;
+	my @unparked;
+	my $cb = Lock.new;
+
+	my %wired = wire($fleet, :$bus, :$session,
+		steps => [
+			{ content => 'delegating',
+			  tool-calls => [task-call('c1', 'reviewer', 'review the payments module'),] },
+			{ content => 'started it; nothing else to do here' },
+			{ content => 'the reviewer says billing/ is fine' },
+		],
+		loop-args => %(
+			'on-park'   => -> %info {
+				$cb.protect: { @parked.push: %info.Hash };
+				try $gate.keep(True);
+			},
+			'on-unpark' => -> %info { $cb.protect: { @unparked.push: %info.Hash } },
+		),
+	);
+
+	my $run = %wired<loop>.run([msg('user', 'get the payments module reviewed'),]);
+	run-settled($run, 'the parked run');
+	my @events = drain-events($run);
+	my %outcome = (await $run.result).Hash;
+
+	is %outcome<outcome>, 'completed',
+		'the run completed — after the child, not before it';
+
+	# --- the acknowledgement ------------------------------------------
+	my @results = events-of(@events, 'tool-result').List;
+	is @results.elems, 1, 'one tool result: the task call itself';
+	nok @results[0].is-error,
+		'an acknowledgement is not an error — nothing failed';
+	ok @results[0].content.starts-with('STATUS: started'),
+		'and it says in its first three words that it is not the answer';
+	ok @results[0].content.contains('safe to finish your turn'),
+		'it tells the model the one thing it will not otherwise believe: '
+			~ 'that ending its turn here does not end the conversation';
+
+	# --- the park -------------------------------------------------------
+	my @parks = events-of(@events, 'run-parked').List;
+	is @parks.elems, 1, 'the run parked exactly once';
+	is @parks[0].outstanding, 1, 'waiting on one operation';
+	is @parks[0].ops[0]<op-id>, 'reviewer-1',
+		'and the inventory names it, which is what a UI renders';
+
+	my @resumes = events-of(@events, 'run-resumed').List;
+	is @resumes.elems, 1, 'and resumed once';
+	is @resumes[0].reason, 'completion', 'because something arrived';
+	ok @resumes[0].parked-seconds >= 0, 'carrying what the wait cost';
+
+	is @parked.elems, 1, 'the on-park hook fired once';
+	is @unparked.elems, 1,
+		'and its counterpart exactly once — a host that lends a slot for '
+			~ 'the duration of a park needs it back';
+
+	# --- the operation, event by event ----------------------------------
+	is events-of(@events, 'background-op-started')[0].op-id, 'reviewer-1',
+		'the operation was announced when it was acknowledged';
+	nok events-of(@events, 'background-op-settled')[0].collected,
+		'and settled UNcollected: nothing joined it synchronously, so a '
+			~ 'turn is coming';
+	is events-of(@events, 'background-op-delivered')[0].op-kind,
+		'subagent-settled', 'which is the turn that was injected';
+
+	# --- what the model actually saw -------------------------------------
+	my $turn = background-turn(%wired<backend>.recorded-calls);
+	ok $turn.defined && $turn.content.contains('not the user speaking'),
+		'the next request carries a user turn that says it is not the user';
+	ok $turn.content.contains('reviewed billing/, and it is fine'),
+		'with the child’s own words in it';
+	ok $turn.content.contains('reviewer-1') && $turn.content.contains('task call c1'),
+		'and enough identity to stand on its own once compaction has '
+			~ 'eaten the acknowledgement it answers';
+
+	# --- and what the transcript recorded --------------------------------
+	# The acknowledgement is an ANSWERED tool message, and without a flag
+	# it is indistinguishable from a tool call that finished — so a crash
+	# repair reading this transcript back would classify a delegation
+	# whose answer was lost as one that completed, and stay silent about
+	# it.
+	my $ack-line = $session.events.first({
+		($_<payload><tool-call-id> // '') eq 'c1';
+	});
+	ok $ack-line.defined && ?($ack-line<payload><background> // False),
+		'the acknowledgement’s own tool message is flagged `background`: it '
+			~ 'is answered, and its real result is still outstanding';
+
+	my $injected = $session.events.first({
+		($_<payload><injected> // '') eq 'subagent-settled';
+	});
+	is-deeply $injected<payload><role injected completion-of call-id>.List,
+		('user', 'subagent-settled', 'reviewer-1', 'c1'),
+		'the envelope extras are the durable delivery marker: what kind of '
+			~ 'event it was, whose completion, and the call that started it';
+};
+
+subtest 'the idle valve ends a park nothing will ever end, and sweeps the questions' => {
+	plan 10;
+
+	my $bus = LLM::Agent::CompletionBus.new;
+	# This child asks a question and blocks on the answer for ever, which
+	# is exactly the operation that can never complete — and it is held
+	# until the run has really parked, so the two parks below are the ones
+	# this test says they are rather than an accident of who got there
+	# first.
+	my $ask-gate = Promise.new;
+	my $fleet = Fleet.new(asking => ['reviewer'], :$ask-gate);
+
+	my %wired = wire($fleet, :$bus,
+		steps => [
+			{ content => 'delegating',
+			  tool-calls => [task-call('c1', 'reviewer', 'review the payments module'),] },
+			{ content => 'started it' },
+			{ content => 'I see the question, but I am busy with other things' },
+		],
+		loop-args => %(
+			'park-idle-timeout' => 0.4e0,
+			'on-park'           => -> %info { try $ask-gate.keep(True) },
+		),
+	);
+
+	my $run = %wired<loop>.run([msg('user', 'get it reviewed'),]);
+	run-settled($run, 'the idling run');
+	my @events = drain-events($run);
+	my %outcome = (await $run.result).Hash;
+
+	is %outcome<outcome>, 'failed',
+		'the run ends rather than waiting for ever';
+	is %outcome<reason>, 'park-idle',
+		'with a reason a program can branch on';
+	ok %outcome<error>.contains('reviewer-1'),
+		'and it NAMES what never answered, which is the one thing somebody '
+			~ 'reading this failure needs to know';
+	ok %outcome<error>.contains('Whether they took effect is unknown'),
+		'and says the honest thing about it';
+
+	is events-of(@events, 'run-parked').elems, 2,
+		'two parks: one that the question woke, and one that nothing did';
+	is events-of(@events, 'run-resumed').map({ .reason }).List,
+		('completion', 'idle'),
+		'the first ended because the question arrived, the second because '
+			~ 'the valve fired';
+
+	# The question really did reach the parent, on its own, with no call
+	# to carry it.
+	my $turn = background-turn(%wired<backend>.recorded-calls);
+	ok $turn.defined && $turn.content.contains('Which one did you mean?'),
+		'the question was delivered as a turn of its own';
+	ok $turn.content.contains('task_answer'),
+		'telling the model how to answer it';
+
+	# And the child is not left blocked on a parent that has stopped.
+	wait-until({ $fleet.outcome-of('reviewer-1').defined },
+		'the child to be told its question is going nowhere');
+	is $fleet.outcome-of('reviewer-1')<action>, 'cancel',
+		'the child was answered `cancel` rather than left on a vow nobody '
+			~ 'was ever going to keep';
+	is $bus.state<outstanding>, 0,
+		'and nothing is left open on the bus for the NEXT run of this '
+			~ 'conversation to park on';
+};
+
+subtest 'a cancel reaches a parked run, and closes what it was waiting for' => {
+	plan 6;
+
+	my $bus = LLM::Agent::CompletionBus.new;
+	# A gate this test never opens until the assertions are done: the
+	# child cannot settle, so the park cannot end any way but the cancel.
+	my $gate = Promise.new;
+	my $fleet = Fleet.new(gates => { reviewer => $gate });
+
+	my $run;
+	my %wired = wire($fleet, :$bus,
+		steps => [
+			{ content => 'delegating',
+			  tool-calls => [task-call('c1', 'reviewer', 'review it'),] },
+			{ content => 'started it' },
+		],
+		loop-args => %( 'on-park' => -> %info { $run.cancel } ),
+	);
+
+	$run = %wired<loop>.run([msg('user', 'get it reviewed'),]);
+	run-settled($run, 'the cancelled park');
+	my @events = drain-events($run);
+	my %outcome = (await $run.result).Hash;
+
+	is %outcome<outcome>, 'cancelled', 'the run was cancelled';
+	is events-of(@events, 'run-cancelled')[0].stage, 'parked',
+		'and says where it was when it noticed';
+	is events-of(@events, 'run-resumed')[0].reason, 'cancelled',
+		'the park ended for the same reason';
+
+	is $bus.state<outstanding>, 0,
+		'CLOSE-ALL FIRST: an operation left open on a session-scoped bus '
+			~ 'would park the next run of this conversation on work nobody '
+			~ 'is producing any more';
+	is $bus.state<queued>, 0, 'and nothing was queued behind it';
+
+	# The cascade still reaches the child, and the gate is opened here so
+	# nothing is left waiting on it after this subtest.
+	wait-until({ $fleet.children.elems == 1 }, 'the child to exist');
+	try $gate.keep(True);
+	drained-settled($run, 'the cancelled run');
+	ok $fleet.children[0]<run>.is-cancelled,
+		'and the child was cancelled with its parent';
+};
+
+subtest 'a steer wakes a park, and completions still go first' => {
+	plan 5;
+
+	my $bus = LLM::Agent::CompletionBus.new;
+	my $gate = Promise.new;
+	my $fleet = Fleet.new(
+		gates => { reviewer => $gate },
+		finals => { reviewer => 'the review is done' },
+	);
+
+	my @steers;
+	my $steer-lock = Lock.new;
+
+	my %wired = wire($fleet, :$bus,
+		steps => [
+			{ content => 'delegating',
+			  tool-calls => [task-call('c1', 'reviewer', 'review it'),] },
+			{ content => 'started it' },
+			{ content => 'noted, and the review is in' },
+		],
+		loop-args => %(
+			'steer-source' => {
+				$steer-lock.protect: { my @taken = @steers; @steers = (); @taken }
+			},
+			# Both arrive while the run is parked, and the completion is
+			# made to land FIRST — so the round that wakes has genuinely
+			# got both of them and the order in the conversation is the
+			# loop's decision rather than an accident of timing.
+			'on-park' => -> %info {
+				try $gate.keep(True);
+				my $deadline = now + TIMEOUT;
+				until $bus.state<queued> > 0 {
+					die 'the child never settled' if now > $deadline;
+					sleep 0.005;
+				}
+				$steer-lock.protect: {
+					@steers.push: 'and check the tests while you are at it';
+				};
+			},
+		),
+	);
+
+	my $run = %wired<loop>.run([msg('user', 'get it reviewed'),]);
+	run-settled($run, 'the steered park');
+	my @events = drain-events($run);
+
+	is (await $run.result)<outcome>, 'completed', 'the run completed';
+	is events-of(@events, 'run-resumed')[0].reason, 'completion',
+		'the bus is checked before the steer source, so a completion that '
+			~ 'is already there is what the park says woke it';
+
+	my @turns = user-turns(%wired<backend>.recorded-calls[2]<messages>.list);
+	is @turns.elems, 3,
+		'the wake round carries the original question, the completion and '
+			~ 'the steer';
+	ok @turns[1].starts-with('[background event]'),
+		'the completion is second: it arrived first';
+	is @turns[2], 'and check the tests while you are at it',
+		'and the steer is LAST — a steer at a round boundary is very often '
+			~ 'the user reacting to the completion they just watched '
+			~ 'arrive, and the reaction cannot come before the thing '
+			~ 'reacted to';
+};
+
+subtest 'a task_wait parked on a child takes the answer, and no turn follows' => {
+	plan 6;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => { agent => 'parent' });
+	my $bus = LLM::Agent::CompletionBus.new;
+	my $gate = Promise.new;
+	my $fleet = Fleet.new(
+		gates => { reviewer => $gate },
+		finals => { reviewer => 'the review says it is fine' },
+	);
+
+	my %wired = wire($fleet, :$bus, :$session,
+		steps => [
+			{ content => 'delegating',
+			  tool-calls => [task-call('c1', 'reviewer', 'review it'),] },
+			{ content => 'I cannot go on without it',
+			  tool-calls => [wait-call('c2', 'reviewer-1'),] },
+			{ content => 'the review says it is fine' },
+		],
+		# The child is held until the wait has really parked on it, so
+		# "the join was waiting when it settled" is a fact rather than a
+		# race the cache would have won.
+		composer-args => %(
+			'on-child-park' => -> %info {
+				try $gate.keep(True) if %info<tool> eq 'task_wait';
+			},
+		),
+	);
+
+	my $run = %wired<loop>.run([msg('user', 'get it reviewed'),]);
+	run-settled($run, 'the joined run');
+	my @events = drain-events($run);
+
+	is (await $run.result)<outcome>, 'completed', 'the run completed';
+
+	my @results = events-of(@events, 'tool-result').List;
+	is @results[1].content, 'the review says it is fine',
+		'the task_wait answered with the child’s own words';
+
+	ok events-of(@events, 'background-op-settled')[0].collected,
+		'the operation settled COLLECTED: this call handed the answer over '
+			~ 'itself';
+	is events-of(@events, 'background-op-delivered').elems, 0,
+		'so no turn was injected — one presentation, not two';
+	is events-of(@events, 'run-parked').elems, 0,
+		'and the run never parked at all: a synchronous join is the model '
+			~ 'choosing to wait, and there was nothing outstanding by the '
+			~ 'time it stopped asking for tools';
+
+	nok $session.events.first({ $_<payload><injected>:exists }).defined,
+		'nothing in the transcript claims a completion turn that never '
+			~ 'happened';
+};
+
+subtest 'a task_wait after the settle withdraws the turn it would have been' => {
+	plan 6;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => { agent => 'parent' });
+	my $bus = LLM::Agent::CompletionBus.new;
+	my $gate = Promise.new;
+	my $fleet = Fleet.new(
+		gates => { reviewer => $gate },
+		finals => { reviewer => 'the review says it is fine' },
+	);
+
+	# The other order, and the hard one. The child has to settle — and its
+	# turn has to be sitting in the queue — BEFORE the task_wait runs, and
+	# both have to happen inside one round, because the drain at the top
+	# of the next one would otherwise deliver it first. An ordinary inner
+	# tool call in the same batch is the lever: the loop dispatches groups
+	# in model order, so this one finishes before the task_wait starts.
+	my $inner = ScriptedProvider.new(
+		tools => [read-tool(),],
+		responder => -> $name, $arguments, $id {
+			try $gate.keep(True);
+			my $deadline = now + TIMEOUT;
+			until $bus.state<queued> > 0 {
+				die 'the child never settled' if now > $deadline;
+				sleep 0.005;
+			}
+			'the file says hello';
+		},
+	);
+
+	my %wired = wire($fleet, :$bus, :$session, :$inner,
+		steps => [
+			{ content => 'delegating',
+			  tool-calls => [task-call('c1', 'reviewer', 'review it'),] },
+			{ content => 'reading, and then collecting',
+			  tool-calls => [read-call('c2'), wait-call('c3', 'reviewer-1'),] },
+			{ content => 'the review says it is fine' },
+		],
+	);
+
+	my $run = %wired<loop>.run([msg('user', 'get it reviewed'),]);
+	run-settled($run, 'the withdrawing run');
+	my @events = drain-events($run);
+
+	is (await $run.result)<outcome>, 'completed', 'the run completed';
+
+	nok events-of(@events, 'background-op-settled')[0].collected,
+		'the settle really did enqueue: nobody was waiting when it landed';
+
+	my @results = events-of(@events, 'tool-result').List;
+	is @results[2].content, 'the review says it is fine',
+		'and the task_wait that came afterwards answered from the cache';
+
+	is events-of(@events, 'background-op-delivered').elems, 0,
+		'the queued turn was WITHDRAWN rather than delivered — which is '
+			~ 'why `collected` does the withdraw whether or not the '
+			~ 'operation was still open';
+	is $bus.state<queued>, 0, 'and there is nothing left on the bus';
+
+	nok $session.events.first({ $_<payload><injected>:exists }).defined,
+		'so the answer reached the model exactly once, by the other route';
+};
+
+subtest 'a question comes back interim, and does not hang the join' => {
+	plan 6;
+
+	my $bus = LLM::Agent::CompletionBus.new;
+	my $fleet = Fleet.new(
+		asking => ['reviewer'],
+		finals => { reviewer => 'billing/ reviewed, and it is fine' },
+	);
+
+	my %wired = wire($fleet, :$bus,
+		steps => [
+			{ content => 'delegating',
+			  tool-calls => [task-call('c1', 'reviewer', 'review the payments module'),] },
+			{ content => 'started it' },
+			# The trap: waiting on the very child whose question is open.
+			# It MUST come back interim — the agent it is waiting for
+			# cannot make progress until this parent answers, and a join
+			# that parked here would be waiting for itself.
+			{ content => 'let me just collect it',
+			  tool-calls => [wait-call('c2', 'reviewer-1'),] },
+			{ content => 'fine, I will answer it',
+			  tool-calls => [answer-call('c3', 'reviewer-1', 'the one under billing/'),] },
+			{ content => 'now I wait' },
+			{ content => 'the reviewer says billing/ is fine' },
+		],
+	);
+
+	my $run = %wired<loop>.run([msg('user', 'get it reviewed'),]);
+	run-settled($run, 'the interim run');
+	my @events = drain-events($run);
+
+	is (await $run.result)<outcome>, 'completed',
+		'the run completed rather than deadlocking';
+
+	my @results = events-of(@events, 'tool-result').List;
+	ok @results[1].content.starts-with('STATUS: interim'),
+		'the join came back interim, because the child it is waiting on is '
+			~ 'blocked on an answer only this parent can give';
+	nok @results[1].is-error,
+		'and that is not an error: it is the channel working';
+
+	ok @results[2].content.contains('[background event]'),
+		'answering says what happens next, and it is not a collect';
+
+	wait-until({ $fleet.outcome-of('reviewer-1').defined },
+		'the child to record what it was told');
+	is $fleet.outcome-of('reviewer-1')<action>, 'accept',
+		'the child got its answer';
+
+	my $turn = %wired<backend>.recorded-calls.map({
+		|$_<messages>.list.grep({
+			.role eq 'user' && .content.contains('billing/ reviewed');
+		});
+	}).first;
+	ok $turn.defined,
+		'and what it finally said arrived as a background turn, without '
+			~ 'the parent having to collect it';
+};
+
+subtest 'a huge answer is excerpted into the turn, with the rest in an artifact' => {
+	plan 7;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => { agent => 'parent' });
+	my $bus = LLM::Agent::CompletionBus.new;
+	my $gate = Promise.new;
+
+	# A megabyte. Unelidable in a user turn — compaction refuses the
+	# recent window — so it has to go through the same seam a megabyte of
+	# fs_read goes through, or one delegation eats a context window.
+	my Str $huge = 'x' x 1_000_000;
+	my $fleet = Fleet.new(
+		gates => { reviewer => $gate }, finals => { reviewer => $huge },
+	);
+
+	my %wired = wire($fleet, :$bus, :$session,
+		steps => [
+			{ content => 'delegating',
+			  tool-calls => [task-call('c1', 'reviewer', 'review everything'),] },
+			{ content => 'started it' },
+			{ content => 'that was a lot' },
+		],
+		loop-args => %(
+			'request-budget' => LLM::Agent::RequestBudget.new(
+				default-profile => LLM::Agent::RequestBudget::Profile.new(
+					context-window => 100_000),
+				max-observation-size => 2_000,
+			),
+			'on-park' => -> %info { try $gate.keep(True) },
+		),
+	);
+
+	my $run = %wired<loop>.run([msg('user', 'review everything'),]);
+	run-settled($run, 'the enormous run');
+	drain-events($run);
+
+	my $turn = background-turn(%wired<backend>.recorded-calls);
+	ok $turn.defined, 'the turn arrived';
+	ok $turn.content.chars < 5_000,
+		'and it is an EXCERPT: a megabyte in an unelidable user turn is a '
+			~ 'context window spent on one delegation';
+	ok $turn.content.starts-with('[background event]'),
+		'the framing survived at full size — a frame cut along with the '
+			~ 'content would leave a turn the model reads as a person';
+	ok $turn.content.contains('Incorporate this result'),
+		'and so did the instruction after it';
+	ok $turn.content.contains('elided'),
+		'with a marker saying what is missing and where it went';
+
+	my $injected = $session.events.first({
+		($_<payload><injected> // '') eq 'subagent-settled';
+	});
+	ok ($injected<payload><artifact> // %())<file>.defined,
+		'the transcript records the artifact the rest of it went to';
+
+	my $file = $path.parent.add($path.basename.subst(/'.jsonl'$/, '') ~ '.artifacts')
+		.add($injected<payload><artifact><file>);
+	is $file.e ?? $file.s !! 0, 1_000_000,
+		'and the whole megabyte really is in it';
+};
+
+subtest 'with no bus, a task call blocks exactly as it always did' => {
+	plan 8;
+
+	my $fleet = Fleet.new(finals => { reviewer => 'the review is fine' });
+
+	# No bus anywhere: not on the composer, not on the loop.
+	my %wired = wire($fleet,
+		steps => [
+			{ content => 'delegating',
+			  tool-calls => [task-call('c1', 'reviewer', 'review it'),] },
+			{ content => 'the review is fine' },
+		],
+	);
+
+	my $run = %wired<loop>.run([msg('user', 'get it reviewed'),]);
+	run-settled($run, 'the blocking run');
+	my @events = drain-events($run);
+
+	is (await $run.result)<outcome>, 'completed', 'the run completed';
+
+	my @results = events-of(@events, 'tool-result').List;
+	is @results[0].content, 'the review is fine',
+		'the task call answered with the CHILD’S ANSWER, not with an '
+			~ 'acknowledgement — it waited, as it always has';
+
+	is events-of(@events, 'run-parked').elems, 0, 'nothing parked';
+	is events-of(@events, 'background-op-started').elems, 0,
+		'nothing was tracked';
+	is events-of(@events, 'background-op-delivered').elems, 0,
+		'and nothing was injected';
+
+	# The words are part of "unchanged", and they are the part a model
+	# notices: a description that promised an immediate return on a tool
+	# that blocks would be a lie in every conversation.
+	my @tools = %wired<composer>.tools-for-llm.list;
+	my %task = @tools.first({ $_<function><name> eq 'task' })<function>;
+	ok %task<description>.contains('and wait for its answer'),
+		'the task description still says it waits';
+	nok %task<description>.contains('returns IMMEDIATELY'),
+		'and does not say the opposite';
+
+	my %wait = @tools.first({ $_<function><name> eq 'task_wait' })<function>;
+	ok %wait<description>.starts-with('Wait for an agent you started'),
+		'and task_wait is described as the ordinary collect it is here';
+};
+
+subtest 'a bus on the composer and not on the loop is said out loud' => {
+	plan 4;
+
+	# THE ONE WIRING MISTAKE THIS CANNOT SURVIVE. The composer promises
+	# the model an answer later; the loop has nothing telling it to wait
+	# for one, so it ends the run at the next quiet turn and the answer
+	# lands on a bus nobody reads. Every delegation is silently a lie, and
+	# nothing else has a symptom — which is why this is a loud Log rather
+	# than a comment in a Pod somebody will read afterwards.
+	my $bus = LLM::Agent::CompletionBus.new;
+	my $fleet = Fleet.new(finals => { reviewer => 'the review is fine' });
+
+	my $loop;
+	my $composer = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), spawn => $fleet.callback,
+		loop => { $loop }, completion-bus => $bus,
+	);
+	$fleet.composer = $composer;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'delegating',
+		  tool-calls => [task-call('c1', 'reviewer', 'review it'),] },
+		{ content => 'started it' },
+	]);
+	# ...and NO bus here, which is the whole of the mistake.
+	$loop = LLM::Agent::Loop.new(backends => [$backend,], provider => $composer);
+
+	my $run = $loop.run([msg('user', 'get it reviewed'),]);
+	run-settled($run, 'the misconfigured run');
+	my @events = drain-events($run);
+
+	is (await $run.result)<outcome>, 'completed',
+		'the run ends at the next quiet turn, because nothing told it to '
+			~ 'wait — which is exactly the damage';
+
+	my @complaints = events-of(@events, 'log').grep({
+		.data ~~ Associative
+			&& (.data<message> // '').contains('completion bus');
+	}).List;
+	is @complaints.elems, 1, 'and it complained, once per affected delegation';
+	is @complaints[0].level, 'error',
+		'at error, because a wiring bug that has no other symptom must not '
+			~ 'be filtered out with the chatter';
+	ok @complaints[0].data<message>.contains('SAME'),
+		'and says what to do about it';
+};
+
+subtest 'time spent parked is not time spent working' => {
+	plan 5;
+
+	# Ten times the cap, spent waiting. A run that counted it would die of
+	# a wall-clock limit for having been patient with a child — which,
+	# for an agent whose whole job is delegating, is a cap on the one
+	# thing it is for.
+	my Real $cap = 0.4e0;
+	my Real $park = 4.0e0;
+
+	my $bus = LLM::Agent::CompletionBus.new;
+	my $gate = Promise.new;
+	my $fleet = Fleet.new(
+		gates => { reviewer => $gate }, finals => { reviewer => 'done' },
+	);
+
+	my $started = now;
+	my %wired = wire($fleet, :$bus,
+		steps => [
+			{ content => 'delegating',
+			  tool-calls => [task-call('c1', 'reviewer', 'take your time'),] },
+			{ content => 'started it' },
+			{ content => 'and it is done' },
+		],
+		loop-args => %(
+			'request-budget' => LLM::Agent::RequestBudget.new(
+				default-profile => LLM::Agent::RequestBudget::Profile.new(
+					context-window => 100_000),
+				max-wall-clock => $cap,
+			),
+			'on-park' => -> %info {
+				start { await Promise.in($park); try $gate.keep(True) }
+			},
+		),
+	);
+
+	my $run = %wired<loop>.run([msg('user', 'get it reviewed'),]);
+	run-settled($run, 'the patient run');
+	drain-events($run);
+	my %outcome = (await $run.result).Hash;
+	my $elapsed = now - $started;
+
+	is %outcome<outcome>, 'completed',
+		"the run completed, having been parked for {$park}s against a "
+			~ "{$cap}s wall-clock cap";
+	isnt %outcome<reason>, 'budget-exhausted', 'nothing tripped';
+
+	ok $elapsed >= $park,
+		'it really did wait — this is not a test that raced past the park';
+	ok %outcome<spent><parked-seconds> >= $park * 0.9,
+		'and the seconds are reported, so the two numbers can be added '
+			~ 'back up';
+	ok %outcome<spent><wall-clock> < $cap,
+		'while `wall-clock` is what the run itself WORKED for, which is '
+			~ 'what the cap is about';
+};
+
+subtest 'a wake round is not a tool round' => {
+	plan 4;
+
+	# max-tool-rounds counts rounds that asked for tools. A run whose
+	# round budget was spent by notifications would run out of it for
+	# reasons that have nothing to do with tools — so a round woken by a
+	# completion, which asks for nothing, must not count.
+	my $bus = LLM::Agent::CompletionBus.new;
+	my $gate = Promise.new;
+	my $fleet = Fleet.new(
+		gates => { reviewer => $gate }, finals => { reviewer => 'reviewed' },
+	);
+
+	my %wired = wire($fleet, :$bus,
+		steps => [
+			{ content => 'delegating',
+			  tool-calls => [task-call('c1', 'reviewer', 'review it'),] },
+			{ content => 'started it' },
+			# The wake round, and then a SECOND tool round after it. With
+			# a cap of two, this only runs if the wake round in between
+			# was not counted.
+			{ content => 'now let me read something',
+			  tool-calls => [read-call('c2'),] },
+			{ content => 'all done' },
+		],
+		loop-args => %(
+			'max-tool-rounds' => 2,
+			'on-park'         => -> %info { try $gate.keep(True) },
+		),
+	);
+
+	my $run = %wired<loop>.run([msg('user', 'get it reviewed'),]);
+	run-settled($run, 'the woken run');
+	my @events = drain-events($run);
+
+	is (await $run.result)<outcome>, 'completed', 'the run completed';
+	is events-of(@events, 'limit-reached').elems, 0,
+		'no limit was reached: the round the completion woke asked for no '
+			~ 'tools, and did not spend a tool round';
+	is events-of(@events, 'run-parked').elems, 1, 'there really was a park';
+	is events-of(@events, 'tool-result').map({ .name }).List,
+		('task', 'fs_read'),
+		'and the tool round AFTER the wake still ran';
+};
+
+subtest 'an acknowledgement is small, whatever it is acknowledging' => {
+	plan 5;
+
+	my $bus = LLM::Agent::CompletionBus.new;
+	my $gate = Promise.new;
+	my $fleet = Fleet.new(gates => { reviewer => $gate });
+
+	# A model that starts a fleet of eight gets eight of these in one
+	# batch, so the only variable-length part of an acknowledgement — the
+	# label — is cut, and cut hard.
+	my Str $enormous = 'review ' ~ ('the payments module ' x 200);
+
+	my %wired = wire($fleet, :$bus,
+		steps => [
+			{ content => 'delegating',
+			  tool-calls => [tool-call('c1', 'task',
+				'{"agent-type":"reviewer","prompt":"' ~ $enormous ~ '"}'),] },
+			{ content => 'started it' },
+			{ content => 'done' },
+		],
+		loop-args => %( 'on-park' => -> %info { try $gate.keep(True) } ),
+	);
+
+	my $run = %wired<loop>.run([msg('user', 'get it reviewed'),]);
+	run-settled($run, 'the acknowledged run');
+	my @events = drain-events($run);
+
+	my $ack = events-of(@events, 'tool-result')[0];
+	ok $ack.content.starts-with('STATUS: started'), 'it is an acknowledgement';
+	ok $ack.content.chars < 800,
+		"an acknowledgement stays small by construction: {$ack.content.chars} "
+			~ "characters against a {$enormous.chars}-character brief";
+	ok $ack.content.contains('task_wait'),
+		'and still carries the escape hatch';
+
+	# The turn that follows may be as long as the answer is; it is the
+	# acknowledgement that has to stay cheap.
+	my $turn = background-turn(%wired<backend>.recorded-calls);
+	ok $turn.defined, 'the answer still arrived';
+	ok $turn.content.contains('asked to: review the payments module'),
+		'and the turn names the brief it was about, cut to a reference '
+			~ 'rather than repeated whole';
+};

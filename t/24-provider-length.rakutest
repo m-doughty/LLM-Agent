@@ -1,0 +1,440 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Compactor;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Agent::RequestBudget;
+use LLM::Agent::TokenCount;
+use LLM::Chat::Conversation::Message;
+
+# `finish_reason: 'length'`: the provider took the prompt, cut the answer
+# off, and said so. LLM::Chat surfaces that as a quit with an error class
+# of 'response', which classify-error buckets as `advance` — and on a
+# single-backend chain an advance degrades into a retry, so the loop used
+# to re-send an identical 200k-token request until the retry budget ran
+# out. Nothing about the outcome could change: the cap is deterministic.
+#
+# So a length is intercepted before the retry buckets get it, and split
+# into the two failures it really is. Near the window it joins the
+# compaction path (one compaction, then the terminal the preflight reaches
+# from the other side); nowhere near it, the completion cap was the binding
+# constraint and the run ends with `completion-truncated`.
+
+plan 9;
+
+# One token per character, no per-message overhead: every number below is
+# arithmetic a reader can check.
+sub counter(--> LLM::Agent::TokenCount) {
+	LLM::Agent::TokenCount::Heuristic.new(
+		chars-per-token => 1, per-message-overhead => 0,
+	);
+}
+
+sub profile(*%args --> LLM::Agent::RequestBudget::Profile) {
+	LLM::Agent::RequestBudget::Profile.new(|%args);
+}
+
+#|( The step a provider serves when it accepted the prompt and then ran out
+    of room for the answer: fragments, then a quit whose Response still
+    carries the reason (and, when the provider says so, the usage). )
+sub length-step(*%extra --> Hash) {
+	{
+		chunks          => ['I will start by ', 'reading the'],
+		'finish-reason' => 'length',
+		error           => 'Hit max tokens',
+		'error-class'   => 'response',
+		|%extra,
+	};
+}
+
+#|( 898 counted tokens: a sticky system line plus four 224-character
+    turns. Under a 1,200-token window it passes the preflight (898 + 100
+    reserve), is under a 1,200-budget compactor's 960-token trigger, and is
+    still inside the 25% the counter is allowed to be wrong by
+    (898 + 100 + 225 > 1200) — which is the exact shape of the production
+    failure: a request the budget thought had room, truncated anyway. )
+sub near-window-conversation(--> List) {
+	(
+		msg('system', 'SY', sticky => True, sysprompt => True),
+		|(1 .. 4).map({ msg($_ %% 2 ?? 'assistant' !! 'user', 'm' ~ ('.' x 223)) }),
+	).List;
+}
+
+sub window-budget(*%windows --> LLM::Agent::RequestBudget) {
+	LLM::Agent::RequestBudget.new(
+		profiles => %windows.map(-> $pair {
+			$pair.key => profile(
+				context-window      => $pair.value,
+				completion-reserve  => 100,
+				input-safety-margin => 0,
+			);
+		}).Hash,
+	);
+}
+
+# The streaming calls a backend received, in order — the blocking ones are
+# the compactor summarizing and are not round trips.
+sub streams(ScriptedBackend $backend --> List) {
+	$backend.recorded-calls.grep({ $_<kind> eq 'stream' }).List;
+}
+
+# The total size of one recorded request, as the loop's counter sees it.
+sub request-size(%call --> Int) {
+	counter().count-messages(%call<messages>.list);
+}
+
+subtest 'a length near the window compacts once and then succeeds' => {
+	plan 9;
+
+	my $summarizer = scripted-backend(
+		model => 'summarizer', steps => [{ content => 'THE SUMMARY' },],
+	);
+	my $backend = scripted-backend(model => 'only', steps => [
+		length-step(),
+		{ content => 'after compacting' },
+	]);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], counter => counter(),
+		compactor => LLM::Agent::Compactor.new(
+			backend => $summarizer, counter => counter(),
+			context-budget => 1_200, keep-recent => 2,
+		),
+		request-budget => window-budget(only => 1_200),
+	);
+
+	my $run = $loop.run(near-window-conversation());
+	run-settled($run, 'the truncated run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'completed',
+		'the request that was truncated is compacted and sent again';
+	is %outcome<final>, 'after compacting', 'and the second one answers';
+
+	is streams($backend).elems, 2,
+		'TWO round trips, not one per retry: the identical re-send is the '
+			~ 'whole defect';
+	my @sizes = streams($backend).map({ request-size($_) });
+	ok @sizes[1] < @sizes[0],
+		"and the second request is SMALLER (@sizes[1] < @sizes[0] tokens) — "
+			~ 'nothing identical was ever sent twice';
+
+	is events-of(@events, 'compaction-done').elems, 1,
+		'exactly one compaction, aimed at a target below what the counter '
+			~ 'measured';
+	is events-of(@events, 'round-started').elems, 1,
+		'all of it inside ONE round — a forced compaction is a retry of the '
+			~ 'round trip';
+
+	my @failed = events-of(@events, 'attempt-failed');
+	is @failed.elems, 1, 'one attempt failed';
+	is @failed.head.disposition, 'advance',
+		'as an advance that did NOT degrade into a retry-same, even though '
+			~ 'this is the only backend in the chain';
+	like @failed.head.error, /'provider-length'/,
+		'and the record says what the loop worked out, not just "Hit max '
+			~ 'tokens"';
+};
+
+subtest 'a length near the window, and no compactor: context-exhausted' => {
+	plan 9;
+
+	# THE regression pin. max-retries is 3, the chain is one backend long,
+	# and an advance with nowhere to go normally degrades into a retry —
+	# which is how one truncated answer used to cost three full prompts.
+	my $backend = scripted-backend(model => 'only', steps => [
+		length-step(),
+		{ content => 'this must never be asked for' },
+		{ content => 'nor this' },
+	]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], counter => counter(), max-retries => 3,
+		request-budget => window-budget(only => 1_200),
+	);
+
+	my $run = $loop.run(near-window-conversation());
+	run-settled($run, 'the exhausted run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'failed', 'the run ends';
+	is %outcome<reason>, 'context-exhausted',
+		'with the terminal the preflight reaches from the other side';
+	like %outcome<error>, /'no compactor'/,
+		'saying that making the conversation smaller is the missing piece';
+
+	is streams($backend).elems, 1,
+		'having sent the doomed request exactly ONCE — the identical retry '
+			~ 'is what this defect was';
+	is %outcome<attempts>.elems, 1,
+		'and the terminal carries the attempt that was paid for to discover '
+			~ 'this, rather than dropping it on the way out of the '
+			~ 'compaction path';
+	is events-of(@events, 'attempt-started').elems, 1, 'one attempt';
+	is events-of(@events, 'attempt-failed').head.disposition, 'advance',
+		'and its disposition is the non-degrading advance';
+
+	my @logs = events-of(@events, 'log').grep({
+		($_.data ~~ Associative)
+			&& ($_.data<message> // '').contains('truncated the completion')
+	});
+	is @logs.elems, 1,
+		'one Log event says the provider truncated a request at the window';
+	is @logs.head.level, 'warning',
+		'at warning, not info: this one cost a whole prompt to discover, '
+			~ 'and the number that let it through was wrong';
+};
+
+subtest 'a small prompt truncated by max_tokens: completion-truncated' => {
+	plan 8;
+
+	# A 12-token conversation against an 8,000-token window. Nothing about
+	# the context is the problem, and no amount of compaction makes a
+	# truncated answer fit a 256-token cap.
+	my $summarizer = scripted-backend(
+		model => 'summarizer', steps => [{ content => 'never summarized' },],
+	);
+	my $backend = scripted-backend(model => 'only', steps => [
+		length-step(),
+		{ content => 'this must never be asked for' },
+	]);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], counter => counter(),
+		compactor => LLM::Agent::Compactor.new(
+			backend => $summarizer, counter => counter(),
+			context-budget => 8_000, keep-recent => 2,
+		),
+		request-budget => window-budget(only => 8_000),
+	);
+
+	my $run = $loop.run([msg('user', 'do the thing'),]);
+	run-settled($run, 'the capped run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'failed', 'the round fails rather than retrying';
+	is %outcome<reason>, 'completion-truncated',
+		'under a name of its own — a program can tell "raise max_tokens" '
+			~ 'from "the conversation is too big"';
+	like %outcome<error>, /'max_tokens 256'/,
+		'and the error names the cap that bound, so it teaches';
+	like %outcome<error>, /'ompaction cannot help'/,
+		'and says why compaction is not the answer';
+
+	is streams($backend).elems, 1, 'one call, no retries';
+	is $summarizer.recorded-calls.elems, 0,
+		'and the compactor was never asked — a smaller conversation would '
+			~ 'not have made the answer fit';
+	is events-of(@events, 'attempt-failed').head.disposition, 'abort',
+		'the attempt aborts: no other backend truncates this answer '
+			~ 'differently';
+	is events-of(@events, 'turn-discarded').map({ .reason }).List, ('failed',),
+		'and the fragments it did stream are discarded, once';
+};
+
+subtest 'a length on backend 0 does not burn the chain' => {
+	plan 5;
+
+	my $primary = scripted-backend(model => 'primary', steps => [
+		length-step(),
+		{ content => 'the primary must not be asked twice' },
+	]);
+	my $fallback = scripted-backend(model => 'fallback', steps => [
+		{ content => 'the fallback took it' },
+	]);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$primary, $fallback], counter => counter(),
+		request-budget => window-budget(primary => 1_200, fallback => 10_000),
+	);
+
+	my $run = $loop.run(near-window-conversation());
+	run-settled($run, 'the chained run');
+	my @events = drain-events($run);
+
+	is (await $run.result)<final>, 'the fallback took it',
+		'a truncation at one backend’s window advances to the next, which '
+			~ 'may have a bigger one';
+	is streams($primary).elems, 1,
+		'the primary saw the request exactly once';
+	is streams($fallback).elems, 1, 'and the fallback exactly once';
+	is events-of(@events, 'attempt-failed').elems, 1,
+		'one failure between them';
+	is events-of(@events, 'compaction-done').elems, 0,
+		'and nothing was compacted: a backend that fits it was still to '
+			~ 'come, and compaction is the LAST move, not the first';
+};
+
+subtest 'every backend truncates: one compaction for the whole chain' => {
+	plan 6;
+
+	my $summarizer = scripted-backend(
+		model => 'summarizer', steps => [{ content => 'THE SUMMARY' },],
+	);
+	my $primary = scripted-backend(model => 'primary', steps => [
+		length-step(),
+		{ content => 'the primary took the smaller one' },
+	]);
+	my $fallback = scripted-backend(model => 'fallback', steps => [
+		length-step(),
+		{ content => 'the fallback must not be asked again' },
+	]);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$primary, $fallback], counter => counter(),
+		compactor => LLM::Agent::Compactor.new(
+			backend => $summarizer, counter => counter(),
+			context-budget => 1_200, keep-recent => 2,
+		),
+		request-budget => window-budget(primary => 1_200, fallback => 1_200),
+	);
+
+	my $run = $loop.run(near-window-conversation());
+	run-settled($run, 'the chain that truncated everywhere');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'completed', 'the compacted request gets through';
+	is %outcome<final>, 'the primary took the smaller one',
+		'at the head of the chain, which is where a retry starts again';
+	is events-of(@events, 'compaction-done').elems, 1,
+		'ONE compaction for the whole chain, not one per backend';
+	is streams($primary).elems, 2,
+		'the primary saw the big request once and the small one once';
+	is streams($fallback).elems, 1,
+		'and the fallback only ever saw the big one — the chain was never '
+			~ 'walked twice with the same bytes';
+	ok request-size(streams($primary)[1]) < request-size(streams($primary)[0]),
+		'the second request really is a different, smaller one';
+};
+
+subtest 'the provider’s own numbers beat the counter' => {
+	plan 4;
+
+	# The counter says 12 tokens against a 10,000-token window, which is
+	# nowhere near it. The provider says it billed 9,950 prompt tokens and
+	# 50 completion ones, which is the window exactly — and the provider is
+	# the one that tokenized the request.
+	my $backend = scripted-backend(model => 'only', steps => [
+		length-step(usage => { prompt => 9_950, completion => 50 }),
+		{ content => 'this must never be asked for' },
+	]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], counter => counter(),
+		request-budget => window-budget(only => 10_000),
+	);
+
+	my $run = $loop.run([msg('user', 'do the thing'),]);
+	run-settled($run, 'the run the counter misjudged');
+	my %outcome = await $run.result;
+
+	is %outcome<reason>, 'context-exhausted',
+		'reported usage that reaches the window is context overflow, '
+			~ 'whatever the counter thought';
+	# The terminal error belongs to the move the loop could not make (there
+	# is no compactor); what happened is in the attempt record, which is
+	# where somebody reading a failed run looks.
+	like %outcome<attempts>.head<error>, /'billed 9950 prompt tokens'/,
+		'and the attempt record quotes the provider rather than the counter';
+	unlike %outcome<attempts>.head<error>, /'ompaction cannot help'/,
+		'so it is not read as a completion cap';
+	is streams($backend).elems, 1, 'and it was sent exactly once';
+};
+
+subtest 'the tolerance decides which failure it was' => {
+	plan 4;
+
+	# A 1,000-token window with no reserve and no margin. The counter is
+	# allowed to be a quarter wrong, so 900 counted tokens (900 + 225 >
+	# 1000) is read as the window, and 700 (700 + 175 <= 1000) is not.
+	sub judged(Int:D $chars --> Hash) {
+		my $backend = scripted-backend(model => 'only', steps => [
+			length-step(),
+			{ content => 'this must never be asked for' },
+		]);
+		my $loop = LLM::Agent::Loop.new(
+			backends => [$backend,], counter => counter(),
+			request-budget => LLM::Agent::RequestBudget.new(
+				profiles => { only => profile(
+					context-window      => 1_000,
+					completion-reserve  => 0,
+					input-safety-margin => 0,
+				) },
+			),
+		);
+		my $run = $loop.run([msg('user', 'x' x $chars),]);
+		run-settled($run, 'the run of ' ~ $chars ~ ' tokens');
+		my %outcome = await $run.result;
+		%( reason => %outcome<reason>, calls => streams($backend).elems );
+	}
+
+	my %near = judged(900);
+	is %near<reason>, 'context-exhausted',
+		'inside the tolerance, the provider is believed over the counter';
+	is %near<calls>, 1, 'and the request is not sent again';
+
+	my %clear = judged(700);
+	is %clear<reason>, 'completion-truncated',
+		'clear of it by more than a quarter, the counter is believed and '
+			~ 'the completion cap is the honest answer';
+	is %clear<calls>, 1, 'and that request is not sent again either';
+};
+
+subtest 'a backend nothing describes gets the teaching terminal' => {
+	plan 4;
+
+	# No request budget at all: the same posture as the preflight, which
+	# sends a request nobody described rather than refusing it. An
+	# undeclared window is not evidence of a full one — so the terminal
+	# names both possibilities instead of inventing a compaction target.
+	my $backend = scripted-backend(model => 'undescribed', steps => [
+		length-step(),
+		{ content => 'this must never be asked for' },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,]);
+
+	my $run = $loop.run([msg('user', 'do the thing'),]);
+	run-settled($run, 'the undescribed run');
+	my %outcome = await $run.result;
+
+	is %outcome<reason>, 'completion-truncated',
+		'the failure still has a name, and it is still not a retry';
+	like %outcome<error>, /'no request-budget profile'/,
+		'and the error says why the loop could not tell which cap it was';
+	like %outcome<error>, /"declare a profile"/,
+		'and what to do if it was really the window';
+	is streams($backend).elems, 1, 'one call — the point of all of this';
+};
+
+subtest 'an ordinary response failure still retries as it always did' => {
+	plan 4;
+
+	# The guard rail on the guard rail. `error-class` 'response' is what a
+	# malformed body, an empty completion and a content filter all arrive
+	# as, and only ONE of them is a finish reason of 'length'. The rest
+	# must keep the retry they have always had.
+	my $backend = scripted-backend(model => 'only', steps => [
+		{ error => 'the body was not JSON', 'error-class' => 'response' },
+		{ content => 'the retry worked' },
+	]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], counter => counter(), max-retries => 3,
+		backoff-cap => 0.05,
+		request-budget => window-budget(only => 1_200),
+	);
+
+	my $run = $loop.run(near-window-conversation());
+	run-settled($run, 'the retried run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<outcome>, 'completed', 'the run recovers';
+	is %outcome<final>, 'the retry worked', 'on the second attempt';
+	is streams($backend).elems, 2, 'having asked the same backend twice';
+	is events-of(@events, 'attempt-failed').head.disposition, 'retry-same',
+		'because an advance with nowhere to go still degrades — that is a '
+			~ 'transient failure, not a deterministic cap';
+};

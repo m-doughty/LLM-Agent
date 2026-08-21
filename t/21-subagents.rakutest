@@ -1,8 +1,10 @@
 use Test;
 use lib 'lib', 't/lib';
+use JSON::Fast;
 use AgentTestKit;
 use LLM::Agent::Event;
 use LLM::Agent::Loop;
+use LLM::Agent::RequestBudget;
 use LLM::Agent::Session;
 use LLM::Agent::Subagents;
 use LLM::Chat::Conversation::Message;
@@ -17,7 +19,7 @@ use LLM::Chat::Conversation::Message;
 # that goes wrong is an is_error result and never an exception, and the
 # guards refuse in words the model can act on rather than by throwing.
 
-plan 20;
+plan 28;
 
 my $tmp = $*TMPDIR.add("llm-agent-t21-{$*PID}-{now.Int}");
 $tmp.mkdir;
@@ -138,9 +140,12 @@ subtest 'the task tool is published beside the inner catalogue' => {
 	);
 
 	my @tools = $subagents.tools-for-llm.list;
-	is @tools.map({ $_<function><name> }).List, ('fs_read', 'task'),
+	is @tools.map({ $_<function><name> }).List,
+		('fs_read', 'task', 'task_answer', 'task_wait'),
 		"the inner catalogue first, in its own order, and the composer's "
-			~ 'own tool last';
+			~ 'own three tools last — the delegation protocol is published '
+			~ 'whole, because a catalogue is fixed for a whole turn and the '
+			~ 'way to answer a question has to be there before one is asked';
 	is-deeply @tools[0], read-tool(),
 		'an inner declaration is passed through byte for byte — a composer '
 			~ 'that rewrote them would change what the model may call';
@@ -166,18 +171,25 @@ subtest 'an inner tool called task is dropped rather than published twice' => {
 	plan 2;
 
 	# Two declarations under one name is a request several providers
-	# reject outright, and the composer owns the name it routes on.
+	# reject outright, and the composer owns the names it routes on — all
+	# three of them.
 	my $inner = ScriptedProvider.new(
-		tools => [read-tool(), tool-decl('task', 'Something else entirely'),],
+		tools => [
+			read-tool(),
+			tool-decl('task', 'Something else entirely'),
+			tool-decl('task_wait', 'And something else again'),
+		],
 	);
 	my $subagents = LLM::Agent::Subagents.new(
 		inner => $inner, types => types(), spawn => -> %spec { Nil },
 	);
 
 	my @names = $subagents.tools-for-llm.map({ $_<function><name> }).List;
-	is @names, ('fs_read', 'task'), 'the name appears exactly once';
-	ok $subagents.tools-for-llm[1]<function><description>.starts-with('Delegate'),
-		"and it is the composer's, not the inner provider's";
+	is @names, ('fs_read', 'task', 'task_answer', 'task_wait'),
+		'each name appears exactly once';
+	ok $subagents.tools-for-llm[1]<function><description>.starts-with('Delegate')
+		&& $subagents.tools-for-llm[3]<function><description>.starts-with('Wait for'),
+		"and they are the composer's, not the inner provider's";
 };
 
 subtest 'a task call runs a child and answers with its final text' => {
@@ -242,7 +254,7 @@ subtest 'a task call runs a child and answers with its final text' => {
 };
 
 subtest 'the wrapping keeps the two envelopes apart' => {
-	plan 7;
+	plan 9;
 
 	my $spawner = Spawner.new(
 		scripts => { tester => (({ content => 'all green' },)) },
@@ -276,6 +288,15 @@ subtest 'the wrapping keeps the two envelopes apart' => {
 		'all of them tagged with the agent id';
 	is @wrapped.map({ $_.agent-type }).unique.List, ('tester',),
 		'and the agent type';
+
+	# THE JOIN, and it is constant for the child's whole life: every
+	# wrapper names the `task` call that started it, which is the only
+	# thing tying the tool-call events for that call to the child events
+	# it produced.
+	is @wrapped.map({ $_.call-id }).unique.List, ('c1',),
+		'every wrapper names the task call the child was started by';
+	is @wrapped[0].to-hash<call-id>, 'c1',
+		'and it is in the flattened form a transcript stores';
 
 	my @terminal = @wrapped.grep({
 		LLM::Agent::Event::TERMINAL-KINDS{$_.inner<kind>};
@@ -505,7 +526,17 @@ subtest 'the max-live backstop refuses while children are running' => {
 			[task-call("c$i", 'reviewer', "review chunk $i"),],
 		).head;
 	});
-	wait-until({ $subagents.live-agents.elems == 2 }, 'both children to start');
+	# Both conditions, because a slot appears the moment a spawn is
+	# ADMITTED and the handle's session-path is written when the callback
+	# answers: waiting on the count alone can read a row that is still
+	# `starting`, whose path is the empty string it was reserved with.
+	wait-until(
+		{
+			my @live = $subagents.live-agents;
+			@live.elems == 2 && !@live.grep({ $_<starting> }).elems;
+		},
+		'both children to start and register',
+	);
 
 	is $subagents.live-agents.map({ $_<agent-id> }).List,
 		('reviewer-1', 'reviewer-2'),
@@ -602,13 +633,29 @@ subtest 'cancelling the parent cancels its children' => {
 };
 
 subtest 'a cancel arriving inside the spawn window still settles the call' => {
-	plan 8;
+	plan 6;
 
 	# THE WINDOW: a spawn has taken its slot and the child run does not
 	# exist yet, because building one is the app's code and can take as
 	# long as it likes. This subtest parks the spawn callback exactly
 	# there and cancels the parent while it is parked, so the interleaving
 	# is a fact rather than something a slow runner might hit.
+	#
+	# Both calls of the batch are in the window, because a batch of task
+	# calls is started all at once (see "Several task calls at once") —
+	# which is why the cancel here has to reach TWO parked spawns and not
+	# one parked spawn and one that never began.
+	#
+	# That is also why the FIRST interception point — the pre-spawn check
+	# that refuses before the callback is entered at all — is no longer
+	# something this file can force: it needs the cancel to land between a
+	# call's admission and its own check, and with every call of a batch
+	# admitted and entered at once that window is a scheduling accident
+	# rather than a state a test can construct. It is still the arm that
+	# fires when the cancel wins that race, and what this subtest pins is
+	# the property both arms share and the one that matters: every call
+	# settles, and no child is left running behind a call nobody is
+	# waiting for.
 	my $in-spawn = Promise.new;
 	my $release = Promise.new;
 	my $lock = Lock.new;
@@ -625,8 +672,14 @@ subtest 'a cancel arriving inside the spawn window still settles the call' => {
 	);
 
 	my &spawn = -> %spec {
-		$lock.protect: { $spawns++ };
-		$in-spawn.keep(True) if $in-spawn.status ~~ Planned;
+		# The count and the latch under ONE lock: both calls of the batch
+		# arrive here at once now, and a bare `keep if Planned` is a race
+		# two threads lose together — the second `keep` throws, which the
+		# composer would quite correctly report as a spawn that failed.
+		$lock.protect: {
+			$spawns++;
+			$in-spawn.keep(True) if $in-spawn.status ~~ Planned;
+		};
 		await $release;
 
 		my $loop = LLM::Agent::Loop.new(
@@ -661,18 +714,20 @@ subtest 'a cancel arriving inside the spawn window still settles the call' => {
 		'the parent to park in a tool call');
 
 	# Two task calls in ONE batch — dispatched here rather than by the
-	# loop, which sends one at a time. The first parks in the window; the
-	# second is behind it and will be admitted after the cancel.
+	# loop, which only groups them when the app has said `task` may be
+	# grouped. Both park in the window.
 	my $batch = start $subagents.execute-tool-calls([
 		task-call('t1', 'reviewer', 'review one'),
 		task-call('t2', 'reviewer', 'review two'),
 	]);
 
 	await Promise.anyof($in-spawn, Promise.in(TIMEOUT));
-	is $in-spawn.status, Kept, 'the first spawn is parked inside the window';
-	is $subagents.live-agents.elems, 1, 'its slot is taken';
-	ok $subagents.live-agents[0]<starting>,
-		'and it is a cancellation target with no run behind it yet';
+	is $in-spawn.status, Kept, 'a spawn is parked inside the window';
+	wait-until({ $subagents.live-agents.elems == 2 },
+		'both spawns to take their slots');
+	is $subagents.live-agents.elems, 2, 'both slots are taken';
+	is $subagents.live-agents.grep({ $_<starting> }).elems, 2,
+		'and both are cancellation targets with no run behind them yet';
 
 	# HERE. Nothing exists that a Run-shaped sweep of the table could find.
 	$run.cancel;
@@ -683,16 +738,15 @@ subtest 'a cancel arriving inside the spawn window still settles the call' => {
 		'the batch settles: a cancel in the window does not strand it';
 
 	my @answers = $batch.result.List;
-	ok @answers[0]<is_error> && @answers[0]<content>.contains('cancelled'),
-		'the call that was in the window is answered as cancelled';
-	ok @answers[1]<is_error> && @answers[1]<content>.contains('did not run'),
-		'and the one behind it was never started at all';
-	is $spawns, 1,
-		'which the spawn callback agrees with: it was entered exactly once';
+	is @answers.grep({
+		$_<is_error> && $_<content>.contains('cancelled');
+	}).elems, 2,
+		'both calls that were in the window are answered as cancelled';
 
-	wait-until({ @built[0]<run>.is-done }, 'the child that was started');
-	is @built[0]<run>.result.result<outcome>, 'cancelled',
-		'and the child that HAD been built was cancelled rather than left '
+	wait-until({ @built.elems == $spawns && @built.all<run>.map({ .is-done }).all.so },
+		'the children that were started');
+	is @built.grep({ $_<run>.result.result<outcome> ne 'cancelled' }).elems, 0,
+		'and every child that HAD been built was cancelled rather than left '
 			~ 'running behind a call nobody was waiting for';
 
 	$parent-gate.keep(True);
@@ -701,7 +755,7 @@ subtest 'a cancel arriving inside the spawn window still settles the call' => {
 };
 
 subtest 'a child is owned until it has DRAINED, not until it has answered' => {
-	plan 8;
+	plan 17;
 
 	# The gap this subtest exists for: a child that abandoned a tool call
 	# to a deadline has a result — the parent gets its answer, which is
@@ -709,27 +763,55 @@ subtest 'a child is owned until it has DRAINED, not until it has answered' => {
 	# go of the child there would free its max-live slot, drop it out of
 	# live-agents, and leave cancel-children with nothing to cancel while
 	# a tool call carries on writing files.
+	#
+	# And the other half of it: OWNED is not LIVE. A child that never
+	# drains is owned for ever, and a composer that counted it against
+	# max-live would spend the rest of the host's life refusing work on
+	# behalf of something that has stopped doing any.
 	my $never = Promise.new;
 	my $stuck = ScriptedProvider.new(
 		tools => [read-tool(),], results => { fs_read => 'far too late' },
 		block-call => { fs_read => $never },
 	);
 
+	# The second child's tools: gated while the test needs it live, and
+	# then an ordinary tool round it finishes and drains from.
+	my $gate2 = Promise.new;
+	my $working = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'the file says hello' },
+		block-call => { fs_read => $gate2 },
+	);
+
 	my @kids;
 	my $lock = Lock.new;
+	# Two children out of one callback, told apart by the prompt they were
+	# given: the first wedges for ever, the second is the one admitted
+	# beside it.
 	my &spawn = -> %spec {
-		my $loop = LLM::Agent::Loop.new(
-			backends => [scripted-backend(steps => [
-				{ content => 'starting',
-				  tool-calls => [tool-call('k1', 'fs_read', '{"path":"a"}'),] },
-				{ content => 'I gave up on the tool and answered anyway' },
-			]),],
-			provider => $stuck,
-			# Short, and against a call that never answers: the child WILL
-			# reach its deadline, so nothing here waits on a clock to be
-			# lucky.
-			tool-deadline => 0.15,
-		);
+		my $loop = %spec<prompt> eq 'do the thing'
+			?? LLM::Agent::Loop.new(
+				backends => [scripted-backend(steps => [
+					{ content => 'starting',
+					  tool-calls => [tool-call('k1', 'fs_read', '{"path":"a"}'),] },
+					{ content => 'I gave up on the tool and answered anyway' },
+				]),],
+				provider => $stuck,
+				# Short, and against a call that never answers: the child
+				# WILL reach its deadline, so nothing here waits on a
+				# clock to be lucky.
+				tool-deadline => 0.15,
+			)
+			!! LLM::Agent::Loop.new(
+				backends => [scripted-backend(steps => [
+					{ content => 'working',
+					  tool-calls => [tool-call('k2', 'fs_read', '{"path":"b"}'),] },
+					{ content => 'second done' },
+				]),],
+				# No tool-deadline: this one is held open by the gate and
+				# then answers properly, which is what makes it the LIVE
+				# child rather than a second wedge.
+				provider => $working,
+			);
 		my $run = $loop.run([msg('user', %spec<prompt>),]);
 		$lock.protect: { @kids.push: %( :$run, :$loop ) };
 		ChildHandle.new(run => $run, session-path => '');
@@ -737,7 +819,7 @@ subtest 'a child is owned until it has DRAINED, not until it has answered' => {
 
 	my $subagents = LLM::Agent::Subagents.new(
 		inner => ScriptedProvider.new(tools => [read-tool(),]),
-		types => types(), :&spawn, max-live => 1,
+		types => types(), :&spawn, max-live => 1, drain-grace => 0.05,
 	);
 
 	my %answer = $subagents.execute-tool-calls(
@@ -758,6 +840,47 @@ subtest 'a child is owned until it has DRAINED, not until it has answered' => {
 		'so the composer still owns it — the slot is not free yet';
 	ok $subagents.live-agents[0]<draining>,
 		'and says which of the two it is';
+	wait-until({ ?$subagents.live-agents[0]<wedged> }, 'the drain grace to expire');
+	ok $subagents.live-agents[0]<wedged>,
+		'then exposes the wedge without reclaiming its slot or ownership';
+
+	is $subagents.owned-count, 1,
+		'owned, still: a wedge is this composer\'s to cancel until it drains';
+	is $subagents.live-count, 0,
+		'and live: nothing here can answer any more. That split is what the '
+			~ 'admission check turns on';
+
+	# ADMITTED, at max-live 1, beside a child the composer still owns.
+	my $second = start $subagents.execute-tool-calls(
+		[task-call('c2', 'reviewer', 'do the second thing'),],
+	).head;
+	wait-until({ $subagents.live-agents.elems == 2 },
+		'a second child to be admitted beside the wedge');
+	is $subagents.owned-count, 2, 'two children owned';
+	is $subagents.live-count, 1,
+		'one of which can answer — the wedge is not holding a slot';
+
+	# And the slot the live one took is a real one: while it is still
+	# working, a third call is refused.
+	my %refused = $subagents.execute-tool-calls(
+		[task-call('c3', 'reviewer', 'do a third thing'),],
+	).head;
+	ok %refused<is_error>,
+		'a third IS refused while the live one runs — the backstop still '
+			~ 'holds, it is only counting something else';
+	ok %refused<content>.contains('already 1')
+		&& %refused<content>.contains('the limit (1)'),
+		'and it refuses in the live count\'s words: a model told "there are '
+			~ 'already 2" would be waiting for one that is never coming';
+
+	$gate2.keep(True);
+	my %second-answer = await $second;
+	is %second-answer<content>, 'second done',
+		'the live child answers normally';
+	wait-until({ $subagents.owned-count == 1 },
+		'the second child to drain and let go of its slot');
+	is $subagents.live-count, 0,
+		'and once it has drained only the wedge is left — owned, uncounted';
 
 	is $subagents.cancel-children, 1,
 		'a shutdown reaches it, which is the whole point of holding on';
@@ -886,7 +1009,7 @@ subtest 'cancel-children settles a task call as an error instead of hanging' => 
 };
 
 subtest 'the parent transcript records both envelopes, and replays without the child' => {
-	plan 8;
+	plan 9;
 
 	my $path = fresh-path();
 	my $session = test-session(
@@ -928,6 +1051,9 @@ subtest 'the parent transcript records both envelopes, and replays without the c
 		'the spawn line says who, what and why';
 	ok %spawned<child-path>.ends-with('reviewer-1.jsonl'),
 		'and points at the child transcript rather than copying it';
+	is %spawned<call-id>, 'c1',
+		'and names the task call it came from, which is what joins the '
+			~ 'spawn line to the tool operation a few envelopes above it';
 
 	my %settled = $session.events.first({ $_<type> eq 'subagent-settled' })<payload>;
 	is %settled<outcome>, 'completed', 'the settle line has the outcome';
@@ -945,6 +1071,43 @@ subtest 'the parent transcript records both envelopes, and replays without the c
 	my $replayed = reopen-session(path => $path);
 	is $replayed.messages.elems, $messages,
 		'and the parent replays to exactly the same conversation';
+	$replayed.close;
+};
+
+subtest 'a spawn line written before call-id existed replays untouched' => {
+	plan 4;
+
+	# The compatibility case, spelled out as a file rather than as a
+	# claim: a transcript from before the key existed has spawn lines
+	# without it, and a reader that treated the absence as damage would
+	# refuse to open a conversation it can read perfectly well.
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => { agent => 'test' });
+	$session.append-message(msg('user', 'review this'));
+	# Deliberately NOT through the composer: this is the OLD shape, and
+	# writing it by hand is the only way to keep writing it once the
+	# composer has moved on.
+	$session.append-event(type => 'subagent-spawned', payload => %(
+		'agent-id' => 'reviewer-1', 'agent-type' => 'reviewer',
+		prompt => 'review the diff', label => 'the diff',
+		'child-path' => '/gone/reviewer-1.jsonl',
+	));
+	$session.append-event(type => 'subagent-settled', payload => %(
+		'agent-id' => 'reviewer-1', outcome => 'completed',
+		result => 'the diff is fine',
+	));
+	$session.close;
+
+	my $replayed;
+	lives-ok { $replayed = reopen-session(path => $path) },
+		'a transcript whose spawn line has no call-id still loads';
+
+	my %spawned = $replayed.events.first({ $_<type> eq 'subagent-spawned' })<payload>;
+	nok %spawned<call-id>.defined,
+		'the key is simply absent — nothing was invented for it';
+	is %spawned<agent-id>, 'reviewer-1', 'and everything beside it survived';
+	is $replayed.messages.elems, 1,
+		'with the conversation itself replayed as it always was';
 	$replayed.close;
 };
 
@@ -1209,4 +1372,449 @@ subtest 'emit-external is the seam, and it refuses rather than racing' => {
 	ok $emitted, 'a live run takes it, from whichever thread it came from';
 	is events-of(@more, 'log').elems, 1,
 		'and it is published on that run, once';
+};
+
+subtest 'a settled child is billed to the run that asked for it' => {
+	plan 9;
+
+	# The composer's half of "a parent's budget caps its subtree": when a
+	# child settles, its own `spent` record goes into the parent loop's
+	# accumulators through `absorb-spend`, so the parent's caps see money
+	# the parent's own attempts never spent.
+
+	my @child-runs;
+	my sub budgeted-spawner(Numeric:D $cost, *%child-caps --> Callable:D) {
+		-> %spec {
+			my $backend = scripted-backend(steps => [
+				{ content => 'the child answers',
+				  usage => { prompt => 200, completion => 100, cost => $cost } },
+			]);
+			my $loop = LLM::Agent::Loop.new(
+				backends => [$backend,],
+				# A budget of its own is what makes a run report `spent` at
+				# all: without one there is nothing to absorb, on purpose.
+				request-budget => LLM::Agent::RequestBudget.new(
+					default-profile =>
+						LLM::Agent::RequestBudget::Profile.new(
+							context-window => 100_000),
+					|%child-caps,
+				),
+			);
+			my $run = $loop.run([msg('user', %spec<prompt>),]);
+			@child-runs.push: %( :$run, :$loop );
+			ChildHandle.new(run => $run, session-path => fresh-path().Str);
+		};
+	}
+
+	my sub parent-run(&spawn, *%caps) {
+		my $loop;
+		my $subagents = LLM::Agent::Subagents.new(
+			inner => ScriptedProvider.new(tools => [read-tool(),]),
+			types => types(), :&spawn, loop => { $loop },
+		);
+		my $backend = scripted-backend(steps => [
+			{ content => 'delegating',
+			  usage => { prompt => 10, completion => 5, cost => 0.1e0 },
+			  tool-calls => [task-call('t1', 'reviewer', 'review this'),] },
+			{ content => 'and here is what it said',
+			  usage => { prompt => 10, completion => 5, cost => 0.1e0 } },
+		]);
+		$loop = LLM::Agent::Loop.new(
+			backends => [$backend,], provider => $subagents,
+			request-budget => LLM::Agent::RequestBudget.new(
+				default-profile => LLM::Agent::RequestBudget::Profile.new(
+					context-window => 100_000),
+				|%caps,
+			),
+		);
+		my $run = $loop.run([msg('user', 'get this reviewed'),]);
+		run-settled($run, 'the delegating run');
+		%( outcome => (await $run.result), events => drain-events($run) );
+	}
+
+	# --- The ordinary case ---------------------------------------------
+	my %fine = parent-run(budgeted-spawner(0.5e0));
+	is %fine<outcome><outcome>, 'completed', 'the delegation ran and answered';
+	is %fine<outcome><spent><cost>, 0.7e0,
+		"the parent's bill is its own two attempts plus the child's one";
+	is %fine<outcome><spent><total-tokens>, 30 + 300,
+		'and its tokens, the same way';
+
+	my @settled = events-of(%fine<events>, 'subagent')
+		.grep({ (.inner<kind> // '') eq 'run-completed' });
+	is @settled.elems, 1, 'the child really did complete';
+
+	# The envelope and the absorb are the same numbers, deliberately: the
+	# transcript records what the parent was billed.
+	my $child-spent = (await @child-runs[0]<run>.result)<spent>;
+	is $child-spent<cost>, 0.5e0, 'and its own record says what it cost';
+
+	# --- SABOTAGE: the child is what puts the parent over --------------
+	@child-runs = ();
+	my %over = parent-run(budgeted-spawner(0.6e0), max-cost => 0.5e0);
+	is %over<outcome><outcome>, 'failed',
+		'a child whose spend crosses the parent cap ends the parent run';
+	is %over<outcome><reason>, 'budget-exhausted',
+		'with the budget\'s ordinary reason';
+	is events-of(%over<events>, 'attempt-started').elems, 1,
+		'and the parent never made its next attempt: the delegation '
+			~ 'settled first, and the boundary after it refused';
+
+	# --- A child nobody counted is not billed for zero -----------------
+	@child-runs = ();
+	my %uncounted = parent-run(-> %spec {
+		my $loop = LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => [{ content => 'done' },]),],
+		);
+		my $run = $loop.run([msg('user', %spec<prompt>),]);
+		@child-runs.push: %( :$run, :$loop );
+		ChildHandle.new(run => $run, session-path => fresh-path().Str);
+	});
+	is %uncounted<outcome><spent><cost>, 0.2e0,
+		'a child with no budget reports no spend, and nothing is invented '
+			~ 'for it';
+};
+
+subtest 'a batch of task calls runs its children side by side' => {
+	plan 5;
+
+	# THE PARALLELISM PROOF, and it is a proof rather than a measurement:
+	# every spawn waits at a barrier until all of them have arrived. A
+	# composer that started them one after another would leave the first
+	# one waiting for children that cannot be built until it returns — so
+	# a serial batch takes BARRIER seconds per call and a concurrent one
+	# takes as long as one child, which is what the clock below asserts.
+	my constant SPAWNS = 4;
+	my constant BARRIER = 5;
+
+	my $lock = Lock.new;
+	my Int $arrived = 0;
+	my @ids;
+	my $all-here = Promise.new;
+
+	my &spawn = -> %spec {
+		my Bool $last = $lock.protect: {
+			@ids.push: %spec<agent-id>;
+			(++$arrived) == SPAWNS;
+		};
+		$all-here.keep(True) if $last;
+
+		# The barrier. A deadline rather than a bare await, so a
+		# regression is a failed test and not a hung suite.
+		await Promise.anyof($all-here, Promise.in(BARRIER));
+
+		my $loop = LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => [
+				{ content => 'reviewed ' ~ %spec<prompt> },
+			]),],
+		);
+		ChildHandle.new(
+			run => $loop.run([msg('user', %spec<prompt>),]),
+			session-path => '',
+		);
+	};
+
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]), types => types(), :&spawn,
+		max-live => SPAWNS,
+	);
+
+	my $started = now;
+	my @results = $subagents.execute-tool-calls(
+		(^SPAWNS).map({ task-call("t$_", 'reviewer', "review $_") }).List,
+	);
+	my $elapsed = now - $started;
+
+	is $all-here.status, Kept,
+		'every spawn was inside the callback at the same moment — the batch '
+			~ 'really is concurrent';
+	ok $elapsed < BARRIER,
+		"and it took {$elapsed.round(0.01)}s rather than the {BARRIER}s a "
+			~ 'serial batch would have spent waiting at the first barrier '
+			~ 'alone';
+	is @ids.elems, SPAWNS, 'one id per call';
+	is @ids.unique.elems, SPAWNS,
+		'and every one of them distinct: the counter mints under the same '
+			~ 'lock the slot is taken under';
+	is @results.map({ $_<tool_call_id> }).List,
+		(^SPAWNS).map({ "t$_" }).List,
+		'and the answers come back in the CALLER’s order, whatever order '
+			~ 'the children finished in';
+};
+
+subtest 'concurrent spawns never over-admit: max-live still holds' => {
+	plan 6;
+
+	# SABOTAGE: twice as many calls as there are slots, all arriving at
+	# once. The guards and the slot reservation are one critical section,
+	# so the arithmetic has to come out exactly — never five children in
+	# three slots, and never two children with one id.
+	my constant SLOTS = 3;
+	my constant CALLS = 6;
+
+	my $lock = Lock.new;
+	my Int $entered = 0;
+	my @ids;
+	my $hold = Promise.new;
+
+	my &spawn = -> %spec {
+		$lock.protect: { $entered++; @ids.push: %spec<agent-id> };
+		# Held open so that every admitted child is still live while the
+		# refusals are being decided.
+		await Promise.anyof($hold, Promise.in(TIMEOUT));
+		my $loop = LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => [{ content => 'done' },]),],
+		);
+		ChildHandle.new(
+			run => $loop.run([msg('user', %spec<prompt>),]), session-path => '',
+		);
+	};
+
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]), types => types(), :&spawn, max-live => SLOTS,
+	);
+
+	my $batch = start $subagents.execute-tool-calls(
+		(^CALLS).map({ task-call("t$_", 'reviewer', "review $_") }).List,
+	);
+
+	# The refusals are immediate; the admitted ones are parked. Wait for
+	# the admissions rather than sleeping on it.
+	wait-until({ $lock.protect({ $entered }) == SLOTS },
+		'the slots to fill');
+	is $lock.protect({ $entered }), SLOTS,
+		'exactly as many children were started as there were slots';
+	is $subagents.live-agents.elems, SLOTS,
+		'and the table agrees: no slot was taken twice';
+
+	$hold.keep(True);
+	await Promise.anyof($batch, Promise.in(TIMEOUT));
+	is $batch.status, Kept, 'the whole batch settles';
+
+	my @results = $batch.result.List;
+	is @results.elems, CALLS, 'every call is answered';
+	is @results.grep({ $_<is_error> && $_<content>.contains('is the limit') })
+		.elems, CALLS - SLOTS,
+		'the ones there was no room for are refused in the words the model '
+			~ 'can act on';
+	is $lock.protect({ @ids.unique.elems }), SLOTS,
+		'and no id was minted twice';
+};
+
+# === Strict task arguments ===
+#
+# The 2026-08-19 incident in one file. A provider generating a turn of
+# three long briefs hit its completion cap inside the third one and —
+# because constrained decoding closes what it opened — still emitted
+# VALID JSON, with a finish reason saying nothing had gone wrong. What
+# was left of the brief became key names. The call parsed, agent-type and
+# prompt were both there, and the prompt was a stump; the composer
+# spawned a subagent on it, and nobody could tell.
+
+#|( The mangled call as it arrived: a real agent type, a prompt cut
+    mid-sentence, and two fragments of the rest of the brief masquerading
+    as arguments — one of them carrying the newlines it was written
+    with. )
+sub mangled-arguments(--> Str:D) {
+	to-json(
+		%(
+			'agent-type'         => 'reviewer',
+			prompt               => 'Review the diff in the payments module '
+				~ 'and report every problem you find with the rounding of',
+			"sh_run.\n\nCONTEXT" => 'the half of the brief that never fitted',
+			art                  => 'and another fragment of it',
+		),
+		:!pretty,
+	);
+}
+
+subtest 'a clipped task call is diagnosed as mangled, and nothing is started' => {
+	plan 10;
+
+	my $spawner = Spawner.new(scripts => {
+		reviewer => (({ content => 'the review' },)),
+	});
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), spawn => $spawner.callback,
+	);
+
+	sub answer(Str:D $arguments --> Hash) {
+		$subagents.execute-tool-calls(
+			[tool-call('c1', 'task', $arguments),],
+		).head;
+	}
+
+	my %incident = answer(mangled-arguments());
+	ok %incident<is_error>,
+		'the call that parses, has both required keys, and is a lie is '
+			~ 'refused';
+	ok %incident<content>.contains(q['sh_run. CONTEXT']),
+		'the refusal names the first of the junk keys — flattened onto one '
+			~ 'line, because a key that carries newlines is not really a key';
+	ok %incident<content>.contains(q['art']),
+		'and the second: naming one of them would leave the model guessing '
+			~ 'which of its arguments was wrong';
+	ok %incident<content>.contains(q['agent-type'])
+		&& %incident<content>.contains(q['prompt'])
+		&& %incident<content>.contains(q['label']),
+		'it names every key a task call may carry, so the model does not '
+			~ 'have to remember the schema to recover';
+	ok %incident<content>.contains('cut off')
+		&& %incident<content>.contains('Re-emit'),
+		'and it teaches the actual lesson: this is what a truncated '
+			~ 'generation looks like, so send the whole call again';
+	ok %incident<content>.contains('complete task'),
+		'with the whole brief in the prompt, rather than the stump that '
+			~ 'arrived';
+
+	is $spawner.count, 0,
+		'and NOT ONE child was started: the mangled call is refused before '
+			~ 'anything is spawned, reserved or counted';
+
+	# A decorated call is refused by the same rule. The ruling is strict
+	# for `task` alone, and this is what strict costs.
+	my %decorated = answer(
+		'{"agent-type":"reviewer","prompt":"review the diff",'
+			~ '"label":"diff","priority":"high"}',
+	);
+	ok %decorated<is_error>,
+		'an otherwise perfect call with one invented key is refused too — '
+			~ 'the check cannot tell a decoration from a fragment, and the '
+			~ 'fragment is the one that matters';
+
+	# The unknown-key check runs FIRST, and this is where that shows: the
+	# call has no `agent-type` at all, but saying "no agent-type" would
+	# send the model looking for a key it thinks it wrote.
+	my %cased = answer('{"Agent-Type":"reviewer","prompt":"review the diff"}');
+	ok %cased<is_error> && %cased<content>.contains(q['Agent-Type']),
+		'a key that differs only in case is unknown — JSON keys are '
+			~ 'case-sensitive and so is this';
+	is $spawner.count, 0,
+		'still nothing spawned, three refusals later';
+};
+
+subtest 'a reason argument is tolerated, and only the junk is named' => {
+	plan 6;
+
+	# MCP::Client's reasons layer adds `reason` to every declaration on the
+	# way out and strips it on the way down — but it is stacked only when
+	# its host turns reasons on, and a model asked for a reason on every
+	# call for a whole conversation writes one here regardless.
+	my $spawner = Spawner.new(scripts => {
+		reviewer => (({ content => 'the review' },)),
+	});
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), spawn => $spawner.callback,
+	);
+
+	my Int $call-number = 0;
+	sub answer(Str:D $arguments --> Hash) {
+		$subagents.execute-tool-calls(
+			[tool-call('r' ~ $call-number++, 'task', $arguments),],
+		).head;
+	}
+
+	my %reasoned = answer(
+		'{"agent-type":"reviewer","prompt":"review the diff",'
+			~ '"reason":"the diff is large enough to be worth a whole run"}',
+	);
+	nok %reasoned<is_error>,
+		'a task call carrying a reason is accepted — refusing a delegation '
+			~ 'over a habit the harness taught the model would be the check '
+			~ 'doing harm';
+	is %reasoned<content>, 'the review', 'and the child really answered';
+	is $spawner.count, 1, 'so the child really was started';
+
+	my %mixed = answer(
+		'{"agent-type":"reviewer","prompt":"review the other diff",'
+			~ '"label":"other","reason":"because","scratch":"junk"}',
+	);
+	ok %mixed<is_error>, 'junk alongside a reason is still junk';
+	ok %mixed<content>.contains(q[not part of it: 'scratch'.]),
+		'and the refusal names the junk key and ONLY it: neither the '
+			~ 'tolerated reason nor the declared label is an offence';
+	is $spawner.count, 1, 'nothing else was spawned';
+};
+
+subtest 'the older refusals still say what they always said' => {
+	plan 6;
+
+	my $spawner = Spawner.new(scripts => { reviewer => review-script() });
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), spawn => $spawner.callback,
+	);
+
+	sub answer(Str:D $arguments --> Hash) {
+		$subagents.execute-tool-calls(
+			[tool-call('c1', 'task', $arguments),],
+		).head;
+	}
+
+	# Strictness sits in FRONT of these, so each one has to still be
+	# reached by the call it was written for.
+	ok answer('not json at all')<content>.contains('not a JSON object'),
+		'arguments that are not an object are still refused as such';
+	ok answer('{"prompt":"do it"}')<content>.contains('no agent-type'),
+		'a call whose only fault is a missing agent-type still says so';
+	ok answer('{"agent-type":"designer","prompt":"do it"}')<content>
+		.contains(q['reviewer', 'tester']),
+		'an agent type nobody registered still lists the ones that exist';
+	ok answer('{"agent-type":"reviewer"}')<content>.contains('no prompt'),
+		'and a call with no prompt still says THAT, rather than being '
+			~ 'caught by the unknown-key check on the way past';
+	ok answer('{"agent-type":"reviewer","prompt":"  "}')<is_error>,
+		'a whitespace prompt is as empty as it ever was';
+
+	is $spawner.count, 0, 'none of them started anything';
+};
+
+subtest 'the allow-list is generic, and the description carries the doctrine' => {
+	plan 6;
+
+	# The helper is deliberately not about `task`: the tools this composer
+	# grows next check their own calls against their own declarations with
+	# it.
+	is-deeply LLM::Agent::Subagents::unknown-argument-keys(
+		%( 'agent-type' => 'r', prompt => 'p', junk => 1 ),
+		('agent-type', 'prompt', 'label'),
+	), ('junk',), 'it names the keys the allow-list does not';
+
+	is-deeply LLM::Agent::Subagents::unknown-argument-keys(
+		%( zeta => 1, alpha => 2 ), ('known',),
+	), ('alpha', 'zeta'),
+		'sorted, so one mangled call refuses with the same words however '
+			~ 'its keys happened to be ordered';
+
+	is-deeply LLM::Agent::Subagents::unknown-argument-keys(
+		%( anything => 1, 'at-all' => 2 ), (),
+	), (),
+		'an EMPTY allow-list names nothing — a declaration without '
+			~ 'properties describes no arguments, and reading that as '
+			~ '"every key is unknown" would turn an unreadable schema into '
+			~ 'a tool that refuses every call it is given';
+
+	is-deeply LLM::Agent::Subagents::unknown-argument-keys(
+		%(), ('agent-type',),
+	), (), 'a call with no arguments has nothing unknown in it';
+
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => types(), spawn => -> %spec { Nil },
+	);
+	my %task = $subagents.tools-for-llm.first({
+		$_<function><name> eq 'task';
+	});
+	my $description = %task<function><description>;
+
+	ok $description.contains('A brief is worth its length'),
+		'the description tells the model that a brief may be as long as it '
+			~ 'needs to be — batching guidance without it reads as an '
+			~ 'instruction to compress, and a compressed brief is the same '
+			~ 'lost context arrived at on purpose';
+	ok $description.contains('splitting the spawns across turns is fine')
+		&& $description.contains('run concurrently'),
+		'and it says so BESIDE the batching guidance, which is unchanged';
 };

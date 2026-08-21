@@ -160,7 +160,7 @@ RunStarted        | run-started        | message-count, context-digest?
 RoundStarted      | round-started      | round, tokens?
 AttemptStarted    | attempt-started    | round, attempt, backend-index, model
 Token             | token              | text, round?, attempt?
-AttemptFailed     | attempt-failed     | round, attempt, backend-index, model?, error, error-class?, error-status?, disposition, backoff?
+AttemptFailed     | attempt-failed     | round, attempt, backend-index, model?, error, error-class?, error-status?, disposition, backoff?, usage?
 AttemptSucceeded  | attempt-succeeded  | round, attempt, backend-index, model-used?, finish-reason?, usage, latency-ms?
 AssistantMessage  | assistant-message  | message, reasoning?, round?
 TurnCommitted     | turn-committed     | message-id?, round?
@@ -169,7 +169,12 @@ ToolStarted       | tool-started       | id, name, round?
 ToolProgress      | tool-progress      | id, progress, total?, message?, round?
 ToolResult        | tool-result        | id, name?, content, is-error, artifact?, round?
 ToolAbandoned     | tool-abandoned     | id, name, reason, dispatched, round?
-Subagent          | subagent           | agent-id, agent-type, label?, inner
+Subagent          | subagent           | agent-id, agent-type, label?, call-id?, inner
+BackgroundOpStarted   | background-op-started   | op-id, op-kind, label?, call-id?, round?
+BackgroundOpSettled   | background-op-settled   | op-id, op-kind, collected, round?
+BackgroundOpDelivered | background-op-delivered | op-kind, op-id?, message-id?, round?
+RunParked         | run-parked         | outstanding, ops, round?
+RunResumed        | run-resumed        | reason, parked-seconds?, round?
 AskPending        | ask-pending        | request, tool?
 AskAnswered       | ask-answered       | request, answer?
 Log               | log                | level, logger?, data
@@ -188,10 +193,13 @@ C<to-hash> when it was not supplied.
 
 =head2 Turns: committed, and discarded
 
-C<AttemptSucceeded> says B<the transport worked>. It does not say the
-model's turn is part of the conversation, and the two really do come
-apart: a turn that asks for tools when a limit has been reached is
-discarded whole (see L<LLM::Agent::Loop>), tokens and all.
+C<AttemptSucceeded> says B<the transport worked> — and, since the loop's
+usage-clip gate, that the completion was not billed at the backend's
+C<max_tokens> either, so an answer the provider quietly cut off never
+reaches one (see L<LLM::Agent::Loop>). It does not say the model's turn
+is part of the conversation, and the two really do come apart: a turn
+that asks for tools when a limit has been reached is discarded whole,
+tokens and all.
 
 So a turn ends in exactly one of two events:
 
@@ -251,6 +259,56 @@ the buckets of L<LLM::Chat::Retry>'s C<classify-error>. C<reason> is the
 named-failure key described on C<RunFailed>, and is present only for the
 failures that have a name.
 
+=head2 Background work, and the run that waits for it
+
+A background tool call answers twice: once immediately, with an
+acknowledgement saying the work has started, and once later with what it
+produced. Five events frame that, and between them they answer the two
+questions a consumer of a background run actually has — B<what is still
+owed>, and B<why is nothing happening>.
+
+=begin table
+
+Event                 | The question it answers
+======================|==========================================================
+BackgroundOpStarted   | something was acknowledged, and an answer is owed for it
+BackgroundOpSettled   | that answer exists now
+BackgroundOpDelivered | and the model has been shown it, as a turn
+RunParked             | the model went quiet with work outstanding; here is what
+RunResumed            | ...and here is what woke it
+
+=end table
+
+C<BackgroundOpSettled>'s C<collected> is the one to read twice. B<False>
+is the ordinary case: the answer went onto the completion bus and a
+C<BackgroundOpDelivered> follows it at the next round boundary. B<True>
+means somebody joined the operation synchronously — a C<task_wait> that
+was already parked on the child when it settled — so the model has the
+answer as an ordinary tool result and B<no delivered event is coming>.
+Exactly one of the two presentations happens, and C<collected> is which.
+
+A C<RunParked> is B<not> a failure and B<not> a stall. The model finished
+its turn, the harness has work outstanding that it promised to report,
+and the run is waiting rather than ending — which is the whole of
+L<LLM::Agent::Loop>'s C<Park, don't end>. C<ops> is the inventory, in the
+order the operations were opened, and it is what a UI renders as "waiting
+on". It is always emitted, empty or not, for the same reason C<usage> is:
+"nothing outstanding" and "the inventory was not reported" are different
+facts.
+
+C<RunResumed>'s C<reason> says what ended the park — C<completion>
+(something landed), C<steer> (the user said something), C<cancelled>, or
+C<idle> (nothing arrived for C<park-idle-timeout>, and the run gives up
+honestly rather than waiting for ever). C<parked-seconds> is how long it
+waited, and it is the number that is B<subtracted> from the run's
+wall-clock spend: a run that spent an hour parked on a child spent an
+hour waiting, not working, and a C<max-wall-clock> that counted it would
+kill runs for being patient.
+
+Every one of the five is B<non-terminal>. A park is a pause, a resume is
+the end of a pause, and a background operation settling is not the run
+ending any more than a tool result is.
+
 =head2 Subagent: a child run's event, carried on the parent's stream
 
 A run that spawns another run (L<LLM::Agent::Subagents>) has two event
@@ -288,6 +346,28 @@ group by when several children are running at once: it is short, it is
 what the transcript's C<subagent-spawned> envelope records, and it is
 stable across a child that had to be restarted.
 
+C<call-id> is the other join, and it points the other way: it is the
+provider's id for the B<C<task> tool call that started this child>, the
+same string the C<ToolCall>, C<ToolResult> and C<ToolAbandoned> events
+for that call carry as C<id>. It is constant for the child's whole life —
+every wrapper for one agent carries the same one — which is what lets a
+consumer put a delegation's tool card and its agent card together instead
+of drawing the same act twice:
+
+=begin code :lang<raku>
+
+# One card, not two: the child's first event claims the tool card the
+# `task` call already put on screen.
+$card-for{$e.call-id} //= agent-card($e.agent-id);
+
+=end code
+
+It is B<optional>. A composer forwarding a child it did not start from a
+tool call has none to give, and an event replayed from a transcript
+written before the key existed has none either; both leave it undefined
+rather than inventing a call that never happened, and a consumer that
+finds no C<call-id> falls back to a card of its own.
+
 =head1 SEE ALSO
 
 L<LLM::Agent::Run> (the handle that carries the Supply), L<LLM::Chat::Retry>
@@ -321,6 +401,11 @@ my subset AgentDiscardReason of Str where * eq any('limit', 'failed', 'cancelled
 #| loop stopped, and C<dispatched> says whether the call can have run.
 my subset AgentAbandonReason of Str
 	where * eq any('cancelled', 'deadline', 'budget-exhausted');
+
+#| What ended a park. See RunResumed: C<idle> is the safety valve firing,
+#| and is the only one of the four that ends the run rather than the wait.
+my subset AgentResumeReason of Str
+	where * eq any('completion', 'steer', 'cancelled', 'idle');
 
 #|( The base of the taxonomy. Never emitted itself: C<kind> is a stub, so
     an event class that forgot to declare one fails loudly the first time
@@ -498,6 +583,9 @@ class LLM::Agent::Event::AttemptFailed is LLM::Agent::Event {
 	#| Seconds the loop will sleep before retrying. Present only for
 	#| C<retry-same> — an advance does not wait.
 	has Num $.backoff;
+	#| Whatever usage the provider reported for this failed attempt. An
+	#| empty Map means it reported none; failed calls can still be billed.
+	has %.usage;
 
 	method kind(--> Str:D) { 'attempt-failed' }
 	method payload(--> Hash:D) {
@@ -507,6 +595,7 @@ class LLM::Agent::Event::AttemptFailed is LLM::Agent::Event {
 			error => $!error, error-class => $!error-class,
 			error-status => $!error-status, disposition => $!disposition,
 			backoff => $!backoff,
+			|(%!usage.elems ?? (usage => %!usage.Hash) !! ()),
 		};
 	}
 }
@@ -523,7 +612,9 @@ class LLM::Agent::Event::AttemptSucceeded is LLM::Agent::Event {
 	#| 'stop', 'tool_calls', 'length', ... as the provider reported it.
 	has Str $.finish-reason;
 	#| C<prompt-tokens> / C<completion-tokens> / C<total-tokens> as far as
-	#| the provider reported them. B<Empty> — not absent — when it
+	#| the provider reported them, plus C<cached-prompt-tokens> — a
+	#| cache-hit SUBSET of C<prompt-tokens>, not an independent count —
+	#| when the provider reported one. B<Empty> — not absent — when it
 	#| reported nothing, so "zero" and "unknown" stay distinguishable.
 	has %.usage;
 	#| Wall-clock time from AttemptStarted to here.
@@ -747,6 +838,13 @@ class LLM::Agent::Event::Subagent is LLM::Agent::Event {
 	has Str:D $.agent-type is required;
 	#| What the model called this particular child, when it named one.
 	has Str $.label;
+	#|( The provider's id for the C<task> call this child was started
+	    B<by> — the same string that call's C<ToolCall> and C<ToolResult>
+	    carry as C<id> — and constant for the child's whole life.
+	    Undefined for a child that no tool call started, and for one
+	    replayed from a transcript written before the key existed. See the
+	    module Pod. )
+	has Str $.call-id;
 	#|( The child event, flattened. Required, and required to be a Hash: a
 	    wrapper with nothing inside says a child emitted something without
 	    saying what, which is worse than no event at all. )
@@ -756,7 +854,143 @@ class LLM::Agent::Event::Subagent is LLM::Agent::Event {
 	method payload(--> Hash:D) {
 		{
 			agent-id => $!agent-id, agent-type => $!agent-type,
-			label => $!label, inner => %!inner.Hash,
+			label => $!label, 'call-id' => $!call-id, inner => %!inner.Hash,
+		};
+	}
+}
+
+#|( A background operation has been acknowledged: something answered the
+    model immediately and undertook to report the real result later. From
+    here until the matching C<BackgroundOpSettled>, the run will not end
+    — see L<LLM::Agent::CompletionBus>.
+
+    Emitted by whatever opened the operation (a composer, a host's
+    notification sink), not by the loop: the loop finds out that work is
+    outstanding by asking the bus, and never by watching for this. )
+class LLM::Agent::Event::BackgroundOpStarted is LLM::Agent::Event {
+	#| The bus key this operation is tracked under, and the join to its
+	#| C<BackgroundOpSettled> / C<BackgroundOpDelivered>. For a delegation
+	#| it is the child's agent-id.
+	has Str:D $.op-id is required;
+	#|( What sort of work it is: 'subagent', 'job', whatever a host tracks.
+
+	    B<C<op-kind>, not C<kind>>, and the awkward name is load-bearing:
+	    C<kind> on an event is the B<wire name of the event class>, it is
+	    what C<to-hash> writes first, and a payload key of the same name
+	    would quietly overwrite it — leaving a C<background-op-started>
+	    that serialises as a C<subagent>. )
+	has Str:D $.op-kind is required;
+	#| What it is doing, for a human reading a list of outstanding work.
+	has Str $.label;
+	#|( The provider's id for the tool call that acknowledged it — the
+	    same string that call's C<ToolCall> and C<ToolResult> carry as
+	    C<id>. Undefined for an operation no tool call started. )
+	has Str $.call-id;
+	has Int $.round;
+
+	method kind(--> Str:D) { 'background-op-started' }
+	method payload(--> Hash:D) {
+		{
+			'op-id' => $!op-id, 'op-kind' => $!op-kind, label => $!label,
+			'call-id' => $!call-id, round => $!round,
+		};
+	}
+}
+
+#|( The answer a background operation owed now exists.
+
+    C<collected> is what a consumer branches on. B<False>: it went onto
+    the completion bus and a C<BackgroundOpDelivered> will follow at the
+    next round boundary. B<True>: somebody joined it synchronously and
+    the model already has it as a tool result, so nothing further is
+    coming. See the module Pod. )
+class LLM::Agent::Event::BackgroundOpSettled is LLM::Agent::Event {
+	#| Matches the C<BackgroundOpStarted>'s op-id.
+	has Str:D $.op-id is required;
+	#| See C<BackgroundOpStarted> on why this is not called C<kind>.
+	has Str:D $.op-kind is required;
+	#| True when a synchronous join took the result, so no turn is coming.
+	has Bool:D $.collected = False;
+	has Int $.round;
+
+	method kind(--> Str:D) { 'background-op-settled' }
+	method payload(--> Hash:D) {
+		{
+			'op-id' => $!op-id, 'op-kind' => $!op-kind,
+			collected => $!collected, round => $!round,
+		};
+	}
+}
+
+#|( A deliverable has been injected into the conversation as a framed
+    user turn: the model has now been shown it. Emitted by the loop, at
+    the round boundary that drained it.
+
+    C<op-id> is absent for an B<untracked> deliverable — news that nothing
+    was waiting for, which the run never parked on. C<message-id> is the
+    session envelope id of the turn, and is absent on a sessionless run;
+    it is the join between this event and the transcript line, which
+    carries the same C<< injected => kind >> extra. )
+class LLM::Agent::Event::BackgroundOpDelivered is LLM::Agent::Event {
+	#| See C<BackgroundOpStarted> on why this is not called C<kind>. It is
+	#| the deliverable's own kind, which is the same string the injected
+	#| turn's C<injected> extra carries.
+	has Str:D $.op-kind is required;
+	has Str $.op-id;
+	has Str $.message-id;
+	has Int $.round;
+
+	method kind(--> Str:D) { 'background-op-delivered' }
+	method payload(--> Hash:D) {
+		{
+			'op-kind' => $!op-kind, 'op-id' => $!op-id,
+			'message-id' => $!message-id, round => $!round,
+		};
+	}
+}
+
+#|( The model stopped asking for tools while background work was still
+    outstanding, so the run is B<waiting rather than ending>. NOT
+    terminal, and not a failure: see the module Pod.
+
+    C<ops> is the inventory as the bus reported it — C<< { op-id, kind,
+    label?, meta } >> per operation, in the order they were opened — and
+    is B<always> emitted, empty or not, because "nothing outstanding" and
+    "nobody said" are different answers. )
+class LLM::Agent::Event::RunParked is LLM::Agent::Event {
+	#| How many operations the run is waiting for.
+	has Int:D $.outstanding is required;
+	#| The inventory, oldest first. Plain data.
+	has @.ops;
+	has Int $.round;
+
+	method kind(--> Str:D) { 'run-parked' }
+	method payload(--> Hash:D) {
+		{
+			outstanding => $!outstanding, ops => @!ops.List, round => $!round,
+		};
+	}
+}
+
+#|( The park is over. C<reason> says what ended it: C<completion>
+    (something landed and a round is about to deliver it), C<steer> (the
+    user said something), C<cancelled>, or C<idle> — the safety valve,
+    which is the one reason that ends the B<run> rather than the wait.
+
+    C<parked-seconds> is what the wait cost, and it is subtracted from
+    the run's C<wall-clock> spend rather than added to it. )
+class LLM::Agent::Event::RunResumed is LLM::Agent::Event {
+	has AgentResumeReason:D $.reason is required;
+	#| How long the park lasted. Undefined only for a consumer that built
+	#| the event by hand.
+	has Num $.parked-seconds;
+	has Int $.round;
+
+	method kind(--> Str:D) { 'run-resumed' }
+	method payload(--> Hash:D) {
+		{
+			reason => $!reason, 'parked-seconds' => $!parked-seconds,
+			round => $!round,
 		};
 	}
 }
@@ -913,14 +1147,23 @@ class LLM::Agent::Event::RunFailed is LLM::Agent::Event {
 	    can do something about. Absent for the ordinary ones — a caller
 	    branching on it is branching on a case somebody deliberately named.
 
-	    Two are named so far. C<context-exhausted>: the conversation will
-	    not fit the context window — either compaction ran out of things
-	    to drop, or every backend's preflight refused it and compacting to
-	    the roomiest one's window did not help. C<budget-exhausted>: a run
-	    cap (cost, total tokens or wall clock) was reached; C<error> names
-	    which one, what was spent and what the cap was. Both are the loop
-	    stopping B<cleanly> rather than sending a request it knows will
-	    fail or spending money somebody said not to. )
+	    Four are named so far. C<context-exhausted>: the conversation will
+	    not fit the context window — compaction ran out of things to drop,
+	    or every backend refused it (a preflight that would not send it, or
+	    a provider that truncated the answer at the edge of the window) and
+	    compacting once did not help. C<budget-exhausted>: a run cap (cost,
+	    total tokens or wall clock) was reached; C<error> names which one,
+	    what was spent and what the cap was. C<completion-truncated>: a
+	    provider reported C<finish_reason: 'length'> on a request nowhere
+	    near the window, so C<max_tokens> was the binding constraint;
+	    C<error> names the cap, and no smaller conversation would change the
+	    outcome. C<park-idle>: the run was parked on background work and
+	    nothing arrived for C<park-idle-timeout>, so rather than wait for
+	    ever it closed the outstanding operations and said which ones never
+	    answered. All four are the loop stopping B<cleanly> rather than
+	    sending a request it knows will fail, spending money somebody said
+	    not to, paying for the same truncation twice, or parking until the
+	    host is restarted. )
 	has Str $.reason;
 
 	method kind(--> Str:D) { 'run-failed' }
@@ -938,7 +1181,8 @@ class LLM::Agent::Event::RunFailed is LLM::Agent::Event {
     the moment it arrives. )
 class LLM::Agent::Event::RunCancelled is LLM::Agent::Event {
 	#| Where the run was when it noticed: 'streaming', 'backoff',
-	#| 'tools', 'compaction', 'start'. Advisory; useful in a log.
+	#| 'tools', 'compaction', 'parked' (waiting on background work),
+	#| 'start'. Advisory; useful in a log.
 	has Str $.stage;
 	has Int $.round;
 

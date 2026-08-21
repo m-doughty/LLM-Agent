@@ -1,0 +1,249 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use JSON::Fast;
+use LLM::Agent::Canonical;
+use LLM::Agent::Compactor;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Agent::RequestBudget;
+use LLM::Agent::RunContext;
+use LLM::Agent::TokenCount;
+
+plan 4;
+
+class RequestSpy does LLM::Agent::TokenCount {
+	has Int:D $.scale = 1;
+	has @.requests;
+
+	method count-messages(@messages --> Int) {
+		$!scale * [+] @messages.map({ ($_.content // '').chars });
+	}
+
+	method count-text(Str:D $text --> Int) { $!scale * $text.chars }
+
+	method count-request(
+		@messages, :@tools = (), Str :$context-head, Str :$context-tail,
+		--> Int
+	) {
+		@!requests.push: {
+			messages => @messages.elems,
+			tools    => @tools.elems,
+			head     => ($context-head // ''),
+			tail     => ($context-tail // ''),
+		};
+		self.count-messages(@messages)
+			+ ($context-head.defined ?? self.count-text($context-head) !! 0)
+			+ ($context-tail.defined ?? self.count-text($context-tail) !! 0)
+			+ (@tools.elems
+				?? self.count-text(to-json(@tools.List, :!pretty)) !! 0);
+	}
+}
+
+class MutableCatalogue {
+	has @!catalogue;
+
+	submethod BUILD(:@catalogue) { @!catalogue = @catalogue }
+
+	method tools-for-llm(--> List) { @!catalogue.List }
+	method set-catalogue(@catalogue --> Nil) {
+		@!catalogue = @catalogue;
+		Nil;
+	}
+	method execute-tool-calls(@calls --> List) { () }
+}
+
+sub profile(*%args --> LLM::Agent::RequestBudget::Profile) {
+	LLM::Agent::RequestBudget::Profile.new(|%args);
+}
+
+subtest 'each backend preflights the complete request in its own units' => {
+	plan 8;
+	my $primary-counter = RequestSpy.new(scale => 4);
+	my $fallback-counter = RequestSpy.new(scale => 1);
+	my $primary = scripted-backend(model => 'primary', steps => []);
+	my $fallback = scripted-backend(
+		model => 'fallback', steps => [{ content => 'fallback answer' },],
+	);
+	my $provider = MutableCatalogue.new(catalogue => [
+		tool-decl('fs_read', 'Read a file', { path => { type => 'string' } }),
+	]);
+	my $context = LLM::Agent::RunContext.new(
+		head-sections => [identity => 'request head'],
+		facts => [date => '2026-08-13'],
+	);
+	my $run = LLM::Agent::Loop.new(
+		backends => [$primary, $fallback], provider => $provider,
+		request-budget => LLM::Agent::RequestBudget.new(profiles => {
+			primary => profile(
+				context-window => 500, completion-reserve => 50,
+				input-safety-margin => 0, counter => $primary-counter,
+			),
+			fallback => profile(
+				context-window => 5_000, completion-reserve => 50,
+				input-safety-margin => 0, counter => $fallback-counter,
+			),
+		}),
+	).run([msg('user', 'x' x 100),], :$context);
+	run-settled($run, 'the per-model fallback run');
+
+	is (await $run.result)<final>, 'fallback answer',
+		'the fallback re-preflights and accepts in its own units';
+	is $primary.recorded-calls.elems, 0,
+		'the primary is skipped by its selected counter';
+	is $fallback.recorded-calls.elems, 1, 'the fallback alone is sent';
+	is $primary-counter.requests.elems, 1,
+		'the primary profile counted one complete request';
+	is $fallback-counter.requests.elems, 1,
+		'the fallback profile independently counted it again';
+	is $primary-counter.requests.head<tools>, 1,
+		'the selected counter receives the tool catalogue';
+	ok $primary-counter.requests.head<head>.chars > 0,
+		'it receives the runtime context head';
+	ok $primary-counter.requests.head<tail>.chars > 0,
+		'and the runtime context tail';
+};
+
+subtest 'Usage calibration is isolated from context, tools and rewritten history' => {
+	plan 6;
+	my $usage = LLM::Agent::TokenCount::Usage.new;
+	my $backend = scripted-backend(model => 'only', steps => [
+		{ content => 'one', usage => { prompt => 500, completion => 1 } },
+		{ content => 'two' },
+		{ content => 'three' },
+		{ content => 'four' },
+		{ content => 'five' },
+		{ content => 'six' },
+	]);
+	my $provider = MutableCatalogue.new(catalogue => [
+		tool-decl('one', 'First tool'),
+	]);
+	my $context = LLM::Agent::RunContext.new(facts => [date => '2026-08-13']);
+	my $changed = LLM::Agent::RunContext.new(facts => [date => '2026-08-14']);
+	my @history = [msg('user', 'same history'),];
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], provider => $provider,
+		request-budget => LLM::Agent::RequestBudget.new(profiles => {
+			only => profile(context-window => 100_000, counter => $usage),
+		}),
+	);
+
+	run-settled($loop.run(@history, :$context), 'the calibrated run');
+	is $usage.calibration<prompt-tokens>, 500, 'the selected profile learns usage';
+	run-settled($loop.run(@history, :$context), 'the identical request-shape run');
+	is $usage.calibration<prompt-tokens>, 500,
+		'an unchanged context, catalogue and history keeps it';
+
+	run-settled(
+		$loop.run([msg('user', 'other text!!'),], :$context),
+		'the rewritten-history run',
+	);
+	is-deeply $usage.calibration, {},
+		'rewritten same-length history invalidates through its prefix digest';
+
+	$usage.record-usage(
+		prompt-tokens => 600, message-count => 1,
+		prefix-digest => messages-digest(@history), backend => 'only',
+	);
+	run-settled($loop.run(@history, context => $changed), 'the changed-context run');
+	is-deeply $usage.calibration, {},
+		'a changed runtime context invalidates before preflight';
+
+	$usage.record-usage(
+		prompt-tokens => 700, message-count => 1,
+		prefix-digest => messages-digest(@history), backend => 'only',
+	);
+	run-settled($loop.run(@history, context => $changed), 'the stable changed-context run');
+	is $usage.calibration<prompt-tokens>, 700,
+		'the new stable request shape keeps its new calibration';
+	$provider.set-catalogue([
+		tool-decl('two', 'Different tool'),
+	]);
+	run-settled($loop.run(@history, context => $changed), 'the changed-tools run');
+	is-deeply $usage.calibration, {},
+		'a changed tool catalogue invalidates before preflight';
+};
+
+subtest 'forced compaction carries the selected target counter end to end' => {
+	plan 6;
+	my $normal = RequestSpy.new(scale => 1);
+	my $primary-counter = RequestSpy.new(scale => 10);
+	my $fallback-counter = RequestSpy.new(scale => 2);
+	my $primary = scripted-backend(model => 'primary', steps => []);
+	my $fallback = scripted-backend(
+		model => 'fallback', steps => [{ content => 'fits after trim' },],
+	);
+	my $summarizer = scripted-backend(model => 'summary', steps => [
+		{ error => 'unavailable', 'error-class' => 'http', 'error-status' => 403 },
+	]);
+	my @conversation = (
+		msg('system', 'SY', sticky => True, sysprompt => True),
+		|(1 .. 8).map({ msg($_ %% 2 ?? 'assistant' !! 'user', 'm' x 100) }),
+	).List;
+	my Int $fallback-before = $fallback-counter.count-messages(@conversation);
+	my $run = LLM::Agent::Loop.new(
+		backends => [$primary, $fallback], counter => $normal,
+		compactor => LLM::Agent::Compactor.new(
+			backend => $summarizer, counter => $normal,
+			context-budget => 3_000, keep-recent => 2,
+		),
+		request-budget => LLM::Agent::RequestBudget.new(profiles => {
+			primary => profile(
+				context-window => 3_000, completion-reserve => 100,
+				input-safety-margin => 0, counter => $primary-counter,
+			),
+			fallback => profile(
+				context-window => 1_500, completion-reserve => 100,
+				input-safety-margin => 0, counter => $fallback-counter,
+			),
+		}),
+	).run(@conversation);
+	run-settled($run, 'the heterogeneous forced-compaction run');
+	my @events = drain-events($run);
+	my $done = events-of(@events, 'compaction-done').head;
+
+	is (await $run.result)<final>, 'fits after trim',
+		'the chain re-preflights after the forced compaction';
+	is $primary.recorded-calls.elems, 0,
+		'the primary remains too large in its own units';
+	is $fallback.recorded-calls.elems, 1,
+		'the fallback accepts the compacted request in its units';
+	is $done.tokens-before, $fallback-before,
+		'the emitted before count uses the selected fallback counter';
+	ok $done.tokens-after <= 1_400,
+		'the hard trim checks the fallback target with that same counter';
+	is $done.tokens-after,
+		$fallback-counter.count-messages(
+			(await $run.result)<messages>[0 .. *-2].list,
+		),
+		'the emitted after count is also in the selected counter units';
+};
+
+subtest 'Compactor override governs summary acceptance as well as trim counts' => {
+	plan 4;
+	my $normal = RequestSpy.new(scale => 1);
+	my $selected = RequestSpy.new(scale => 4);
+	my $backend = scripted-backend(steps => [
+		{ content => 'S' x 100 },
+	]);
+	my @conversation = (
+		msg('system', 'SY', sticky => True, sysprompt => True),
+		|(1 .. 6).map({ msg($_ %% 2 ?? 'assistant' !! 'user', 'm' x 100) }),
+	).List;
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, counter => $normal, context-budget => 3_000,
+		keep-recent => 2,
+	);
+	my %result = $compactor.compact(
+		@conversation, target => 1_300, counter => $selected,
+	);
+
+	ok %result<fallback>,
+		'a summary small in the normal counter but over the selected target is rejected';
+	is %result<tokens-before>, $selected.count-messages(@conversation),
+		'the before count uses the invocation counter';
+	is %result<tokens-after>, $selected.count-messages(%result<messages>.list),
+		'the accepted hard-trim result is counted with it too';
+	ok %result<exhausted>,
+		'and the hard trim reports that its selected-counter floor still misses';
+};

@@ -17,7 +17,7 @@ use LLM::Chat::Conversation::Message;
 # most about them, which is that a dispatched tool call always settles
 # before one trips.
 
-plan 21;
+plan 28;
 
 my @prompt = [msg('user', 'do the thing'),];
 
@@ -96,6 +96,86 @@ subtest 'a backend the request does not fit is skipped, not attempted' => {
 	my @log = events-of(@events, 'log')
 		.grep({ .data ~~ Associative && .data<message>.contains('does not fit') });
 	is @log.elems, 1, 'and the skip is said out loud, once, as a log event';
+};
+
+subtest 'failed attempts are billed and spend reports completeness' => {
+	plan 7;
+
+	my $backend = scripted-backend(steps => [
+		{ error => 'temporary', 'error-class' => 'connection',
+		  usage => { prompt => 100, completion => 2, cost => 0.3e0 } },
+		{ content => 'done', usage => { total => 40, cost => 0.1e0 } },
+	]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], backoff-cap => 0.001,
+		request-budget => LLM::Agent::RequestBudget.new(
+			default-profile => profile(context-window => 100_000),
+		),
+	);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the retried run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	is %outcome<spent><total-tokens>, 142,
+		'failed and successful attempts both contribute tokens';
+	ok (%outcome<spent><cost> - 0.4e0).abs < 1e-9,
+		'failed and successful attempts both contribute cost';
+	ok %outcome<spent><complete>,
+		'a total or both halves on every started attempt is complete';
+	is events-of(@events, 'attempt-failed')[0].usage<prompt-tokens>, 100,
+		'and so does AttemptFailed';
+
+	my $silent = scripted-backend(steps => [
+		{ error => 'temporary', 'error-class' => 'connection' },
+		{ content => 'done', usage => { total => 40 } },
+	]);
+	my $silent-run = LLM::Agent::Loop.new(
+		backends => [$silent,], backoff-cap => 0.001,
+		request-budget => LLM::Agent::RequestBudget.new(
+			default-profile => profile(context-window => 100_000),
+		),
+	).run(@prompt);
+	run-settled($silent-run, 'the partially reported run');
+	my %silent-outcome = await $silent-run.result;
+	nok %silent-outcome<spent><complete>,
+		'an attempt that reports no usage makes the aggregate incomplete';
+	is %silent-outcome<spent><total-tokens>, 40,
+		'the reported subset is still charged';
+	is %silent-outcome<attempts>[0]<usage>:exists, False,
+		'no empty usage hash is invented in the failure record';
+};
+
+subtest 'calibration is scoped to the selected backend profile' => {
+	plan 3;
+
+	my $fallback-counter = LLM::Agent::TokenCount::Usage.new;
+	my $primary-counter = LLM::Agent::TokenCount::Usage.new;
+	my $global-counter = LLM::Agent::TokenCount::Usage.new;
+	my $primary = scripted-backend(model => 'primary', steps => [
+		{ error => 'connect failed', 'error-class' => 'connection',
+		  usage => { prompt => 100, completion => 1 } },
+	]);
+	my $fallback = scripted-backend(model => 'fallback', steps => [
+		{ content => 'done', usage => { prompt => 200, completion => 2 } },
+	]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$primary, $fallback], counter => $global-counter,
+		max-retries => 1,
+		request-budget => LLM::Agent::RequestBudget.new(profiles => {
+			primary => profile(context-window => 100_000, counter => $primary-counter),
+			fallback => profile(context-window => 100_000, counter => $fallback-counter),
+		}),
+	);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the fallback run');
+
+	is $primary-counter.calibration<prompt-tokens>, 100,
+		'the failed primary attempt teaches only its profile counter';
+	is $fallback-counter.calibration<prompt-tokens>, 200,
+		'the successful fallback teaches its own profile counter';
+	is-deeply $global-counter.calibration, {},
+		'the shared fallback counter is not contaminated by either model';
 };
 
 subtest 'the skip is in the attempts, with the arithmetic that caused it' => {
@@ -494,6 +574,181 @@ subtest 'cost accumulates, and the result Map says what it spent' => {
 	ok %outcome<spent><wall-clock> >= 0, 'with the wall clock beside them';
 };
 
+subtest 'the prompt and completion halves accumulate beside the total' => {
+	plan 8;
+
+	# The same two attempts as the cost subtest above, once through a
+	# priced backend (an OpenRouter-flavoured Response) and once through
+	# one that prices nothing (a plain Response). The split is OAI-spec
+	# usage, so it must come out identically either way — what a provider
+	# charges has nothing to do with which way the tokens went.
+	sub split-run(:$priced --> Hash) {
+		my %first = prompt => 100, completion => 20;
+		my %last  = prompt => 200, completion => 30;
+		if $priced {
+			%first<cost> = 0.02e0;
+			%last<cost>  = 0.03e0;
+		}
+
+		my $backend = scripted-backend(steps => [
+			{ content => 'thinking',
+			  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),],
+			  usage => %first },
+			{ content => 'done', usage => %last },
+		]);
+		my $provider = ScriptedProvider.new(
+			tools => tools(), results => { fs_read => 'contents' },
+		);
+		my $loop = LLM::Agent::Loop.new(
+			backends => [$backend,], :$provider,
+			request-budget => LLM::Agent::RequestBudget.new(
+				default-profile => profile(context-window => 100_000),
+			),
+		);
+		my $run = $loop.run(@prompt);
+		run-settled($run, $priced ?? 'the priced run' !! 'the free run');
+		drain-events($run);
+		(await $run.result)<spent>;
+	}
+
+	my %priced = split-run(:priced);
+	is %priced<prompt-tokens>, 300,
+		'every attempt that reported a prompt half is in the prompt total';
+	is %priced<completion-tokens>, 50,
+		'and every completion half in the completion total';
+	is %priced<total-tokens>, 350,
+		'with the grand total unchanged by the split being there';
+	ok (%priced<cost> - 0.05e0).abs < 1e-9, 'and the cost beside it';
+
+	my %free = split-run(:!priced);
+	is %free<prompt-tokens>, 300,
+		'a backend that prices nothing still reports its prompt half';
+	is %free<completion-tokens>, 50, 'and its completion half';
+	is %free<total-tokens>, 350, 'and its total';
+	nok %free<cost>:exists,
+		'the split and the cost are independent answers — one being '
+			~ 'absent says nothing about the other';
+};
+
+subtest 'cached-prompt-tokens accumulates as a reported subset, absent when it is not' => {
+	plan 6;
+
+	# Two attempts, both reporting a cache-hit slice of their prompt
+	# tokens. It rides `usage-of` into AttemptSucceeded and into the
+	# spend map, summed like every other reported number — but it must
+	# never inflate `total-tokens`, because it was already counted there.
+	my $backend = scripted-backend(steps => [
+		{ content => 'thinking',
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),],
+		  usage => { prompt => 100, completion => 20, cached => 80 } },
+		{ content => 'done',
+		  usage => { prompt => 200, completion => 30, cached => 150 } },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { fs_read => 'contents' },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider,
+		request-budget => LLM::Agent::RequestBudget.new(
+			default-profile => profile(context-window => 100_000),
+		),
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the cached run');
+	my @events = drain-events($run);
+	my %outcome = await $run.result;
+
+	my %first-usage = events-of(@events, 'attempt-succeeded')[0].usage;
+	is %first-usage<cached-prompt-tokens>, 80,
+		'a reported cache hit rides the first attempt-succeeded event';
+
+	is %outcome<spent><cached-prompt-tokens>, 230,
+		'the run adds the cache hits up across attempts: 80 + 150';
+	is %outcome<spent><total-tokens>, 350,
+		'without inflating the total — cached tokens are already counted '
+			~ 'in prompt-tokens';
+	is %outcome<spent><prompt-tokens>, 300,
+		'or the prompt half either';
+
+	# A second run where nobody reports a cache hit at all.
+	my $silent-backend = scripted-backend(steps => [
+		{ content => 'hi', usage => { prompt => 10, completion => 2 } },
+	]);
+	my $silent-loop = LLM::Agent::Loop.new(
+		backends => [$silent-backend,],
+		request-budget => LLM::Agent::RequestBudget.new(
+			default-profile => profile(context-window => 100_000),
+		),
+	);
+	my $silent-run = $silent-loop.run(@prompt);
+	run-settled($silent-run, 'the uncached run');
+	drain-events($silent-run);
+	my %silent-outcome = await $silent-run.result;
+
+	nok %silent-outcome<spent><cached-prompt-tokens>:exists,
+		'and a run nobody reported one for leaves the key out — absent, '
+			~ 'not zero';
+	is %silent-outcome<spent><prompt-tokens>, 10,
+		'while the ordinary prompt half is still there';
+};
+
+subtest 'a split nobody reported is absent rather than zero' => {
+	plan 7;
+
+	sub spent-of(@steps, :$provider --> Hash) {
+		my $backend = scripted-backend(steps => @steps);
+		my %extra = $provider.defined ?? %( :$provider ) !! %();
+		my $loop = LLM::Agent::Loop.new(
+			backends => [$backend,], |%extra,
+			request-budget => LLM::Agent::RequestBudget.new(
+				default-profile => profile(context-window => 100_000),
+			),
+		);
+		my $run = $loop.run(@prompt);
+		run-settled($run, 'the run');
+		drain-events($run);
+		(await $run.result)<spent>;
+	}
+
+	# A backend that reports one number and calls it a day: the total is
+	# knowable, the split is not, and saying "0 in, 0 out" would be a
+	# measurement nobody made.
+	my %totals-only = spent-of([
+		{ content => 'done', usage => { total => 120 } },
+	]);
+	is %totals-only<total-tokens>, 120, 'the total is what it reported';
+	nok %totals-only<prompt-tokens>:exists,
+		'and no prompt half is invented for it';
+	nok %totals-only<completion-tokens>:exists,
+		'nor a completion half';
+
+	# One attempt of each kind. The split keys appear, and carry the sum
+	# over the attempts that actually reported one — the total-only
+	# attempt contributes to the total and to nothing else.
+	my %mixed = spent-of(
+		[
+			{ content => 'thinking',
+			  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),],
+			  usage => { total => 120 } },
+			{ content => 'done', usage => { prompt => 40, completion => 8 } },
+		],
+		provider => ScriptedProvider.new(
+			tools => tools(), results => { fs_read => 'contents' },
+		),
+	);
+	is %mixed<total-tokens>, 168, 'both attempts count towards the total';
+	is %mixed<prompt-tokens>, 40,
+		'the split is the sum over the attempts that gave one';
+	is %mixed<completion-tokens>, 8, 'on both halves';
+
+	# And a run where nobody reported anything at all.
+	my %silent = spent-of([{ content => 'done' },]);
+	is %silent.keys.sort, ['complete', 'total-tokens', 'wall-clock'],
+		'a silent backend leaves a spend record of the two things the '
+			~ 'loop knows on its own';
+};
+
 subtest 'no budget, no spend: the result Map is the six keys it was' => {
 	plan 3;
 
@@ -723,7 +978,7 @@ subtest 'the constructor refuses budgets that contradict each other' => {
 		~ 'context-budget, and is not a contradiction';
 
 	my $counter = counter();
-	throws-like {
+	lives-ok {
 		LLM::Agent::Loop.new(
 			backends => [scripted-backend(steps => []),],
 			:$counter,
@@ -735,8 +990,8 @@ subtest 'the constructor refuses budgets that contradict each other' => {
 				small => profile(context-window => 4_000),
 			}),
 		)
-	}, Exception, message => /'still cannot take'/,
-		'a compactor that converges above the smallest declared window';
+	}, 'a smaller fallback window does not constrain ordinary primary '
+		~ 'compaction; forced fallback compaction handles it';
 
 	# The shorthand really does become a budget.
 	my $shorthand = LLM::Agent::Loop.new(
@@ -893,8 +1148,9 @@ subtest 'a window that fits the conversation but not the context' => {
 	# to aim at the room left for the CONVERSATION, and the context goes
 	# out with every request whatever the compactor does.
 	ok events-of(@events, 'compaction-done').head.tokens-after
-		<= 1_000 - 400 - $context-tokens,
-		'and it aimed at the window less the reserve AND the context';
+		<= 1_000 - 400,
+		'and the emitted COMPLETE-request count is under the window less the '
+			~ 'reserve (including the context in the selected counter units)';
 };
 
 subtest 'the context counts towards the compaction trigger' => {
@@ -946,7 +1202,6 @@ subtest 'the context counts towards the compaction trigger' => {
 	my $run = roomy-loop($backend, counter()).run(conversation().List, :$context);
 	run-settled($run, 'the triggered run');
 	my @events = drain-events($run);
-
 	is events-of(@events, 'compaction-done').elems, 1,
 		'the same conversation plus a context is over it, and compacts';
 	is (await $run.result)<final>, 'after compacting', 'and the run carries on';
@@ -1038,4 +1293,168 @@ subtest 'RoundStarted counts tokens for a budget with no compactor' => {
 		'a request budget is a budget: the round says how big the '
 			~ 'conversation is';
 	is (await $run.result)<outcome>, 'completed', 'and the run is fine';
+};
+
+subtest 'spend from somewhere else is absorbed, and the caps see it' => {
+	plan 12;
+
+	# THE SUBTREE CLOSURE. A subagent is a whole run of its own and its
+	# bill never touches its parent's accumulators by itself, so
+	# `absorb-spend` is how a parent's cap comes to cover what it
+	# delegated. The responder below stands in for exactly what
+	# LLM::Agent::Subagents does when a child settles: it hands the parent
+	# loop a settled spend record from the middle of a tool call.
+
+	my $loop;
+	my @answers;
+
+	sub delegating-run(%child-spend, *%caps) {
+		@answers = ();
+		my $backend = scripted-backend(steps => [
+			{ content => 'delegating',
+			  usage => { prompt => 10, completion => 5, cost => 0.1e0 },
+			  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+			{ content => 'and here is the answer',
+			  usage => { prompt => 10, completion => 5, cost => 0.1e0 } },
+		]);
+		my $provider = ScriptedProvider.new(
+			tools => tools(),
+			responder => -> $name, $arguments, $id {
+				# `$loop` is a forward declaration filled in below: the
+				# responder runs long after it has a value.
+				@answers.push: $loop.absorb-spend(%child-spend);
+				'the child said so';
+			},
+		);
+		$loop = LLM::Agent::Loop.new(
+			backends => [$backend,], :$provider,
+			request-budget => LLM::Agent::RequestBudget.new(
+				default-profile => profile(context-window => 100_000),
+				|%caps,
+			),
+		);
+		my $run = $loop.run(@prompt);
+		run-settled($run, 'the delegating run');
+		%( outcome => (await $run.result), events => drain-events($run) );
+	}
+
+	# --- It is the same money -----------------------------------------
+	my %fine = delegating-run(
+		%( cost => 0.5e0, 'total-tokens' => 400,
+		   'prompt-tokens' => 300, 'completion-tokens' => 100 ),
+	);
+	is %fine<outcome><outcome>, 'completed', 'with no cap, nothing stops';
+	is-deeply @answers.List, (True,), 'the absorb was counted, and said so';
+	is %fine<outcome><spent><cost>, 0.7e0,
+		"the run's bill is its own two attempts plus what it delegated";
+	is %fine<outcome><spent><total-tokens>, 30 + 400,
+		'and so are its tokens';
+	is %fine<outcome><spent><prompt-tokens>, 20 + 300,
+		'the prompt half accumulates like an attempt of its own';
+	is %fine<outcome><spent><completion-tokens>, 10 + 100,
+		'and so does the completion half';
+
+	# --- SABOTAGE: the child is what puts the parent over --------------
+	#
+	# The parent's own two attempts cost 0.1 each, which is nowhere near
+	# the cap. The one delegation is, and the very next boundary refuses.
+	my %over = delegating-run(%( cost => 0.6e0 ), max-cost => 0.5e0);
+	is %over<outcome><outcome>, 'failed',
+		'a child that spends the parent over its cap ends the parent run';
+	is %over<outcome><reason>, 'budget-exhausted',
+		'with the budget\'s own reason, not a special subtree one';
+	like %over<outcome><error>, /'cost'/,
+		'naming the cap it reached, as any other overspend does';
+	is events-of(%over<events>, 'attempt-started').elems, 1,
+		'and the attempt after it never happened: the cap is checked at '
+			~ 'the boundary, so the delegation settled first and nothing '
+			~ 'started after it';
+
+	# --- What it will not absorb --------------------------------------
+	my $idle = LLM::Agent::Loop.new(
+		backends => [scripted-backend(steps => [{ content => 'hi' },]),],
+		request-budget => LLM::Agent::RequestBudget.new(
+			default-profile => profile(context-window => 50_000),
+		),
+	);
+	nok $idle.absorb-spend(%( cost => 1e0 )),
+		'a loop with no run yet has no accumulator to bill, and says so';
+
+	my %tagged = delegating-run(%( cost => 0.5e0 ));
+	nok $loop.absorb-spend(%( cost => 1e0 ), run-id => 'some-other-run'),
+		'and a record tagged for another run is dropped rather than '
+			~ 'charged to whatever run came next';
+};
+
+subtest 'absorb-spend carries cached-prompt-tokens over like the token halves' => {
+	plan 6;
+
+	my $loop;
+
+	# Same shape as the subtree-closure helper above, but the parent's own
+	# first attempt can be told to report a cache hit too, so the absorbed
+	# amount is checked against a parent that already has one of its own.
+	sub delegating-cached-run(%child-spend, Int :$parent-cached --> Hash) {
+		my %first = prompt => 10, completion => 5;
+		%first<cached> = $parent-cached if $parent-cached.defined;
+
+		my $backend = scripted-backend(steps => [
+			{ content => 'delegating', usage => %first,
+			  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+			{ content => 'and here is the answer',
+			  usage => { prompt => 10, completion => 5 } },
+		]);
+		my $provider = ScriptedProvider.new(
+			tools => tools(),
+			responder => -> $name, $arguments, $id {
+				$loop.absorb-spend(%child-spend);
+				'the child said so';
+			},
+		);
+		$loop = LLM::Agent::Loop.new(
+			backends => [$backend,], :$provider,
+			request-budget => LLM::Agent::RequestBudget.new(
+				default-profile => profile(context-window => 100_000),
+			),
+		);
+		my $run = $loop.run(@prompt);
+		run-settled($run, 'the cached delegating run');
+		drain-events($run);
+		(await $run.result)<spent>;
+	}
+
+	# --- The child reported a cache hit, the parent's own attempts none --
+	my %child-only = delegating-cached-run(
+		%( cost => 0.1e0, 'cached-prompt-tokens' => 40 ),
+	);
+	is %child-only<cached-prompt-tokens>, 40,
+		'the absorbed cache hit becomes the run\'s own — there was nothing '
+			~ 'of its own to sum it with';
+
+	# --- Neither the child nor the parent's own attempts reported one ----
+	my %neither = delegating-cached-run(%( cost => 0.1e0 ));
+	nok %neither<cached-prompt-tokens>:exists,
+		'a child that never reported one leaves the parent\'s view exactly '
+			~ 'as silent as it already was — absent, not zero';
+
+	# --- Both the child and the parent's own attempts reported one -------
+	my %both = delegating-cached-run(
+		%( cost => 0.1e0, 'cached-prompt-tokens' => 40 ),
+		parent-cached => 15,
+	);
+	is %both<cached-prompt-tokens>, 55,
+		'the child\'s cache hit sums with the run\'s own: 15 + 40';
+	is %both<prompt-tokens>, 20,
+		'without disturbing the ordinary prompt total';
+	is %both<total-tokens>, 30,
+		'or the grand total — cached tokens are a subset, not an addition';
+
+	# --- The parent reported one, but this time the child stayed silent --
+	my %parent-only = delegating-cached-run(
+		%( cost => 0.1e0 ),
+		parent-cached => 15,
+	);
+	is %parent-only<cached-prompt-tokens>, 15,
+		'a child silent on caching leaves the parent\'s own reported hits '
+			~ 'untouched';
 };

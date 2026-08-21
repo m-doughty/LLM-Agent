@@ -1,0 +1,305 @@
+use Test;
+use lib 'lib', 't/lib';
+use nqp;
+use AgentTestKit;
+use LLM::Agent::CompletionBus;
+use LLM::Agent::Loop;
+use LLM::Agent::Run;
+use LLM::Agent::Subagents;
+use LLM::Chat::Conversation::Message;
+
+# THE LEAK THIS FILE EXISTS FOR.
+#
+# `await Promise.anyof($a, $b, Promise.in($poll))` registers a
+# continuation on EVERY promise it is handed, and the runtime only lets go
+# of those when the promise they sit on settles. Two of the loop's waits
+# and one of the composer's used to do that in a poll loop against
+# promises that may never settle at all — `$run.cancellation` on a run
+# nobody cancels, a child's `result` while the child is still working — so
+# each of them grew an array at twenty to fifty entries a second for as
+# long as the wait lasted, and woke every one of them at once if a cancel
+# finally arrived. All three now wait on a bare timer and read the state.
+#
+# It is an xt test because it reads a Rakudo INTERNAL: `Promise`'s private
+# `$!thens`. Two facts about it decide the shape of everything below.
+# One .then appends TWO elements, and the array is CLEARED when the
+# promise settles — so a leak can only be seen MID-FLIGHT. There is no
+# post-hoc assertion to make: by the time a run is over, a leaked
+# registration and an honest one look identical (both gone, or both
+# still there on a promise that never settles).
+#
+# Hence: sample twice while the wait is running, and assert the two
+# samples are EQUAL. Pre-fix they differ by tens; post-fix nothing is
+# registered at all while the wait runs. The concurrent read is a benign
+# race — the count is monotone while the leak exists and constant once it
+# does not — which is another reason this lives in xt.
+
+#| The number of `.then` continuations parked on a Promise: two per
+#| registration, zero once it has settled.
+sub thens-count(Promise:D $p --> Int:D) {
+	my $thens := nqp::getattr($p<>, Promise, q[$!thens]);
+	nqp::isconcrete($thens) ?? nqp::elems($thens) !! 0;
+}
+
+# The feature probe, and the only honest thing to do when it fails: a
+# renamed or restructured attribute makes `thens-count` throw, and a
+# rewritten one could make it silently answer nonsense. Neither is a
+# regression in this dist, and neither is something to assert through.
+without try thens-count(Promise.new) {
+	plan :skip-all('Promise internals changed; re-verify the leak by hand');
+}
+
+plan 4;
+
+# Poll for a condition with a loud deadline, exactly as t/ does: never one
+# sleep long enough to "probably" be right.
+sub wait-until(&condition, Str:D $what) {
+	my $deadline = now + TIMEOUT;
+	until &condition() {
+		die "Timed out after {TIMEOUT}s waiting for $what" if now > $deadline;
+		sleep 0.005;
+	}
+}
+
+sub read-tool(--> Hash) {
+	tool-decl('fs_read', 'Read a file', { path => { type => 'string' } },
+		required => ['path']);
+}
+
+subtest 'the batch wait registers nothing on cancellation' => {
+	plan 3;
+
+	# One tool round, gated for most of a second: the loop parks in
+	# !execute-ops for the whole of the sampling window, which is the wait
+	# under test. No tool-deadline, deliberately — a deadline small enough
+	# to speed the poll up is also small enough to end the wait before the
+	# second sample, and the poll's floor is not what is being measured.
+	my $gate = Promise.new;
+	my $provider = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'the file says hello' },
+		block-call => { fs_read => $gate },
+	);
+	my $backend = scripted-backend(steps => [
+		{ content => 'reading',
+		  tool-calls => [tool-call('c1', 'fs_read', '{"path":"a"}'),] },
+		{ content => 'the file says hello' },
+	]);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], provider => $provider);
+
+	my $run = $loop.run([msg('user', 'read a'),]);
+	wait-until({ $provider.recorded-calls.elems == 1 },
+		'the tool batch to be dispatched');
+
+	# In flight, and staying that way: 0.6s at the default 50ms poll is a
+	# dozen passes, which pre-fix was two dozen elements of growth.
+	sleep 0.15;
+	my Int $first = thens-count($run.cancellation);
+	sleep 0.6;
+	my Int $second = thens-count($run.cancellation);
+	my Bool $still-waiting = !$run.is-done;
+
+	ok $still-waiting,
+		'the run really was parked in the batch wait for the whole window — '
+			~ 'without which the samples below would agree about nothing';
+	is $second, $first,
+		'and not one continuation was registered on cancellation while it '
+			~ 'waited — pre-fix the second sample came back two dozen '
+			~ 'elements higher than the first';
+
+	$gate.keep(True);
+	run-settled($run, 'the gated run');
+	# Zero, not "the same as before": nothing in this path registers
+	# anything at all on a cancellation nobody used. A future one-shot
+	# registration would raise this constant DELIBERATELY, and changing
+	# the number here is how it would be reviewed.
+	is thens-count($run.cancellation), 0,
+		'and the finished run leaves an empty continuation list behind';
+};
+
+subtest 'the stream wait registers nothing on cancellation' => {
+	plan 3;
+
+	# A PACED stream: twelve fragments 50ms apart is 0.6s of streaming,
+	# which is the wait under test. The round-trip timeout is short enough
+	# to clamp the stream poll to 20ms — fifty passes a second — and far
+	# longer than the gap between fragments, so the inactivity check never
+	# fires.
+	my $backend = scripted-backend(steps => [
+		{ chunks => ('tick ' xx 12).List, 'chunk-delay' => 0.05 },
+	]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], round-trip-timeout => 0.4,
+	);
+
+	my $run = $loop.run([msg('user', 'say something slowly'),]);
+	wait-until({ $backend.recorded-calls.elems == 1 }, 'the stream to start');
+
+	sleep 0.1;
+	my Int $first = thens-count($run.cancellation);
+	sleep 0.3;
+	my Int $second = thens-count($run.cancellation);
+	my Bool $still-streaming = !$run.is-done;
+
+	ok $still-streaming,
+		'the stream was still arriving across both samples';
+	is $second, $first,
+		'and the stream wait registered nothing on cancellation either';
+
+	run-settled($run, 'the paced run');
+	is thens-count($run.cancellation), 0,
+		'and left nothing behind when it finished';
+};
+
+#|( The handle a spawn callback answers with: `.run` and `.session-path`,
+    duck-typed, exactly as the composer checks for. )
+class ChildHandle {
+	has LLM::Agent::Run:D $.run is required;
+	has Str:D $.session-path is required;
+}
+
+subtest 'settle-child registers nothing on the child result' => {
+	plan 3;
+
+	# The composer's own wait, on the child's result rather than on a
+	# cancellation — same shape, same leak, and worse in one way: a child
+	# that works for an hour is an hour of registrations on the ONE promise
+	# nothing else was going to clear.
+	my $gate = Promise.new;
+	my $child-tools = ScriptedProvider.new(
+		tools => [read-tool(),], results => { fs_read => 'the file says hello' },
+		block-call => { fs_read => $gate },
+	);
+
+	my $lock = Lock.new;
+	my @kids;
+	my &spawn = -> %spec {
+		my $loop = LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => [
+				{ content => 'working',
+				  tool-calls => [tool-call('k1', 'fs_read', '{"path":"a"}'),] },
+				{ content => 'child done' },
+			]),],
+			provider => $child-tools,
+		);
+		my $run = $loop.run([msg('user', %spec<prompt>),]);
+		$lock.protect: { @kids.push: %( :$run, :$loop ) };
+		ChildHandle.new(run => $run, session-path => '');
+	};
+
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => ({ name => 'reviewer', description => 'Reviews a diff.' },),
+		:&spawn,
+	);
+
+	my $task = start $subagents.execute-tool-calls([
+		tool-call('c1', 'task',
+			'{"agent-type":"reviewer","prompt":"review the diff"}'),
+	]).head;
+	wait-until({ $lock.protect({ @kids.elems }) == 1 }, 'the child to start');
+	my $child = $lock.protect: { @kids[0]<run> };
+
+	# Post-fix this is a constant 2: !own-child's single `.then` on the
+	# result, and nothing else. Asserted as an equality rather than as
+	# that number, because what is being pinned is that the WAIT adds
+	# nothing — CANCEL-POLL is 50ms, so pre-fix this grew by forty
+	# elements a second.
+	sleep 0.15;
+	my Int $first = thens-count($child.result);
+	sleep 0.45;
+	my Int $second = thens-count($child.result);
+	my Bool $still-waiting = $child.result.status ~~ Planned;
+
+	ok $still-waiting, 'the child was still working across both samples';
+	is $second, $first,
+		'and settle-child registered nothing on its result while it waited';
+
+	$gate.keep(True);
+	my %answer = await $task;
+	is %answer<content>, 'child done',
+		'and the call it was waiting for answered normally';
+};
+
+subtest 'the park registers nothing on cancellation' => {
+	plan 4;
+
+	# THE NEWEST WAIT, and the one with the longest legs: a run parked on
+	# background work waits for as long as that work takes, which for a
+	# fleet of subagents is minutes. `park-poll` is 100ms by default and
+	# 20ms here, so an anyof in this loop would have been fifty
+	# registrations a second on a cancellation nobody is ever going to
+	# use — the exact shape of the three above, on the wait most likely to
+	# run the longest.
+	my $gate = Promise.new;
+	my $bus = LLM::Agent::CompletionBus.new;
+
+	my $lock = Lock.new;
+	my @kids;
+	my &spawn = -> %spec {
+		my $provider = ScriptedProvider.new(
+			tools => [read-tool(),],
+			results => { fs_read => 'the file says hello' },
+			block-call => { fs_read => $gate },
+		);
+		my $loop = LLM::Agent::Loop.new(
+			backends => [scripted-backend(steps => [
+				{ content => 'working',
+				  tool-calls => [tool-call('k1', 'fs_read', '{"path":"a"}'),] },
+				{ content => 'child done' },
+			]),],
+			:$provider,
+		);
+		my $run = $loop.run([msg('user', %spec<prompt>),]);
+		$lock.protect: { @kids.push: %( :$run, :$loop ) };
+		ChildHandle.new(run => $run, session-path => '');
+	};
+
+	my $parent-loop;
+	my $subagents = LLM::Agent::Subagents.new(
+		inner => ScriptedProvider.new(tools => [read-tool(),]),
+		types => ({ name => 'reviewer', description => 'Reviews a diff.' },),
+		:&spawn, loop => { $parent-loop }, completion-bus => $bus,
+	);
+
+	my $parked = Promise.new;
+	$parent-loop = LLM::Agent::Loop.new(
+		backends => [scripted-backend(steps => [
+			{ content => 'delegating',
+			  tool-calls => [tool-call('c1', 'task',
+				'{"agent-type":"reviewer","prompt":"review the diff"}'),] },
+			{ content => 'started it' },
+			{ content => 'and it is done' },
+		]),],
+		provider => $subagents, completion-bus => $bus,
+		park-poll => 0.02e0,
+		on-park => -> %info { try $parked.keep(True) },
+	);
+
+	my $run = $parent-loop.run([msg('user', 'get the diff reviewed'),]);
+	await Promise.anyof($parked, Promise.in(TIMEOUT));
+	ok $parked.status === Kept, 'the run really did park';
+
+	sleep 0.1;
+	my Int $first = thens-count($run.cancellation);
+	sleep 0.45;
+	my Int $second = thens-count($run.cancellation);
+	my Bool $still-parked = !$run.is-done;
+
+	ok $still-parked, 'and was still parked across both samples';
+	is $second, $first,
+		'while registering nothing at all on its cancellation — a park is a '
+			~ 'bare timer that READS the world, not a wait on four promises '
+			~ 'that may never settle';
+
+	$gate.keep(True);
+	run-settled($run, 'the parked run');
+	# NOT zero, and deliberately not asserted as a number. The composer
+	# registers ONE cascade on the parent's cancellation (`!hook-cancel`),
+	# and a cancellation nobody used never settles, so that registration
+	# is still parked on it when the run ends. What is being pinned is
+	# that the PARK added none of its own — which is the same equality the
+	# subtest above makes, for the same reason.
+	is thens-count($run.cancellation), $second,
+		'and the park left nothing behind beyond the one cascade the '
+			~ 'composer registered before any of it started';
+};

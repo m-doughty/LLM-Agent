@@ -58,17 +58,37 @@ branch on C<outcome>.
 
 C<spent> is the exception, and deliberately: it appears only when the
 loop had an L<LLM::Agent::RequestBudget> to count against, and carries
-C<< { total-tokens, wall-clock, cost? } >> — C<cost> itself only when a
-provider reported one. Absent means B<nobody was counting>, which is a
-different answer from "nothing was spent", and collapsing the two into a
-zero would let a dashboard report a free run for a backend that simply
-does not price its calls.
+C<< { total-tokens, wall-clock, complete, cost?, prompt-tokens?,
+completion-tokens? } >> — the last three only when a provider reported
+them. C<complete> is true only when every provider attempt that started
+reported either a total or both token halves. Absent C<spent> means
+B<nobody was counting>, which is a different answer
+from "nothing was spent", and collapsing the two into a zero would let a
+dashboard report a free run for a backend that simply does not price its
+calls.
+
+The same distinction runs through the optional keys: C<prompt-tokens> and
+C<completion-tokens> are the sums over the attempts that reported a
+split, and are absent entirely when none did. A run that only knows its
+total says so by leaving them out.
+
+=begin code :lang<raku>
+
+my %result = await $run.result;
+with %result<spent> -> %spent {
+    say "total: %spent<total-tokens> tokens";
+    say "  in:  %spent<prompt-tokens>"     if %spent<prompt-tokens>:exists;
+    say "  out: %spent<completion-tokens>" if %spent<completion-tokens>:exists;
+    say "cost:  \$%spent<cost>"            if %spent<cost>:exists;
+}
+
+=end code
 
 C<reason> is the one to branch on when a failure needs handling rather
 than reporting: it carries the same string as the C<RunFailed> event's
-C<reason> — C<'context-exhausted'> and C<'budget-exhausted'> are the two
-so far — and is undefined for the ordinary failures, whose C<error> is
-all there is to say.
+C<reason> — C<'context-exhausted'>, C<'budget-exhausted'> and
+C<'completion-truncated'> are the three so far — and is undefined for the
+ordinary failures, whose C<error> is all there is to say.
 
 Kept-not-broken is deliberate. A broken Promise makes a failed run into an
 exception thrown at whoever happened to be C<await>ing, which means a
@@ -162,8 +182,9 @@ start {
         run-id => $run.id, message-count => @messages.elems,
     );
 
-    # ... rounds, attempts, tools; poll $run.is-cancelled, or use
-    #     $run.cancellation with Promise.anyof to wait on it ...
+    # ... rounds, attempts, tools; poll $run.is-cancelled, or wait on
+    #     $run.cancellation with a ONE-SHOT Promise.anyof — never one
+    #     inside a poll loop; see `cancellation` for why ...
 
     # The epilogue, in this order: let go of everything this run owns —
     # here the handle the cancel hook above pokes — THEN finish it, which
@@ -293,6 +314,23 @@ class LLM::Agent::Run {
 	    polling for one:
 
 	        await Promise.anyof($tool-batch, $run.cancellation);
+
+	    B<Once>, as above — never inside a poll loop. Every C<await
+	    Promise.anyof(...)> registers a continuation on each promise it is
+	    handed, and the runtime holds that continuation until the promise
+	    settles; this one B<never settles> on a run nobody cancels, so a
+	    loop that re-anyofs it leaks a registration per pass for the life
+	    of the run and wakes all of them at once if a cancel does arrive.
+	    A loop waits on a timer and reads the state:
+
+	        until $tool-batch.status !~~ Planned {
+	            await Promise.in($poll);
+	            last if $tool-batch.status !~~ Planned;
+	            last if $run.is-cancelled;
+	        }
+
+	    For promptness rather than polling latency, give the Run an
+	    C<on-cancel> hook that pokes the wait — see the driving seam above.
 	 )
 	has Promise:D $.cancellation .= new;
 

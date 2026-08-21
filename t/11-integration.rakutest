@@ -534,7 +534,7 @@ subtest 'compaction inside a run, replayed identically from the transcript' => {
 	);
 
 	my $compactor = LLM::Agent::Compactor.new(
-		:$backend, :$counter, context-budget => 1_200, keep-recent => 2,
+		:$backend, :$counter, context-budget => 1_600, keep-recent => 2,
 	);
 	my $loop = LLM::Agent::Loop.new(
 		backends => [$backend,], :$provider, :$counter, :$compactor, :$session,
@@ -552,9 +552,11 @@ subtest 'compaction inside a run, replayed identically from the transcript' => {
 	run-settled($run, 'the compacting run');
 	my @events = drain-events($run);
 
-	# 909 tokens at the top of round 1 is under the 960 trigger; the tool
-	# round pushes it well over, and the check at the top of round 2
-	# catches it — which is the reason the check is at the TOP.
+	# 909 conversation tokens at the top of round 1 (plus the selected
+	# counter's tool-catalogue count) fit the 1,600 request window and are
+	# under the 1,280 proactive trigger. The tool round pushes the
+	# conversation itself over that trigger, and the check at the top of
+	# round 2 catches it — which is the reason the check is at the TOP.
 	is events-of(@events, 'compaction-started').elems, 1,
 		'exactly one compaction, at the top of the round that needed it';
 	my $done = events-of(@events, 'compaction-done').head;

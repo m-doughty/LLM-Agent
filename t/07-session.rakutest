@@ -8,7 +8,7 @@ use LLM::Chat::Conversation::Message;
 # The transcript as a file: what a line looks like, when it hits the disk,
 # and what the session refuses to do. Resuming one is t/08's job.
 
-plan 14;
+plan 16;
 
 my $tmp = $*TMPDIR.add("llm-agent-t07-{$*PID}-{now.Int}");
 $tmp.mkdir;
@@ -178,6 +178,46 @@ subtest 'a run context is refused before it is written, or not at all' => {
 	$session.close;
 };
 
+subtest 'an elision is refused before it is written, or not at all' => {
+	plan 9;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => {});
+
+	my $one = $session.append-message(msg('assistant', 'reading',
+		tool-calls => [tool-call('c1', 'fs_read', '{"path":"a"}'),]));
+	my $two = $session.append-message(msg('tool', 'A' x 40, tool-call-id => 'c1'));
+
+	my $id = $session.append-elision(
+		items => [%(id => $two, stub => '[elided by the harness: 40-char result]'),],
+	);
+	ok $id.chars, 'a well-formed elision is written and returns its id';
+	is $session.elems, 4, 'as one line';
+	is $session.events.tail<type>, 'elision', 'of its own type';
+	is-deeply $session.events.tail<payload><items>.map({ $_<id> }).List,
+		($two,), 'naming the message it stubs, by envelope id';
+
+	is $session.messages.elems, 2,
+		'the conversation is the same LENGTH — an elision adds and removes '
+			~ 'nothing';
+	is $session.messages[1].content, '[elided by the harness: 40-char result]',
+		'and the stub is what the message now says';
+	is $session.messages[1].tool-call-id, 'c1',
+		'while everything else about it is where it was';
+
+	throws-like { $session.append-elision(items => []) }, Exception,
+		message => /'cannot be empty'/,
+		'an elision that stubs nothing is refused — a line that changes '
+			~ 'nothing is not worth the bytes';
+	throws-like {
+		$session.append-elision(items => [%(id => 'no-such-id', stub => 'x'),])
+	}, Exception, message => /'not a message this transcript still has'/,
+		'and one naming a message that is not here is refused BEFORE the '
+			~ 'write, exactly as a compaction naming nothing is';
+
+	$session.close;
+};
+
 subtest 'the escape hatch writes unknown types, and refuses the known ones' => {
 	plan 5;
 
@@ -226,6 +266,55 @@ subtest 'events is a copy, nested payload included' => {
 		'the payload replay actually holds is untouched';
 
 	$session.close;
+};
+
+subtest 'peek reads a transcript without touching it' => {
+	plan 12;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => { agent => 'sadna' });
+	$session.append-message(msg('user', 'get it looked at'));
+	$session.append-message(msg('assistant', 'delegating', tool-calls => [
+		{ id => 'c1', type => 'function',
+		  function => { name => 'task', arguments => '{}' } },
+	]));
+	$session.append-message(msg('tool', 'STATUS: started', tool-call-id => 'c1'));
+	$session.append-event(type => 'subagent-spawned',
+		payload => { 'agent-id' => 'reviewer-1' });
+	$session.close;
+
+	my Int $before = $path.s;
+	my %read = LLM::Agent::Session.peek(:$path);
+
+	nok %read<error>.defined, 'a whole transcript reads without an error';
+	is %read<meta><agent>, 'sadna', 'the meta line is the meta line';
+	is %read<size>, $before, 'the size is the size it was read at';
+	is-deeply %read<messages>.map({ .role }).List,
+		('user', 'assistant', 'tool'),
+		'every message line, in file order';
+	is %read<messages>[1].tool-calls.elems, 1,
+		'with its tool calls intact — one call, not a list holding one';
+	is-deeply %read<envelopes>.map({ $_<type> }).List,
+		('session-meta', 'message', 'message', 'message', 'subagent-spawned'),
+		'and every envelope, including the ones messages skips';
+	is $path.s, $before, 'nothing was written to the file';
+
+	# THE CRASH TAIL, which is what `load` repairs off the end and this
+	# deliberately does not: a viewer looking at a live writer must not
+	# truncate the line it is halfway through.
+	$path.spurt('{"v":1,"type":"mess', :append);
+	my Int $after = $path.s;
+	my %tail = LLM::Agent::Session.peek(:$path);
+
+	nok %tail<error>.defined, 'a half-written last line is not an error';
+	is %tail<messages>.elems, 3, 'the whole lines are all still there';
+	is %tail<warnings>.elems, 1, 'and the broken one is a warning';
+	is $path.s, $after,
+		'the file still has its tail — peek repairs nothing';
+
+	ok (LLM::Agent::Session.peek(path => $tmp.add('nowhere.jsonl'))<error>
+		// '').contains('no transcript'),
+		'a path with nothing at it says so rather than throwing';
 };
 
 subtest 'message-ids runs parallel to messages' => {

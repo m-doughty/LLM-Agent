@@ -10,8 +10,19 @@ use LLM::Chat::Conversation::Message;
 # pins what the loop does about it — which backend it talks to next,
 # whether it waits, what the AttemptFailed says, and what ends up in the
 # conversation and the transcript.
+#
+# THE CLOCK IS NOT MOCKED, and does not need to be: `backoff-cap` is a
+# real constructor option (it is the ceiling LLM::Chat::Retry's
+# exponential is clamped to), so a test that wants the retry PATH without
+# the retry WAIT sets it to a few milliseconds and reads the served
+# backoff off the AttemptFailed event. That is the seam — proof by
+# telemetry rather than by stopwatch.
 
-plan 8;
+plan 12;
+
+# Small enough that a full retry ladder costs milliseconds, non-zero so
+# `sleep-with-cancel` is really entered and the cancel check really runs.
+my constant FAST-BACKOFF = 0.02;
 
 my @prompt = [msg('user', 'hello'),];
 
@@ -264,4 +275,176 @@ subtest 'an unclassifiable failure retries the same backend' => {
 	is events-of(@events, 'attempt-failed').head.error-class, 'unknown',
 		'and reported with the class the backend did set';
 	is (await $run.result)<final>, 'second time lucky', 'the retry worked';
+};
+
+# === Connect failures, and the chain with nowhere to advance to ============
+
+subtest 'a flaky connection is ridden out on the only backend there is' => {
+	plan 8;
+
+	# THE REAL-WORLD SHAPE. One backend, and the first two attempts never
+	# get a socket. Nothing about the endpoint is known — nothing was sent
+	# and nothing was said — so the right move is to wait and ask again,
+	# which is what 'connection' means.
+	my $backend = scripted-backend(model => 'only', steps => [
+		{ error => 'Exceeded timeout for connection when attempting to '
+			~ 'access https://openrouter.ai/api/v1/chat/completions',
+		  'error-class' => 'connection' },
+		{ error => 'connection reset by peer', 'error-class' => 'connection' },
+		{ content => 'third time lucky' },
+	]);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], max-retries => 3,
+		backoff-cap => FAST-BACKOFF,
+	);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the flaky-connection run');
+	my @events = drain-events($run);
+
+	is $backend.recorded-calls.elems, 3,
+		'three attempts on the one backend, which is what max-retries buys';
+	is events-of(@events, 'attempt-started').elems, 3,
+		'and every one of them was framed as an attempt';
+
+	my @failed = events-of(@events, 'attempt-failed');
+	is @failed.elems, 2, 'the two that failed, and no more';
+	is @failed.map({ .disposition }).unique.List, ('retry-same',),
+		'both said retry the same backend';
+	is @failed.map({ .error-class }).unique.List, ('connection',),
+		'because a connect that never happened is a connection failure';
+
+	# The BACKOFF is the assertion, not the wall clock: every wait was
+	# really served through retry-backoff and really clamped to the cap
+	# this loop was built with.
+	ok @failed.all.backoff.defined, 'each retry waited';
+	ok @failed.grep({ .backoff > 0 && .backoff <= FAST-BACKOFF }).elems == 2,
+		'and waited exactly as long as backoff-cap allowed, which is how a '
+			~ 'test drives the retry ladder without sitting out real seconds';
+
+	is (await $run.result)<final>, 'third time lucky',
+		'and the run that used to die on the first hiccup finished';
+};
+
+subtest 'an advance with nowhere to go waits and tries again instead' => {
+	plan 6;
+
+	# 'timeout' is the ADVANCE bucket — and on a one-backend chain there
+	# is no next backend for it to advance to. Before this, the chain was
+	# simply exhausted and the run died having made one call.
+	my $backend = scripted-backend(model => 'only', steps => [
+		{ error => 'the endpoint went quiet', 'error-class' => 'timeout' },
+		{ content => 'and then it woke up' },
+	]);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], max-retries => 2,
+		backoff-cap => FAST-BACKOFF,
+	);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the sole-backend advance');
+	my @events = drain-events($run);
+
+	my @failed = events-of(@events, 'attempt-failed');
+	is @failed.elems, 1, 'one failure';
+	is @failed[0].disposition, 'retry-same',
+		'reported as a retry, because that is what the loop DID with an '
+			~ 'advance it had nowhere to take';
+	is @failed[0].error-class, 'timeout',
+		'without rewriting what the classifier actually said';
+	ok @failed[0].backoff.defined, 'and it waited first';
+
+	is $backend.recorded-calls.elems, 2, 'the backend was asked twice';
+	is (await $run.result)<final>, 'and then it woke up', 'and it completed';
+};
+
+subtest 'an advance with a real next backend still advances at once' => {
+	plan 8;
+
+	# THE REGRESSION PIN, and the whole rule in one run: the FIRST backend
+	# has somewhere to go, so its 429 advances immediately and without a
+	# wait; the LAST one does not, so its 429 becomes a wait and one more
+	# try; and when that budget is spent the chain ends exactly as before.
+	my $first = scripted-backend(model => 'a', steps => [
+		{ error => 'rate limited', 'error-class' => 'http', 'error-status' => 429 },
+	]);
+	my $second = scripted-backend(model => 'b', steps => [
+		{ error => 'rate limited too', 'error-class' => 'http', 'error-status' => 429 },
+		{ error => 'still rate limited', 'error-class' => 'http', 'error-status' => 429 },
+	]);
+
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$first, $second], max-retries => 2,
+		backoff-cap => FAST-BACKOFF,
+	);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the two-backend advance');
+	my @events = drain-events($run);
+
+	is $first.recorded-calls.elems, 1,
+		'the first backend was tried once and left behind — the next one in '
+			~ 'the chain answers sooner than a backoff ends';
+	is $second.recorded-calls.elems, 2,
+		'and the last one spent its whole per-backend budget rather than '
+			~ 'giving up with nowhere to advance to';
+
+	my @failed = events-of(@events, 'attempt-failed');
+	is @failed.elems, 3, 'three failures in all';
+	is @failed[0].disposition, 'advance', 'the first advanced';
+	nok @failed[0].backoff.defined, 'without waiting';
+	is @failed[1].disposition, 'retry-same',
+		'the last backend retried itself instead';
+	is @failed[2].disposition, 'advance',
+		'and when its budget ran out the chain ended, disposition and all';
+
+	is (await $run.result)<outcome>, 'failed',
+		'a chain that really is exhausted still fails the run';
+};
+
+subtest 'the two advances that must NOT become retries' => {
+	plan 6;
+
+	# --- abort is still abort, sole backend and all. --------------------
+	my $bad-key = scripted-backend(model => 'only', steps => [
+		{ error => 'invalid api key', 'error-class' => 'http',
+		  'error-status' => 401 },
+		{ content => 'never reached' },
+	]);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$bad-key,], max-retries => 3, backoff-cap => FAST-BACKOFF,
+	);
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the sole-backend abort');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'attempt-failed').head.disposition, 'abort',
+		'a 4xx aborts even when it is the only backend there is';
+	is $bad-key.recorded-calls.elems, 1,
+		'and is asked exactly once — a bad key will not heal in eight seconds';
+	is (await $run.result)<outcome>, 'failed', 'the run fails';
+
+	# --- and neither does a conversation that will not fit. -------------
+	#
+	# The context-overflow seatbelt turns a 400 into an advance. That one
+	# is a DETERMINISTIC refusal of these exact bytes: re-sending them
+	# buys an identical 400 and a wait on top of it, so it is the one
+	# advance that keeps ending the backend's turn.
+	my $too-big = scripted-backend(model => 'only', steps => [
+		{ error => "This model's maximum context length is 8192 tokens",
+		  'error-class' => 'http', 'error-status' => 400 },
+		{ content => 'never reached' },
+	]);
+	my $strict = LLM::Agent::Loop.new(
+		backends => [$too-big,], max-retries => 3, backoff-cap => FAST-BACKOFF,
+	);
+	my $run2 = $strict.run(@prompt);
+	run-settled($run2, 'the oversized run');
+	my @events2 = drain-events($run2);
+
+	is $too-big.recorded-calls.elems, 1,
+		'the same conversation is not sent to the same backend a second time';
+	is events-of(@events2, 'attempt-failed').head.disposition, 'advance',
+		'the seatbelt still reads it as an advance rather than an abort';
+	is (await $run2.result)<outcome>, 'failed',
+		'and with nowhere to advance to, the run ends';
 };

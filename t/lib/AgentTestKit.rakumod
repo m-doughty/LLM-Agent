@@ -55,9 +55,9 @@ Key                 | Effect
 ====================|=====================================================================
 chunks              | List of fragments to emit, in order
 content             | Shorthand for a single-fragment C<chunks>
-tool-calls          | List of wire-shaped calls; also sets finish-reason to 'tool_calls'
-finish-reason       | Overrides the finish reason ('stop', or 'tool_calls' with tool-calls)
-usage               | C<< { prompt, completion, total, model, cost, generation-id, provider-name } >>, any subset
+tool-calls          | List of wire-shaped calls; also sets finish-reason to 'tool_calls' — applied to a FAILING step too, without the implied reason
+finish-reason       | Overrides the finish reason ('stop', or 'tool_calls' with tool-calls) — stamped on a FAILING step too
+usage               | C<< { prompt, completion, total, model, cached, cost, generation-id, provider-name } >>, any subset
 error               | Message the call fails with, AFTER emitting whatever chunks it had
 error-class         | 'http' / 'timeout' / 'connection' / 'response' (default 'unknown')
 error-status        | HTTP status, for error-class 'http'
@@ -68,8 +68,10 @@ stall               | Emit the fragments and then go silent — no done, no quit
 
 =end table
 
-The last three C<usage> keys are the B<provider-specific> ones, and a
-step that scripts any of them gets an
+C<cached> is a base-Response field, set through the same C<_set-usage>
+call as C<prompt>/C<completion>/C<total> — it does B<not> select the
+OpenRouter subclass on its own. The last three C<usage> keys are the
+B<provider-specific> ones, and a step that scripts any of them gets an
 C<LLM::Chat::Backend::Response::OpenRouter> (or its C<::Stream>) instead
 of a plain Response — the real subclass, set through the real
 C<_set-or-usage>, because what the loop does with them is probe with
@@ -102,6 +104,50 @@ C<tool-calls> and to a provider's C<tools>.
 
 The kit checks for it rather than letting it happen: a list of Pairs where
 hashes were expected dies immediately, with that advice.
+
+=head3 Scripting the failures a provider reports through the finish reason
+
+C<finish-reason> and C<usage> are applied on the B<failure> path as well as
+the success one, because some failures are not transport failures at all:
+
+=begin code :lang<raku>
+
+# The provider took the prompt, cut the answer off, and said so. This is
+# what a real streaming backend produces for `finish_reason: 'length'` —
+# fragments, then a quit whose Response still carries the reason and the
+# tokens it billed.
+{ chunks => ['I will start by ', 'reading the'],
+  'finish-reason' => 'length',
+  error => 'Hit max tokens', 'error-class' => 'response',
+  usage => { prompt => 198_000, completion => 590 } }
+
+=end code
+
+The order the kit applies them in is the order L<LLM::Chat>'s own backends
+use — calls, then reason, then usage, then the error info, then the quit
+— so a consumer reading the settled Response sees a truncated completion
+rather than an anonymous stream failure. It works with
+C<fail-after-chunks> too, which is the more faithful shape when the point
+of the test is that the fragments really were emitted before the cut.
+
+C<tool-calls> is scriptable on the failure path for the round a provider
+that is B<honest> about a cut still produces: fragments, a partial
+argument list, C<finish_reason: 'length'>, quit.
+
+=begin code :lang<raku>
+
+# A truthful length that had already assembled a call. The loop is
+# expected to read the LENGTH, not the call — nothing is dispatched.
+{ chunks => ['Spawning: '],
+  tool-calls => [tool-call('c1', 'task', '{"prompt":"do the'),],
+  'finish-reason' => 'length',
+  error => 'Hit max tokens', 'error-class' => 'response' }
+
+=end code
+
+Unlike the success path, a failing step's C<tool-calls> do B<not> imply a
+finish reason: the quit is the terminal there, and what the provider said
+about it is whatever the step scripted.
 
 Running out of steps is an B<error>, not an empty response: the backend
 answers with an C<error-class> of 'response' saying which call it was.
@@ -397,6 +443,7 @@ class ScriptedBackend is LLM::Chat::Backend is export {
 			%args<prompt>     = %usage<prompt>.Int     if %usage<prompt>.defined;
 			%args<completion> = %usage<completion>.Int if %usage<completion>.defined;
 			%args<total>      = %usage<total>.Int      if %usage<total>.defined;
+			%args<cached-prompt> = %usage<cached>.Int  if %usage<cached>.defined;
 			%args<model>      = (%usage<model> // $!model).Str;
 			$resp._set-usage(|%args);
 
@@ -417,9 +464,57 @@ class ScriptedBackend is LLM::Chat::Backend is export {
 		}
 	}
 
-	# The failure half of the same: structured error info BEFORE the quit,
-	# so a consumer reading the finished response sees both.
+	# The failure half of the same: the assembled tool calls and the finish
+	# reason first, then structured error info, then the quit — the order
+	# LLM::Chat's own backends use, so a consumer reading the finished
+	# response sees all of it.
+	#
+	# The finish reason matters on the FAILURE path because of the failures
+	# a provider reports through it rather than through a status: a
+	# `finish_reason: 'length'` quit is a real completion the provider cut
+	# off, and the loop reads `.finish-reason` off the quit Response to tell
+	# it from an ordinary stream failure. A step that scripts `usage`
+	# alongside `error` gets that too — that is the truncated response
+	# which still billed for the prompt it consumed.
+	#
+	# `tool-calls` for the same reason one step further on: a provider that
+	# streams tool call deltas and THEN reports a cut leaves both on the
+	# response, and a consumer that reads the calls off a failed one is
+	# reading a truncated argument list. Unlike the success path this does
+	# not invent a finish reason — the quit is the terminal here, and what
+	# the provider said about it is whatever the step scripted.
 	method !apply-error($resp, %step --> Nil) {
+		if %step<tool-calls>:exists && %step<tool-calls>.defined {
+			my @calls = %step<tool-calls> ~~ Associative
+				?? (%step<tool-calls>,)
+				!! %step<tool-calls>.list;
+			$resp._set-tool-calls(hashes-or-die(@calls, "a step's tool-calls"));
+		}
+
+		$resp._set-finish-reason(%step<finish-reason>.Str)
+			if %step<finish-reason>.defined;
+
+		if %step<usage> ~~ Associative {
+			my %usage = %step<usage>;
+			my %args;
+			%args<prompt>     = %usage<prompt>.Int     if %usage<prompt>.defined;
+			%args<completion> = %usage<completion>.Int if %usage<completion>.defined;
+			%args<total>      = %usage<total>.Int      if %usage<total>.defined;
+			%args<cached-prompt> = %usage<cached>.Int  if %usage<cached>.defined;
+			%args<model>      = (%usage<model> // $!model).Str;
+			$resp._set-usage(|%args);
+
+			if scripts-or-usage(%step) && $resp.can('_set-or-usage') {
+				my %or;
+				%or<cost> = %usage<cost>.Num if %usage<cost>.defined;
+				%or<generation-id> = %usage<generation-id>.Str
+					if %usage<generation-id>.defined;
+				%or<provider-name> = %usage<provider-name>.Str
+					if %usage<provider-name>.defined;
+				$resp._set-or-usage(|%or);
+			}
+		}
+
 		my %info = class => (%step<error-class> // 'unknown').Str;
 		%info<status> = %step<error-status>.Int if %step<error-status>.defined;
 		$resp._set-error-info(|%info);
@@ -480,6 +575,16 @@ class ScriptedBackend is LLM::Chat::Backend is export {
 					error => %step<error> // 'scripted mid-stream failure',
 					error-class => %step<error-class>,
 					error-status => %step<error-status>,
+					# Forwarded, not dropped: a provider that stops
+					# mid-answer often says WHY through the finish reason and
+					# still bills for what it read, and a mid-stream script
+					# is the most faithful way to write that round. The calls
+					# travel with them for the same reason: an argument list
+					# assembled as far as the cut is what a consumer of a
+					# failed response actually finds on it.
+					'finish-reason' => %step<finish-reason>,
+					usage => %step<usage>,
+					'tool-calls' => %step<tool-calls>,
 				));
 			}
 			elsif %step<stall> {

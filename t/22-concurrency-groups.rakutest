@@ -1,0 +1,629 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Event;
+use LLM::Agent::Loop;
+use LLM::Agent::Session;
+use LLM::Chat::Conversation::Message;
+
+# Opt-in concurrency groups: `concurrent-tools` names the tools whose
+# NEIGHBOURING calls may go down as one batch. Everything here is about
+# the two halves of that sentence — what a group does, and what an empty
+# option (the default, and every loop written before it existed) does
+# not.
+#
+# The provider's `recorded-batches` is the instrument throughout: it is
+# the shape of what really arrived, which is the one thing a test of this
+# cannot take on trust.
+
+plan 11;
+
+my @prompt = [msg('user', 'do the things'),];
+
+my $tmp = $*TMPDIR.add("llm-agent-t22-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	close-test-sessions();
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+my $n = 0;
+sub fresh-path(--> IO::Path) { $tmp.add('g' ~ $n++ ~ '.jsonl') }
+
+sub wait-until(&condition, Str:D $what) {
+	my $deadline = now + TIMEOUT;
+	until &condition() {
+		die "Timed out after {TIMEOUT}s waiting for $what" if now > $deadline;
+		sleep 0.005;
+	}
+}
+
+sub tools(--> List) {
+	(
+		tool-decl('task', 'Delegate a piece of work', { prompt => { type => 'string' } }),
+		tool-decl('fs_read', 'Read a file', { path => { type => 'string' } }),
+		tool-decl('fs_write', 'Write a file', { path => { type => 'string' } }),
+	);
+}
+
+# The batch shapes a provider saw, as call-id lists: ((c1, c2), (c3,)) is
+# "two together, then one on its own".
+sub batch-shapes($provider --> List) {
+	$provider.recorded-batches.map({
+		$_.map({ ($_<id> // '').Str }).List;
+	}).List;
+}
+
+subtest 'with nothing opted in, a batch is still one call at a time' => {
+	plan 4;
+
+	# THE REGRESSION PIN. Not "the old tests still pass" — an explicit
+	# statement that a multi-call turn of ordinary tools reaches the
+	# provider as N batches of one, observed at the seam where a
+	# regression would show.
+	my $backend = scripted-backend(steps => [
+		{ content => 'three things',
+		  'tool-calls' => [
+			tool-call('c1', 'task', '{"prompt":"one"}'),
+			tool-call('c2', 'task', '{"prompt":"two"}'),
+			tool-call('c3', 'fs_read', '{"path":"a"}'),
+		  ] },
+		{ content => 'done' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(),
+		results => { task => 'delegated', fs_read => 'contents' },
+	);
+	my $loop = LLM::Agent::Loop.new(backends => [$backend,], :$provider);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the ungrouped run');
+	my @events = drain-events($run);
+
+	is-deeply batch-shapes($provider), (('c1',), ('c2',), ('c3',)),
+		'three batches of one, in the model’s order — the default is the '
+			~ 'contract this option was added under, not a special case of it';
+
+	is-deeply event-kinds(@events).grep({ .starts-with('tool-') }).List,
+		('tool-call', 'tool-call', 'tool-call',
+		 'tool-started', 'tool-result',
+		 'tool-started', 'tool-result',
+		 'tool-started', 'tool-result'),
+		'and each one starts only once the one before it has answered';
+
+	is (await $run.result)<outcome>, 'completed', 'the run completed';
+
+	# The same loop, with the same tools, and an option that names none of
+	# them: an empty match is the empty option.
+	my $other = ScriptedProvider.new(
+		tools => tools(), results => { task => 'delegated' },
+	);
+	my $other-loop = LLM::Agent::Loop.new(
+		backends => [scripted-backend(steps => [
+			{ content => 'two', 'tool-calls' => [
+				tool-call('d1', 'task', '{"prompt":"one"}'),
+				tool-call('d2', 'task', '{"prompt":"two"}'),
+			  ] },
+			{ content => 'done' },
+		]),],
+		provider => $other,
+		concurrent-tools => ['sh_*',],
+	);
+	run-settled($other-loop.run(@prompt), 'the unmatched run');
+	is-deeply batch-shapes($other), (('d1',), ('d2',)),
+		'a pattern that matches nothing in the batch groups nothing';
+};
+
+subtest 'an opted-in tool’s calls arrive as ONE batch' => {
+	plan 7;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => {});
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'three at once',
+		  'tool-calls' => [
+			tool-call('c1', 'task', '{"prompt":"one"}'),
+			tool-call('c2', 'task', '{"prompt":"two"}'),
+			tool-call('c3', 'task', '{"prompt":"three"}'),
+		  ] },
+		{ content => 'done' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(),
+		responder => -> $name, $args, $id { "answer for $id" },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$session,
+		concurrent-tools => ['task',],
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the grouped run');
+	my @events = drain-events($run);
+
+	is-deeply batch-shapes($provider), (('c1', 'c2', 'c3'),),
+		'ONE batch, carrying all three calls in the model’s order';
+
+	is-deeply event-kinds(@events).grep({ .starts-with('tool-') }).List,
+		('tool-call', 'tool-call', 'tool-call',
+		 'tool-started', 'tool-started', 'tool-started',
+		 'tool-result', 'tool-result', 'tool-result'),
+		'all three start before any of them answers — which is the whole '
+			~ 'observable difference';
+
+	is events-of(@events, 'tool-result').map({ .id }).List, ('c1', 'c2', 'c3'),
+		'and they settle in model order regardless';
+	is events-of(@events, 'tool-result').map({ .content }).List,
+		('answer for c1', 'answer for c2', 'answer for c3'),
+		'each with ITS OWN result: the settle is indexed, not shared';
+
+	# The durable half. Every dispatch envelope is written before the
+	# batch goes down, so a crash in the middle leaves three
+	# dispatched-unsettled operations rather than one.
+	is $session.events.map({ $_<type> }).List,
+		(
+			'session-meta', 'message', 'message',
+			'tool-dispatched', 'tool-dispatched', 'tool-dispatched',
+			'message', 'tool-settled',
+			'message', 'tool-settled',
+			'message', 'tool-settled',
+			'message',
+		),
+		'the transcript records three dispatches, then answer-and-settle '
+			~ 'three times';
+
+	my @dispatched = $session.events.grep({ $_<type> eq 'tool-dispatched' });
+	is @dispatched.map({ $_<payload><call-id> }).List, ('c1', 'c2', 'c3'),
+		'the dispatch lines name the three calls, in order';
+
+	my @settled = $session.events.grep({ $_<type> eq 'tool-settled' });
+	is @settled.map({ $_<payload><op-id> }).List,
+		@dispatched.map({ $_<id> }).List,
+		'and each settle closes its own dispatch line';
+
+	$session.close;
+};
+
+subtest 'a group of one is a single dispatch, unchanged' => {
+	plan 3;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => {});
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'one thing',
+		  'tool-calls' => [tool-call('c1', 'task', '{"prompt":"one"}'),] },
+		{ content => 'done' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { task => 'delegated' },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$session,
+		concurrent-tools => ['task',],
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the single-call run');
+	my @events = drain-events($run);
+
+	is-deeply batch-shapes($provider), (('c1',),),
+		'one call, one batch — the option changes nothing about it';
+	is-deeply event-kinds(@events).grep({ .starts-with('tool-') }).List,
+		('tool-call', 'tool-started', 'tool-result'),
+		'and the same three events in the same order';
+	is-deeply $session.events.map({ $_<type> }).List,
+		(
+			'session-meta', 'message', 'message',
+			'tool-dispatched', 'message', 'tool-settled',
+			'message',
+		),
+		'and the same transcript a loop without the option would have '
+			~ 'written';
+
+	$session.close;
+};
+
+subtest 'a non-matching call BREAKS the run: order is never rearranged' => {
+	plan 5;
+
+	# task, task, fs_read, task → [c1 c2] [c3] [c4]. The whole rule, in
+	# one batch: consecutive runs group, anything else stands alone, and
+	# nothing is ever moved past anything.
+	my $backend = scripted-backend(steps => [
+		{ content => 'a mixture',
+		  'tool-calls' => [
+			tool-call('c1', 'task', '{"prompt":"one"}'),
+			tool-call('c2', 'task', '{"prompt":"two"}'),
+			tool-call('c3', 'fs_read', '{"path":"a"}'),
+			tool-call('c4', 'task', '{"prompt":"three"}'),
+		  ] },
+		{ content => 'done' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(),
+		responder => -> $name, $args, $id { "$name/$id" },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, concurrent-tools => ['task',],
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the mixed run');
+	my @events = drain-events($run);
+
+	is-deeply batch-shapes($provider),
+		(('c1', 'c2'), ('c3',), ('c4',)),
+		'three groups: the pair, the read that broke them, and the task '
+			~ 'behind it';
+
+	is-deeply event-kinds(@events).grep({ .starts-with('tool-s') || .starts-with('tool-r') }).List,
+		('tool-started', 'tool-started', 'tool-result', 'tool-result',
+		 'tool-started', 'tool-result',
+		 'tool-started', 'tool-result'),
+		'the read starts only after the pair has answered, and the last '
+			~ 'task only after the read';
+
+	is events-of(@events, 'tool-result').map({ .id }).List,
+		('c1', 'c2', 'c3', 'c4'),
+		'and every answer lands in the model’s order';
+
+	my @messages = (await $run.result)<messages>;
+	is @messages.grep({ .role eq 'tool' }).map({ .tool-call-id }).List,
+		('c1', 'c2', 'c3', 'c4'),
+		'so does the conversation';
+	is @messages.grep({ .role eq 'tool' }).map({ .content }).List,
+		('task/c1', 'task/c2', 'fs_read/c3', 'task/c4'),
+		'each answered with its own result';
+};
+
+subtest 'a prefix glob groups the family, and only the family' => {
+	plan 2;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'reads and a write',
+		  'tool-calls' => [
+			tool-call('c1', 'fs_read', '{"path":"a"}'),
+			tool-call('c2', 'fs_read', '{"path":"b"}'),
+			tool-call('c3', 'fs_write', '{"path":"c"}'),
+			tool-call('c4', 'task', '{"prompt":"x"}'),
+		  ] },
+		{ content => 'done' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(),
+		responder => -> $name, $args, $id { "$name/$id" },
+	);
+	# `fs_r*` matches both reads and neither the write nor the task —
+	# the same pattern language `idempotency-rules` uses, and the same
+	# `match-tool-pattern` behind it.
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, concurrent-tools => ['fs_r*',],
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the globbed run');
+
+	is-deeply batch-shapes($provider), (('c1', 'c2'), ('c3',), ('c4',)),
+		'the two reads travel together; the write and the task do not';
+	is (await $run.result)<messages>.grep({ .role eq 'tool' })
+		.map({ .content }).List,
+		('fs_read/c1', 'fs_read/c2', 'fs_write/c3', 'task/c4'),
+		'and every call is still answered with its own result';
+};
+
+subtest 'a cancel mid-group takes the whole group, and no more' => {
+	plan 10;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => {});
+
+	my $gate = Promise.new;
+	my $backend = scripted-backend(steps => [
+		{ content => 'two delegations and a read',
+		  'tool-calls' => [
+			tool-call('c1', 'task', '{"prompt":"one"}'),
+			tool-call('c2', 'task', '{"prompt":"two"}'),
+			tool-call('c3', 'fs_read', '{"path":"a"}'),
+		  ] },
+		{ content => 'never reached' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { task => 'delegated', fs_read => 'contents' },
+		block-call => { c1 => $gate },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$session,
+		concurrent-tools => ['task',],
+	);
+
+	my $run = $loop.run(@prompt);
+	wait-until { $provider.recorded-calls.elems >= 1 }, 'the group to start';
+	$run.cancel;
+	run-settled($run, 'the cancelled run');
+	my @events = drain-events($run);
+
+	is-deeply batch-shapes($provider), (('c1', 'c2'),),
+		'the group had gone down whole; the read behind it never did';
+
+	my @abandoned = events-of(@events, 'tool-abandoned');
+	is @abandoned.elems, 3, 'all three calls are accounted for';
+	is @abandoned.map({ .id }).List, ('c1', 'c2', 'c3'), 'in the model’s order';
+	is-deeply @abandoned[0 .. 1].map({ .dispatched }).List, (True, True),
+		'BOTH calls of the group were dispatched, so both outcomes are '
+			~ 'unknown — coarser than one call, and no less honest';
+	nok @abandoned[2].dispatched,
+		'and the call behind the group is still known NOT to have run';
+
+	my @tool-messages = (await $run.result)<messages>.grep({ .role eq 'tool' });
+	is @tool-messages.elems, 3, 'every call is answered';
+	like @tool-messages[1].content, /'Whether it took effect is unknown'/,
+		'the second of the group says its outcome is unknown, exactly as '
+			~ 'the first does';
+	like @tool-messages[2].content, /'It did not run'/,
+		'and the one behind it says, flatly, that it did not';
+
+	# The durable half: two operations, because two calls were dispatched.
+	is $session.events.grep({ $_<type> eq 'tool-dispatched' }).elems, 2,
+		'two dispatch envelopes';
+	is $session.events.grep({ $_<type> eq 'tool-settled' })
+		.map({ $_<payload><outcome> }).List,
+		('outcome-unknown', 'outcome-unknown'),
+		'and two settles, both unknown';
+
+	$gate.keep(True);
+	drained-settled($run, 'the detached group');
+	$session.close;
+};
+
+subtest 'a deadline takes the whole group too' => {
+	plan 4;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'two slow ones',
+		  'tool-calls' => [
+			tool-call('c1', 'task', '{"prompt":"one"}'),
+			tool-call('c2', 'task', '{"prompt":"two"}'),
+		  ] },
+		{ content => 'I could not tell whether those worked.' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { task => 'delegated' },
+		latency => { c1 => 0.6 },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, tool-deadline => 0.15,
+		concurrent-tools => ['task',],
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the deadlined group');
+	my @events = drain-events($run);
+
+	my @abandoned = events-of(@events, 'tool-abandoned');
+	is @abandoned.elems, 2, 'both calls of the group are abandoned';
+	is @abandoned.map({ .reason }).List, ('deadline', 'deadline'),
+		'to the deadline, which bounds the group rather than a member of it';
+	is (await $run.result)<outcome>, 'completed',
+		'and the run carries on, exactly as it does for a single call';
+	is events-of(@events, 'tool-result').elems, 0,
+		'with no result for either: nothing came back';
+
+	drained-settled($run, 'the detached group');
+};
+
+subtest 'a deadline stops every later operation in the batch' => {
+	plan 6;
+
+	my $backend = scripted-backend(steps => [
+		{ content => 'three calls', 'tool-calls' => [
+			tool-call('c1', 'fs_read', '{"path":"a"}'),
+			tool-call('c2', 'fs_write', '{"path":"b","content":"x"}'),
+			tool-call('c3', 'fs_read', '{"path":"c"}'),
+		] },
+		{ content => 'I will reassess after the unknown outcome.' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(),
+		results => { fs_read => 'read', fs_write => 'written' },
+		latency => { c1 => 0.5 },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, tool-deadline => 0.1,
+	);
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the deadlined batch');
+	my @events = drain-events($run);
+
+	is-deeply batch-shapes($provider), (('c1',),),
+		'only the first operation reached the provider';
+	my @abandoned = events-of(@events, 'tool-abandoned');
+	is @abandoned.map(*.id).List, ('c1', 'c2', 'c3'),
+		'all calls are accounted for in model order';
+	is @abandoned.map(*.reason).List, ('deadline', 'deadline', 'deadline'),
+		'the later synthetic outcomes name the causal boundary';
+	is @abandoned.map(*.dispatched).List, (True, False, False),
+		'only the timed-out operation has an unknown outcome';
+	like (await $run.result)<messages>.grep(*.role eq 'tool')[1].content,
+		/'not dispatched'/, 'the model is explicitly told the next call never ran';
+	is (await $run.result)<outcome>, 'completed',
+		'the model receives the synthetic results and gets a fresh round';
+
+	drained-settled($run, 'the detached provider call');
+};
+
+subtest 'a crash mid-group leaves every one of its operations pending' => {
+	plan 5;
+
+	# What a SIGKILL in the middle of a group really leaves behind, made
+	# without a SIGKILL: the group goes down, the process (here, the
+	# session handle) stops before any settle lands, and the transcript is
+	# reopened. The repair an app makes from this is App::Sadna::Engine's
+	# business; what this pins is that the file says THREE things were in
+	# flight rather than one.
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => {});
+
+	my $gate = Promise.new;
+	my $backend = scripted-backend(steps => [
+		{ content => 'three at once',
+		  'tool-calls' => [
+			tool-call('c1', 'task', '{"prompt":"one"}'),
+			tool-call('c2', 'task', '{"prompt":"two"}'),
+			tool-call('c3', 'task', '{"prompt":"three"}'),
+		  ] },
+		{ content => 'never reached' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => tools(), results => { task => 'delegated' },
+		block-call => { c1 => $gate },
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$session,
+		concurrent-tools => ['task',],
+	);
+
+	my $run = $loop.run(@prompt);
+	wait-until { $provider.recorded-calls.elems >= 3 },
+		'the whole group to reach the provider';
+	wait-until {
+		$session.events.grep({ $_<type> eq 'tool-dispatched' }).elems == 3;
+	}, 'the three dispatch lines';
+
+	# THE CRASH: the transcript as it stands right now, read back by a
+	# process that knows nothing about this one.
+	my $replayed = reopen-session(path => $path);
+	my @pending = $replayed.pending-tool-operations;
+
+	is @pending.elems, 3,
+		'all three operations are pending — a group crash is not one '
+			~ 'operation in flight and two that never started';
+	is @pending.map({ $_<call-id> }).List, ('c1', 'c2', 'c3'),
+		'and they name the three calls, in dispatch order';
+	is @pending.map({ $_<tool> }).unique.List, ('task',), 'all of them the tool';
+
+	# The repair a resuming app makes: every one of them, not just the
+	# head of the group.
+	for @pending -> %op {
+		$replayed.resolve-tool-operation(
+			%op<op-id>, outcome => 'outcome-unknown', reason => 'crash-repair',
+		);
+	}
+	is-deeply $replayed.pending-tool-operations, (),
+		'settling each of them leaves nothing open';
+	is $replayed.events.grep({ $_<type> eq 'tool-settled' }).elems, 3,
+		'and the transcript carries three settle lines, one per operation';
+
+	$replayed.close;
+	$gate.keep(True);
+	run-settled($run, 'the run behind the crash');
+	drained-settled($run, 'the group');
+	$session.close;
+};
+
+subtest 'the option refuses a rule hash at construction' => {
+	plan 3;
+
+	my $backend = scripted-backend(steps => [{ content => 'hi' },]);
+	my $provider = ScriptedProvider.new(tools => tools());
+
+	throws-like {
+		LLM::Agent::Loop.new(
+			backends => [$backend,], :$provider,
+			concurrent-tools => [{ tool => 'task' },],
+		);
+	}, Exception, message => /'not a tool-name pattern'/,
+		'a rule hash — the shape the option next door takes — is refused '
+			~ 'while somebody is looking at the config';
+
+	throws-like {
+		LLM::Agent::Loop.new(
+			backends => [$backend,], :$provider, concurrent-tools => ['',],
+		);
+	}, Exception, message => /'not a tool-name pattern'/,
+		'and so is an empty pattern, which would match nothing and look '
+			~ 'like the option being ignored';
+
+	lives-ok {
+		LLM::Agent::Loop.new(
+			backends => [$backend,], :$provider,
+			concurrent-tools => ['task', 'fs_r*'],
+		);
+	}, 'a list of names and globs is what it takes';
+};
+
+subtest 'the two shims see a group, not just its head' => {
+	plan 6;
+
+	# The seam both shims read (`in-flight-ops`) holds the WHOLE group
+	# now, and each of them uses it differently:
+	#
+	#   wrap-ask     — the span goes on EVERY operation, so a deadline
+	#                  pauses for the group rather than for whichever
+	#                  member the question happened to be about;
+	#   progress-hook— a notification naming ANY call of the group is
+	#                  believed, and anything else is still dropped.
+	my $backend = scripted-backend(steps => [
+		{ content => 'two delegations',
+		  'tool-calls' => [
+			tool-call('c1', 'task', '{"prompt":"one"}'),
+			tool-call('c2', 'task', '{"prompt":"two"}'),
+		  ] },
+		{ content => 'done' },
+	]);
+
+	my $loop;
+	my &ask;
+	my &progress;
+	my @asked;
+
+	my $provider = ScriptedProvider.new(
+		tools => tools(),
+		responder => -> $name, $args, $id {
+			if $id eq 'c1' {
+				# Four times the deadline, spent entirely on a human, and
+				# asked while BOTH calls are in flight.
+				ask(%( kind => 'permission', tool => $name ));
+				# One progress note per call, plus one for a call that is
+				# not in this group at all.
+				progress(%( 'tool-call-id' => 'c1', progress => 1 ));
+				progress(%( 'tool-call-id' => 'c2', progress => 2 ));
+				progress(%( 'tool-call-id' => 'an-older-call', progress => 99 ));
+			}
+			"answer for $id";
+		},
+	);
+	$loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, tool-deadline => 0.15,
+		concurrent-tools => ['task',],
+	);
+	&ask = $loop.wrap-ask(-> %request {
+		@asked.push: %request<tool>;
+		sleep 0.6;
+		%( action => 'allow-once' );
+	});
+	&progress = $loop.progress-hook;
+
+	my $run = $loop.run(@prompt);
+	run-settled($run, 'the asking group');
+	my @events = drain-events($run);
+
+	is @asked.elems, 1, 'the human was asked, inside the group';
+	is events-of(@events, 'tool-abandoned').elems, 0,
+		'and NEITHER call was abandoned, though four times the deadline '
+			~ 'passed — the ask span is recorded on every operation in the '
+			~ 'group, not just on one of them';
+	is events-of(@events, 'tool-result').map({ .id }).List, ('c1', 'c2'),
+		'both answered normally';
+
+	my @reported = events-of(@events, 'tool-progress');
+	is @reported.map({ .id }).List, ('c1', 'c2'),
+		'a notification naming EITHER call of the group is believed';
+	is @reported.map({ .progress }).List, (1e0, 2e0), 'with its own number';
+	is (await $run.result)<outcome>, 'completed', 'and the run completed';
+};

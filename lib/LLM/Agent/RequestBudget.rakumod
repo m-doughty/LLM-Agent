@@ -98,23 +98,37 @@ L<LLM::Agent::Loop> asks, per backend, before it spends an attempt:
 
 =begin code :lang<text>
 
-    needed = count-messages(@conversation)
-           + ceiling(chars(to-json(@tools)) / 4)
-           + input-safety-margin
+	request = counter.count-request(
+	              @conversation, :@tools, :$context-head, :$context-tail,
+	          )
+	needed = request + input-safety-margin
 
     it fits when   needed + completion-reserve <= context-window
 
 =end code
 
-The tool declarations are counted because they are real tokens on the
-wire and a catalogue of thirty tools is not small — and because they
-B<disappear> when the loop switches tools off after a limit, which is
-precisely the case where a conversation that did not fit suddenly does.
-They are estimated at four characters per token rather than counted,
-because they are JSON rather than prose and no tokenizer here is asked to
-weigh in on a schema.
+The conversation, runtime context and tool declarations are all counted
+through the B<selected profile's counter> because all three are real tokens
+on the wire and tokenizers disagree about JSON and template framing as well
+as prose. C<TokenCount::Exact> delegates the complete request to a tokenizer
+that supports C<get-request-count>; older counters compose their existing
+C<count-messages> and C<count-text> answers. This is repeated for every
+fallback backend, in that backend's units. A catalogue also disappears when
+the loop switches tools off after a limit, which is precisely the case where
+a request that did not fit may suddenly fit.
 
-=head2 The caps, and what "spent" means
+A forced compaction carries the chosen profile's B<target and counter as a
+pair>. Targets from different tokenizers are compared only by the fraction
+of their currently counted conversation they would retain; the chosen target
+is then used only with the counter that produced it. After compaction every
+backend is preflighted again in its own units.
+
+=head2 Circuit breakers, and what "spent" means
+
+The run limits are circuit breakers checked at safe boundaries, not
+transactional hard caps. A request or tool group already in flight is allowed
+to settle before the next check, so reported spend can finish above a limit;
+the guarantee is that no later operation is started after the breaker trips.
 
 C<max-cost>, C<max-total-tokens> and C<max-wall-clock> are undefined by
 default, and undefined means B<no cap>. C<cap-tripped> compares them
@@ -339,7 +353,11 @@ class LLM::Agent::RequestBudget {
 
 	    C<%spent> is C<< { cost, total-tokens, wall-clock } >>; a missing
 	    key counts as zero, which is what a provider that reports no cost
-	    leaves behind. Reached rather than exceeded — see the Pod. )
+	    leaves behind. A spend record may carry more than that — the loop's
+	    also names the C<prompt-tokens> / C<completion-tokens> split when a
+	    provider reported one — and the extra keys are ignored here, because
+	    no cap is written against half a turn. Reached rather than exceeded
+	    — see the Pod. )
 	method cap-tripped(%spent --> Hash:D) {
 		with $!max-cost {
 			my $cost = (%spent<cost> // 0).Num;

@@ -231,8 +231,8 @@ subtest 'the log hook cannot land an event after the loop finished the run' => {
 	is event-kinds(@events).tail, 'run-completed',
 		'and it is the last event on the Supply — a log from another '
 			~ 'thread cannot get in behind it';
-	ok events-of(@events, 'log').elems > 0,
-		'the hook really was publishing into this run';
+	is events-of(@events, 'log').elems, 0,
+		'an unattributed callback outside a dispatched operation is dropped';
 	is-deeply @events.map({ .seq }).List, (^@events.elems).List,
 		'seq is contiguous across every thread that emitted';
 	is @events.map({ .run-id }).unique.List, ($run.id,),
@@ -315,21 +315,19 @@ subtest 'cancelling a blocked batch frees the loop at once; drained waits' => {
 			~ 'running, and that is exactly where result and drained '
 			~ 'deliberately diverge';
 
-	# The guard pin. The old code kept A's result vow inside the state
-	# machine and cleaned up afterwards, so this admitted B while A's
-	# driver was still holding the loop's stream slot.
-	my $b;
-	lives-ok { $b = $loop.run(@prompt) },
-		'the loop admits the next run the moment the first one is done';
-	run-settled($b, 'run B');
-	is (await $b.result)<outcome>, 'completed',
-		'and B runs to completion over the top of the abandoned batch';
+	# Result is not producer quiescence. A second run must not be admitted
+	# while A's detached provider call can still publish or mutate.
+	throws-like { $loop.run(@prompt) }, Exception, message => /'in flight'/,
+		'the loop refuses a second run until the first has drained';
 
-	# Let the batch land, and give what it produces every chance to leak
-	# into a run before believing that it cannot.
+	# Let the batch land; only then may B start.
 	$gate.keep(True);
 	drained-settled($a, 'run A after the batch finally returned');
+	my $b = $loop.run(@prompt);
+	run-settled($b, 'run B');
 	drained-settled($b, 'run B');
+	is (await $b.result)<outcome>, 'completed',
+		'and B runs normally after the drain boundary';
 
 	my @a-events = drain-events($a, "run A's events");
 	my @b-events = drain-events($b, "run B's events");

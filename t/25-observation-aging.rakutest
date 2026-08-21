@@ -1,0 +1,749 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::Canonical;
+use LLM::Agent::Compactor;
+use LLM::Agent::Loop;
+use LLM::Agent::TokenCount;
+use LLM::Chat::Conversation::Message;
+
+# Observation aging: old tool results stubbed IN PLACE rather than
+# summarized away. What is eligible and — much more of this file — what is
+# deliberately not, because aging something the model is still using costs
+# a re-read AND a prefix cache epoch, and aging it repeatedly costs both
+# forever.
+
+plan 15;
+
+my $tmp = $*TMPDIR.add("llm-agent-t25-{$*PID}-{now.Int}");
+$tmp.mkdir;
+END {
+	close-test-sessions();
+	if $tmp.e {
+		.unlink for $tmp.dir;
+		$tmp.rmdir;
+	}
+}
+
+my $n = 0;
+sub fresh-path(--> IO::Path) { $tmp.add('a' ~ $n++ ~ '.jsonl') }
+
+# One token per character, no per-message overhead: every threshold in this
+# file is arithmetic a reader can check.
+sub counter(--> LLM::Agent::TokenCount) {
+	LLM::Agent::TokenCount::Heuristic.new(
+		chars-per-token => 1, per-message-overhead => 0,
+	);
+}
+
+sub sysprompt(Str:D $content = 'SY' --> LLM::Chat::Conversation::Message) {
+	msg('system', $content, sysprompt => True, sticky => True);
+}
+
+# An assistant turn asking for one tool, and nothing else in it.
+sub asks(Str:D $id, Str:D $tool = 'fs_read', Str:D $arguments = '{"path":"a"}') {
+	msg('assistant', 'calling', tool-calls => [tool-call($id, $tool, $arguments),]);
+}
+
+sub result(Str:D $id, Str:D $content) {
+	msg('tool', $content, tool-call-id => $id);
+}
+
+# An aging compactor whose numbers are small enough to write fixtures
+# against, and whose budget is far away unless a test moves it.
+sub ager(*%args --> LLM::Agent::Compactor) {
+	LLM::Agent::Compactor.new(
+		backend          => scripted-backend(steps => []),
+		counter          => counter(),
+		context-budget   => 1_000_000,
+		keep-recent      => 2,
+		age-observations => True,
+		age-min-chars    => 100,
+		age-reclaim-min  => 1_000,
+		|%args,
+	);
+}
+
+sub elided-indices(%result --> List) {
+	%result<elisions>.list.map({ $_<index> }).List;
+}
+
+subtest 'the eligibility matrix: what an aging pass may and may not touch' => {
+	plan 12;
+
+	# One pass over one conversation holding every case at once. Every
+	# message is annotated with the rule that decides it, and the assertion
+	# is the exact list of positions the pass took.
+	my @messages = (
+		sysprompt('SY'),                            #  0 sticky: never
+		msg('user', 'go'),                          #  1 not a tool result
+		asks('c1'),                                 #  2
+		result('c1', 'A' x 500),                    #  3 ELIDED
+		asks('c2', 'fs_read', '{"path":"b"}'),      #  4
+		result('c2', 'B' x 100),                    #  5 exactly age-min-chars
+		asks('c3', 'fs_read', '{"path":"c"}'),      #  6
+		result('c3', 'C' x 101),                    #  7 ELIDED: one over it
+		msg('assistant', 'T' x 3_000),              #  8 fat, but reasoning
+		msg('user', 'U' x 3_000),                   #  9 fat, but the user's
+		asks('c4', 'sh_run', '{"cmd":"x"}'),        # 10
+		msg('tool', 'D' x 500, tool-call-id => 'c4',
+			sticky => True),                        # 11 sticky tool result
+		asks('c5', 'fs_read', '{"path":"e"}'),      # 12
+		result('c5', LLM::Agent::Compactor::ELISION-PREFIX
+			~ '9000-char fs_read result; re-run the call if you need it '
+			~ 'again]'),                            # 13 already a stub
+		msg('assistant', 'F' x 5_000),              # 14 trailing weight
+		asks('c6', 'fs_read', '{"path":"f"}'),      # 15
+		result('c6', 'G' x 5_000),                  # 16 the recent window
+		msg('user', 'Z' x 2_000),                   # 17
+	);
+
+	my $compactor = ager();
+	my %result = $compactor.compact(@messages);
+
+	is-deeply elided-indices(%result), (3, 7),
+		'exactly the two fat tool results in the middle region with an '
+			~ 'epoch of work after them';
+
+	my @after = %result<messages>.list;
+	is @after.elems, @messages.elems,
+		'nothing was added or removed — an elision is not a compaction';
+	is @after[3].content,
+		'[elided by the harness: 500-char fs_read result; re-run the call if '
+			~ 'you need it again]',
+		'the stub says how much went, which call it was, and what to do';
+	is @after[3].role, 'tool', 'the message is still a tool result';
+	is @after[3].tool-call-id, 'c1',
+		'still answering the same call — which is the whole safety argument: '
+			~ 'the tool_calls pairing cannot come apart';
+
+	is @after[5].content, 'B' x 100,
+		'a result exactly AT age-min-chars is not over it';
+	is @after[8].content, 'T' x 3_000, 'a fat assistant turn is untouched';
+	is @after[9].content, 'U' x 3_000, 'and so is a fat user turn';
+	is @after[11].content, 'D' x 500,
+		'a sticky tool result is untouched — sticky is sticky for every kind '
+			~ 'of compaction';
+	is @after[13].content, @messages[13].content,
+		'and a stub is not re-stubbed, so a pass with nothing left to do '
+			~ 'really does report that it did nothing';
+	is @after[16].content, 'G' x 5_000,
+		'the recent window is verbatim, however fat and however elidable it '
+			~ 'would otherwise be';
+
+	# The one message the sticky prefix rule protects, said out loud.
+	is @after[0].content, 'SY', 'the sysprompt is where it was';
+};
+
+subtest 'an elision-only pass reclaims without a request' => {
+	plan 8;
+
+	my $backend = scripted-backend(steps => []);
+	my $compactor = ager(:$backend);
+
+	my @messages = (
+		sysprompt(),
+		asks('c1'),
+		result('c1', 'A' x 5_000),
+		msg('assistant', 'F' x 2_000),
+		msg('user', 'carry on'),
+		msg('assistant', 'right'),
+	);
+
+	my %result = $compactor.compact(@messages);
+
+	is $backend.recorded-calls.elems, 0,
+		'THE point: no summarization call at all — this is the cheap resort';
+	is %result<dropped>, 0, 'nothing was replaced';
+	is %result<cut-index>, -1,
+		'and there is no cut, because no message left the conversation';
+	is %result<summary>, '', 'so there is no synthetic message either';
+	nok %result<fallback>, 'an elision is not a hard trim';
+	nok %result<exhausted>,
+		'and never exhausted: the pass only ends here when the result is '
+			~ 'under what it was aiming at';
+	ok %result<tokens-after> < %result<tokens-before>,
+		'the conversation really did get smaller';
+	is %result<tokens-after>, counter().count-messages(%result<messages>.list),
+		'by exactly what the counter makes of the conversation it handed back';
+};
+
+subtest 'the trailing grace: an epoch of work has to have happened since' => {
+	plan 6;
+
+	# 'end' and 'end2' are 7 characters between them, so the filler decides
+	# whether the fat result has 999 characters after it or 1,000 — and
+	# age-reclaim-min is 1,000.
+	sub graced(Int:D $filler --> List) {
+		(
+			sysprompt(),
+			asks('c1'),
+			result('c1', 'X' x 5_000),
+			msg('assistant', 'F' x $filler),
+			msg('user', 'end'),
+			msg('user', 'end2'),
+		);
+	}
+
+	my $under = ager();
+	my @just-under = graced(992);
+	nok $under.needs-compaction(@just-under),
+		'999 characters of trailing content is not an epoch, so there is no '
+			~ 'pool and no reason to make a pass';
+
+	# ...and asked to compact anyway, it does not reach into the grace zone:
+	# nothing is eligible, so it falls through to the summarizer.
+	my $backend = scripted-backend(steps => [{ content => 'THE SUMMARY' },]);
+	my %fell-through = ager(:$backend).compact(@just-under);
+	is %fell-through<elisions>.elems, 0, 'nothing was elided';
+	is $backend.recorded-calls.elems, 1,
+		'and the pass went straight to the summarizer rather than looping';
+
+	my $over = ager();
+	my @just-over = graced(993);
+	ok $over.needs-compaction(@just-over),
+		'one character more of trailing content is an epoch';
+	my %aged = ager().compact(@just-over);
+	is-deeply elided-indices(%aged), (2,),
+		'and the fat result is taken';
+	is %aged<messages>[2].content.chars < 100, True,
+		'replaced by something small';
+};
+
+subtest 'a pool made of hyper-recent reads is not a pool' => {
+	plan 5;
+
+	# Three reads of 400 characters: 1,200 characters of stubbable-LOOKING
+	# content over a 1,000 floor, and not one of them stubbable, because all
+	# of it is inside the last epoch's worth of work. This is the case the
+	# keep-recent window alone gets wrong — one tool-heavy round pushes eight
+	# messages and evicts something the model is mid-sentence about.
+	my @hot = (
+		sysprompt(),
+		msg('user', 'find the bug'),
+		asks('c1', 'fs_read', '{"path":"a"}'),
+		result('c1', 'A' x 400),
+		asks('c2', 'fs_read', '{"path":"b"}'),
+		result('c2', 'B' x 400),
+		asks('c3', 'fs_read', '{"path":"c"}'),
+		result('c3', 'C' x 400),
+	);
+
+	nok ager().needs-compaction(@hot),
+		'no epoch: the whole pool is inside the trailing grace';
+
+	my $backend = scripted-backend(steps => [{ content => 'THE SUMMARY' },]);
+	my %result = ager(:$backend).compact(@hot);
+	is %result<elisions>.elems, 0, 'and a pass made anyway elides nothing';
+	ok $backend.recorded-calls[0]<messages>[1].content.contains('AAAA'),
+		'the summarizer sees the real results, capped as it always did';
+
+	# And the same shape at a size where the older reads ARE an epoch behind:
+	# the newest one is still protected, though it is well past the
+	# positional recent window — which is exactly why recency is measured in
+	# content rather than in messages.
+	my @mixed = (
+		sysprompt(),
+		msg('user', 'find the bug'),
+		asks('c1', 'fs_read', '{"path":"a"}'),
+		result('c1', 'A' x 5_000),
+		asks('c2', 'fs_read', '{"path":"b"}'),
+		result('c2', 'B' x 5_000),
+		asks('c3', 'fs_read', '{"path":"c"}'),
+		result('c3', 'C' x 5_000),
+		msg('user', 'anything?'),
+		msg('assistant', 'yes'),
+	);
+
+	my %aged = ager().compact(@mixed);
+	is-deeply elided-indices(%aged), (3, 5),
+		'the two reads with an epoch of work after them are taken';
+	is %aged<messages>[5 + 2].content, 'C' x 5_000,
+		'and the newest is not, though it is inside the middle region';
+};
+
+subtest 'the newest answer to a repeated call is protected, the older ones are not' => {
+	plan 6;
+
+	# The loop breaker. A stub the model reacts to by re-running the call
+	# must not have its replacement aged out too, or the cycle repeats for
+	# the life of the session at the price of a tool result and a cache
+	# epoch per turn.
+	my @messages = (
+		sysprompt(),                                  #  0
+		asks('c1', 'fs_read', '{"path":"a"}'),        #  1
+		result('c1', 'A' x 3_000),                    #  2 ELIDED: older copy
+		asks('c2', 'fs_read', '{ "path" : "a" }'),    #  3 same call, respelt
+		result('c2', 'A' x 9_000),                    #  4 PROTECTED: newest
+		asks('c3', 'fs_read', '{"path":"c"}'),        #  5
+		result('c3', 'C' x 9_000),                    #  6 ELIDED: no twin
+		msg('assistant', 'F' x 2_000),                #  7
+		msg('user', 'go on'),                         #  8
+		asks('c4', 'fs_read', '{"path":"d"}'),        #  9
+		result('c4', 'D' x 9_000),                    # 10 the recent window
+		msg('user', 'Z' x 2_000),                     # 11
+	);
+
+	# age-min-chars is 5,000 here, so index 2 is BELOW it: an older
+	# duplicate is eligible whatever its size, because the whole of it
+	# exists again further down.
+	my $compactor = ager(keep-recent => 4, age-min-chars => 5_000);
+	my %result = $compactor.compact(@messages);
+
+	is-deeply elided-indices(%result), (2, 6),
+		'the older copy and the un-repeated read';
+
+	my @after = %result<messages>.list;
+	like @after[2].content, /'3000-char fs_read result'/,
+		'the older copy went, though it is under age-min-chars — the newer '
+			~ 'copy IS its content';
+	is @after[4].content, 'A' x 9_000,
+		'and the newest answer to that call is protected outright, though it '
+			~ 'is fat and old enough';
+	like @after[6].content, /'9000-char fs_read result'/,
+		'a read nobody repeated is aged on the ordinary rules';
+	is @after[10].content, 'D' x 9_000, 'the recent window is untouched';
+
+	# The identity is the CANONICAL call, not the bytes the model sent:
+	# `{"path":"a"}` and `{ "path" : "a" }` are one call made twice.
+	is canonical-arguments('{"path":"a"}'),
+		canonical-arguments('{ "path" : "a" }'),
+		'which is why respelling the arguments does not defeat it';
+};
+
+subtest 'an older duplicate is still subject to the middle region' => {
+	plan 3;
+
+	# "Always eligible" means exempt from size and from the trailing grace.
+	# It does not mean the recent window is negotiable: that boundary is
+	# what keeps the summarizer's contracts and the tool_calls pairing
+	# intact, and elision does not get its own version of it.
+	my @messages = (
+		sysprompt(),
+		# Fat, so that the ordinary compaction this falls through to has
+		# something worth summarizing and behaves as it always does.
+		msg('user', 'g' x 5_000),
+		asks('c1', 'fs_read', '{"path":"a"}'),
+		result('c1', 'A' x 9_000),      # an older duplicate, in the window
+		asks('c2', 'fs_read', '{"path":"a"}'),
+		result('c2', 'A' x 9_000),      # the newest, also in the window
+	);
+
+	my $backend = scripted-backend(steps => [{ content => 'THE SUMMARY' },]);
+	my %result = ager(:$backend, keep-recent => 4).compact(@messages);
+
+	is %result<elisions>.elems, 0,
+		'neither copy is touched: the middle region holds no tool result';
+	is $backend.recorded-calls.elems, 1,
+		'and with nothing eligible the pass falls through to the summarizer';
+	ok %result<dropped> >= 1, 'which did its ordinary job';
+};
+
+subtest 'over the trigger: aging first, and sometimes aging is enough' => {
+	plan 6;
+
+	# 5,000 characters of dead read in a 5,600-character conversation with a
+	# 5,000-token trigger. Elision alone brings it under, so the summarizer
+	# is never asked.
+	my @messages = (
+		sysprompt(),
+		asks('c1'),
+		result('c1', 'A' x 5_000),
+		msg('assistant', 'F' x 2_000),
+		msg('user', 'and now the tests'),
+		msg('assistant', 'right'),
+	);
+
+	my $backend = scripted-backend(steps => []);
+	my $compactor = ager(
+		:$backend, context-budget => 6_250,      # trigger 5,000
+	);
+
+	ok $compactor.needs-compaction(@messages), 'the conversation wants a pass';
+	ok $compactor.trigger < counter().count-messages(@messages),
+		'because it is over the trigger, not merely holding a pool';
+
+	my %result = $compactor.compact(@messages);
+
+	is $backend.recorded-calls.elems, 0,
+		'and the pass cost nothing: no summarization request';
+	is %result<dropped>, 0, 'nothing was summarized away';
+	is-deeply elided-indices(%result), (2,), 'one observation was elided';
+	ok %result<tokens-after> <= $compactor.trigger,
+		'which was enough to get under the trigger — the test the pass has '
+			~ 'to pass before it may end here';
+};
+
+subtest 'over the trigger: aging, and then summarizing what is left' => {
+	plan 6;
+
+	# The same shape with a budget aging cannot rescue: the pass elides and
+	# then summarizes, and the summarizer is shown the STUBS.
+	my @messages = (
+		sysprompt(),
+		asks('c1'),
+		result('c1', 'A' x 5_000),
+		msg('assistant', 'F' x 2_000),
+		msg('user', 'u' x 300),
+		msg('assistant', 'a' x 300),
+	);
+
+	my $backend = scripted-backend(steps => [{ content => 'THE SUMMARY' },]);
+	my $compactor = ager(:$backend, context-budget => 1_000);
+
+	my %result = $compactor.compact(@messages);
+
+	is $backend.recorded-calls.elems, 1, 'the summarizer was asked once';
+	my $transcript = $backend.recorded-calls[0]<messages>[1].content;
+	like $transcript, /'elided by the harness'/,
+		'over a middle that had already been aged';
+	nok $transcript.contains('AAAA'),
+		'so the 5,000-character read is not what the summarization request '
+			~ 'spends its budget on — which is the failure that made '
+			~ 'tool-result-cap necessary in the first place';
+
+	is-deeply elided-indices(%result), (2,),
+		'the elisions are reported alongside the compaction';
+	ok %result<dropped> >= 1, 'and the middle really was replaced';
+	like %result<summary>, /'THE SUMMARY'/, 'by the model’s own summary';
+};
+
+subtest 'a hard trim still reports what elision took' => {
+	plan 4;
+
+	# The failure ladder is untouched by aging, and the elisions have to
+	# survive it: the loop writes its transcript line from that key, and a
+	# path that dropped it would leave a resumed conversation holding a
+	# result the run had already stubbed.
+	my $backend = scripted-backend(steps => [
+		{ error => 'nope', 'error-class' => 'http', 'error-status' => 403 },
+	]);
+	my $compactor = ager(:$backend, context-budget => 1_000);
+
+	my %result = $compactor.compact((
+		sysprompt(),
+		asks('c1'),
+		result('c1', 'A' x 5_000),
+		msg('assistant', 'F' x 2_000),
+		msg('user', 'u' x 300),
+		msg('assistant', 'a' x 300),
+	));
+
+	ok %result<fallback>, 'the summarizer was unreachable, so it trimmed';
+	is-deeply elided-indices(%result), (2,), 'and the elision is still named';
+	is $backend.recorded-calls.elems, 1,
+		'with the abort bucket spending exactly one attempt, as before';
+	ok %result<tokens-after> < %result<tokens-before>, 'progress either way';
+};
+
+subtest 'the epoch floor: below it nothing happens, and it resets itself' => {
+	plan 7;
+
+	sub pooled(Int:D $chars --> List) {
+		(
+			sysprompt(),
+			asks('c1'),
+			result('c1', 'A' x $chars),
+			msg('assistant', 'F' x 2_000),
+			msg('user', 'carry on'),
+			msg('assistant', 'right'),
+		);
+	}
+
+	my $compactor = ager(age-reclaim-min => 1_000);
+
+	nok $compactor.needs-compaction(pooled(999)),
+		'999 characters of dead read is not worth a cache epoch';
+	ok $compactor.needs-compaction(pooled(1_000)),
+		'1,000 is: the floor is the size of an epoch, and it is inclusive';
+
+	# One epoch, and then the pool is spent — which is what keeps the
+	# predicate from answering True for ever over a conversation nothing can
+	# do anything more with.
+	my %result = $compactor.compact(pooled(5_000));
+	is %result<elisions>.elems, 1, 'the epoch took the batch';
+	nok $compactor.needs-compaction(%result<messages>.list),
+		'and the next round is not asked to do it again — a stub is not '
+			~ 'eligible, so the pool is empty';
+
+	my %again = $compactor.compact(%result<messages>.list);
+	# ...and even asked outright, a second pass finds nothing to stub. The
+	# conversation is under the trigger, so it says so by summarizing rather
+	# than by eliding — no aging loop.
+	is %again<elisions>.elems, 0, 'a second pass elides nothing at all';
+
+	# The other half of the floor: over the trigger, the pool is irrelevant.
+	my $tight = ager(age-reclaim-min => 1_000_000, context-budget => 1_000);
+	ok $tight.needs-compaction(pooled(5_000)),
+		'a conversation over the trigger wants a pass whatever the pool is';
+	nok ager(age-reclaim-min => 1_000_000).needs-compaction(pooled(5_000)),
+		'and under the trigger with an unreachable floor, it does not';
+};
+
+subtest 'a stub is a pure function of what it replaces' => {
+	plan 4;
+
+	sub built(--> List) {
+		(
+			sysprompt(),
+			asks('c1', 'fs_read', '{"path":"a"}'),
+			result('c1', 'A' x 4_096),
+			msg('assistant', 'F' x 2_000),
+			msg('user', 'carry on'),
+			msg('assistant', 'right'),
+		);
+	}
+
+	my %one = ager().compact(built());
+	my %two = ager().compact(built());
+
+	is %one<elisions>[0]<stub>, %two<elisions>[0]<stub>,
+		'two independent passes over equal conversations produce equal stubs';
+	is %one<elisions>[0]<stub>,
+		'[elided by the harness: 4096-char fs_read result; re-run the call if '
+			~ 'you need it again]',
+		'and the format is pinned: length, tool, and what to do about it';
+
+	# A result whose assistant turn is not in the conversation any more —
+	# an earlier compaction summarized it away — cannot be joined to a call,
+	# so the stub simply does not claim to know which tool it was.
+	my %orphan = ager().compact((
+		sysprompt(),
+		msg('user', 'an earlier summary stood here'),
+		result('c9', 'A' x 4_096),
+		msg('assistant', 'F' x 2_000),
+		msg('user', 'carry on'),
+		msg('assistant', 'right'),
+	));
+	is %orphan<elisions>[0]<stub>,
+		'[elided by the harness: 4096-char result; re-run the call if you '
+			~ 'need it again]',
+		'an unjoinable result names no tool rather than naming a wrong one';
+	is-deeply elided-indices(%orphan), (2,),
+		'and is aged on the ordinary rules — no identity means no protection '
+			~ 'and no exemption';
+};
+
+subtest 'with the defaults, nothing about this class has changed' => {
+	plan 6;
+
+	my @messages = (
+		sysprompt(),
+		asks('c1'),
+		result('c1', 'A' x 5_000),
+		msg('assistant', 'F' x 2_000),
+		msg('user', 'u' x 300),
+		msg('assistant', 'a' x 300),
+	);
+
+	my $plain = LLM::Agent::Compactor.new(
+		backend => scripted-backend(steps => []),
+		counter => counter(), context-budget => 1_000_000, keep-recent => 2,
+	);
+	nok $plain.age-observations, 'aging is off unless it is asked for';
+	is $plain.age-min-chars, 2_048, 'and the defaults are the documented ones';
+	is $plain.age-reclaim-min, 49_152, 'both of them';
+	nok $plain.needs-compaction(@messages),
+		'a conversation full of dead reads is not a reason to compact when '
+			~ 'aging is off, however big the pool would have been';
+
+	my $backend = scripted-backend(steps => [{ content => 'THE SUMMARY' },]);
+	my %result = LLM::Agent::Compactor.new(
+		:$backend, counter => counter(), context-budget => 1_000,
+		keep-recent => 2,
+	).compact(@messages);
+	is %result<elisions>.elems, 0, 'a compaction elides nothing';
+	ok $backend.recorded-calls[0]<messages>[1].content.contains('AAAA'),
+		'and shows the summarizer the real results, exactly as it did before '
+			~ 'elision existed';
+};
+
+subtest 'an elision clears the usage calibration, as any compaction does' => {
+	plan 4;
+
+	# Nothing new is needed for this — it is the compaction path — but it is
+	# the thing that would silently bill the next round at the old prices if
+	# it ever stopped being true.
+	my $fallback = LLM::Agent::TokenCount::Heuristic.new;
+	my $usage = LLM::Agent::TokenCount::Usage.new(:$fallback);
+
+	my @messages = (
+		sysprompt(),
+		asks('c1'),
+		result('c1', 'A' x 5_000),
+		msg('assistant', 'F' x 2_000),
+		msg('user', 'carry on'),
+		msg('assistant', 'right'),
+	);
+
+	$usage.record-usage(
+		prompt-tokens => 9_999, message-count => @messages.elems,
+		prefix-digest => messages-digest(@messages), backend => 'm',
+	);
+	is $usage.count-messages(@messages), 9_999,
+		'the conversation the provider billed for counts what it billed';
+
+	my @aged = ager().compact(@messages)<messages>.list;
+	is @aged.elems, @messages.elems,
+		'the elided conversation is the same LENGTH, which is exactly why '
+			~ 'the digest has to be what notices';
+	is $usage.count-messages(@aged), $fallback.count-messages(@aged),
+		'and it is estimated rather than billed at 9,999';
+	is $usage.calibration, {},
+		'the calibration is dropped, so the next billed round recalibrates';
+};
+
+subtest 'a loop ages mid-run, and the transcript keeps both stories' => {
+	plan 11;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => {});
+
+	# Three rounds. The fat read lands in round 1; round 2's filler read is
+	# what puts an epoch of work after it AND moves it out of the recent
+	# window; the check at the top of round 3 finds the pool over the floor
+	# and elides — below the trigger, which is what makes this an epoch
+	# rather than a compaction.
+	my $backend = scripted-backend(steps => [
+		{ content => 'reading',
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"big"}'),] },
+		{ content => 'and the other one',
+		  'tool-calls' => [tool-call('c2', 'fs_read', '{"path":"small"}'),] },
+		{ content => 'done' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => (tool-decl('fs_read', 'Read a file', { path => { type => 'string' } }),),
+		responder => -> $name, $arguments, $id {
+			$arguments.contains('big') ?? 'A' x 5_000 !! 'F' x 2_000;
+		},
+	);
+
+	my $counter = counter();
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, :$counter, context-budget => 1_000_000, keep-recent => 2,
+		age-observations => True, age-min-chars => 100, age-reclaim-min => 1_000,
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$counter, :$compactor, :$session,
+	);
+
+	my $run = $loop.run([msg('user', 'read big'),]);
+	run-settled($run, 'the aging run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'compaction-started').elems, 1,
+		'exactly one pass, at the top of the round that found the pool full';
+	my $done = events-of(@events, 'compaction-done').head;
+	is $done.dropped, 0, 'which dropped nothing — it was an elision';
+	ok $done.tokens-after < $done.tokens-before, 'and still shrank the request';
+
+	is $backend.recorded-calls.elems, 3,
+		'three streamed rounds and NO blocking summarization call';
+	ok $backend.recorded-calls[1]<messages>.first(
+		{ .role eq 'tool' && .content.contains('AAAA') }
+	).defined, 'round 2 was sent the real read';
+	nok $backend.recorded-calls[2]<messages>.first(
+		{ .content.contains('AAAA') }
+	).defined, 'and round 3 was not — the wire carries the stub';
+	ok $backend.recorded-calls[2]<messages>.first(
+		{ .role eq 'tool' && .content.starts-with('[elided by the harness:') }
+	).defined, 'in the same place, still a tool result';
+
+	my @final = (await $run.result)<messages>;
+	$session.close;
+
+	my @elisions = $session.events.grep({ $_<type> eq 'elision' });
+	is @elisions.elems, 1, 'one elision line went to the transcript';
+	is @elisions[0]<payload><items>.elems, 1, 'naming one message';
+
+	# The original is STILL in the file: a transcript is a record of what
+	# happened, and the elision is a record of what the model was shown
+	# afterwards.
+	ok $session.events.first({
+		$_<type> eq 'message' && ($_<payload><content> // '').contains('AAAA')
+	}).defined, 'while the 5,000-character result is still on its own line';
+
+	# THE invariant, for elisions as for compactions: what a resume replays
+	# is the array the run was working with.
+	my $replayed = reopen-session(path => $path);
+	is-deeply $replayed.messages.map({ .role ~ ':' ~ .content }).List,
+		@final.map({ .role ~ ':' ~ .content }).List,
+		'and a resumed transcript replays the aged conversation, message for '
+			~ 'message';
+};
+
+subtest 'a stub the model answers by re-reading is not stubbed again' => {
+	plan 6;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => {});
+
+	# The cycle this has to terminate: elide a read, the model re-runs it,
+	# the fresh copy ages out, the model re-runs it again — a tool result
+	# and a prefix cache epoch per turn, for ever.
+	my $backend = scripted-backend(steps => [
+		{ content => 'reading',
+		  'tool-calls' => [tool-call('c1', 'fs_read', '{"path":"big"}'),] },
+		{ content => 'and the small one',
+		  'tool-calls' => [tool-call('c2', 'fs_read', '{"path":"small"}'),] },
+		# Round 3 sees the stub and goes and gets it again.
+		{ content => 'I will read it again',
+		  'tool-calls' => [tool-call('c3', 'fs_read', '{"path":"big"}'),] },
+		# A DIFFERENT filler path: two reads of one path would make the older
+		# one a redundant duplicate, which is its own (tested) reason to be
+		# elided and would put a second epoch in this run.
+		{ content => 'and another small one',
+		  'tool-calls' => [tool-call('c4', 'fs_read', '{"path":"small2"}'),] },
+		{ content => 'done' },
+	]);
+	my $provider = ScriptedProvider.new(
+		tools => (tool-decl('fs_read', 'Read a file', { path => { type => 'string' } }),),
+		responder => -> $name, $arguments, $id {
+			$arguments.contains('big') ?? 'A' x 5_000 !! 'F' x 2_000;
+		},
+	);
+
+	my $counter = counter();
+	# age-min-chars above the 2,000-character filler read on purpose: it is
+	# scenery — there to put an epoch of work after the big read and to push
+	# it out of the recent window — and a run that aged it too would be
+	# proving two things at once.
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, :$counter, context-budget => 1_000_000, keep-recent => 2,
+		age-observations => True, age-min-chars => 3_000, age-reclaim-min => 1_000,
+	);
+	my $loop = LLM::Agent::Loop.new(
+		backends => [$backend,], :$provider, :$counter, :$compactor, :$session,
+	);
+
+	my $run = $loop.run([msg('user', 'read big'),]);
+	run-settled($run, 'the re-reading run');
+	my @events = drain-events($run);
+
+	is events-of(@events, 'compaction-started').elems, 1,
+		'one epoch, at the top of round 3 — and not a second one afterwards';
+
+	my @final = (await $run.result)<messages>;
+
+	# Termination is a property of the conversation rather than of how many
+	# rounds have gone by: the STUB still carries the tool-call-id of the
+	# call it answered, so the identity census counts it, so the fresh copy
+	# is the newest of two and protected for the rest of the session.
+	nok $compactor.needs-compaction(@final),
+		'and a further epoch over the result finds nothing to take';
+	is @final.grep({ .role eq 'tool' && .content.contains('AAAA') }).elems, 1,
+		'the conversation ends holding the fresh copy of the big read, whole';
+	is @final.grep({
+		.role eq 'tool' && .content.starts-with('[elided by the harness:')
+	}).elems, 1, 'and exactly one stub, where the first copy was';
+
+	ok $backend.recorded-calls.tail<messages>.first(
+		{ .role eq 'tool' && .content.contains('AAAA') }
+	).defined,
+		'so the last request carries the re-read in full: the newest answer '
+			~ 'to a repeated call is protected, and the cycle stops here';
+
+	$session.close;
+	is $session.events.grep({ $_<type> eq 'elision' }).elems, 1,
+		'one elision line for the whole run';
+};

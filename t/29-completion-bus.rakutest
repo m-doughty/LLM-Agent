@@ -1,0 +1,312 @@
+use Test;
+use lib 'lib', 't/lib';
+use AgentTestKit;
+use LLM::Agent::CompletionBus;
+
+# THE COMPLETION BUS: the register of background work a run will not end
+# without, and the queue of what that work reported.
+#
+# Four properties are the whole of it, and every subtest here is one of
+# them. `quiet` is ONE snapshot, so there is no instant at which the bus
+# looks finished and a deliverable has not landed. `settle` is a
+# once-guard, so several threads racing to report one child cannot make
+# the model hear about it twice. `drain` is destructive and FIFO, so the
+# order things arrived in is the order they are said in. And every
+# refusal — a full bus, a malformed deliverable — is a VALUE, because the
+# callers are tool calls and a tool call that throws is a run that dies.
+
+plan 12;
+
+sub deliverable(Str:D $kind = 'subagent-settled', *%extra --> Hash:D) {
+	%(
+		:$kind,
+		head => 'the frame',
+		body => 'what it said',
+		tail => 'what to do next',
+		|%extra,
+	);
+}
+
+subtest 'open then settle: the operation is outstanding in between' => {
+	plan 9;
+
+	my $bus = LLM::Agent::CompletionBus.new;
+
+	ok $bus.quiet, 'a fresh bus is quiet: nothing owed, nothing to say';
+
+	my %admitted = $bus.open('reviewer-1', kind => 'subagent',
+		label => 'review billing/');
+	ok %admitted<ok>, 'the operation was admitted';
+	is %admitted<outstanding>, 1, 'and counted';
+	is %admitted<max>, LLM::Agent::CompletionBus::DEFAULT-MAX-OUTSTANDING,
+		'the refusal numbers come back whether or not it was refused, so a '
+			~ 'caller never has to read them again at a later instant';
+
+	nok $bus.quiet,
+		'the bus is NOT quiet with work outstanding — which is the whole '
+			~ 'of the "park, do not end" decision';
+	is-deeply $bus.state, %( outstanding => 1, queued => 0, quiet => False ),
+		'and state says so with the numbers in it';
+
+	is $bus.outstanding-ops.List,
+		(%( 'op-id' => 'reviewer-1', kind => 'subagent',
+			label => 'review billing/', meta => %() ),),
+		'the inventory is what a RunParked event carries';
+
+	ok $bus.settle('reviewer-1', deliverable => deliverable()),
+		'the settle closed it';
+	is-deeply $bus.state, %( outstanding => 0, queued => 1, quiet => False ),
+		'STILL not quiet: the operation is closed and its answer has not '
+			~ 'been delivered, and a run that ended here would drop the '
+			~ 'result it promised';
+};
+
+subtest 'settle is a once-guard: the second one enqueues nothing' => {
+	plan 5;
+
+	my $bus = LLM::Agent::CompletionBus.new;
+	$bus.open('reviewer-1', kind => 'subagent');
+
+	ok $bus.settle('reviewer-1', deliverable => deliverable()),
+		'the first settle wins';
+	nok $bus.settle('reviewer-1', deliverable => deliverable()),
+		'the second answers False';
+	is $bus.state<queued>, 1,
+		'and enqueued nothing — two threads racing to report one child '
+			~ 'must not make the model hear about it twice';
+
+	nok $bus.settle('never-opened', deliverable => deliverable()),
+		'a settle for a key that was never open is False';
+	is $bus.state<queued>, 1,
+		'and enqueues nothing either: the run that was waiting for it has '
+			~ 'stopped waiting, and a turn for it would land in somebody '
+			~ 'else’s conversation';
+};
+
+subtest 'collected closes without a turn, and withdraws one already queued' => {
+	plan 6;
+
+	# The two orders a synchronous join can happen in. Both have to end
+	# with the answer presented EXACTLY once.
+	my $bus = LLM::Agent::CompletionBus.new;
+
+	# Order one: the join was parked when the child settled.
+	$bus.open('a-1', kind => 'subagent');
+	ok $bus.settle('a-1', :collected), 'the collected settle closed it';
+	is-deeply $bus.state, %( outstanding => 0, queued => 0, quiet => True ),
+		'and enqueued nothing at all: the caller is handing the answer to '
+			~ 'the model itself';
+
+	# Order two: the child settled first, its turn was queued, and the
+	# model then asked for it by name before the round boundary that would
+	# have delivered it.
+	$bus.open('b-1', kind => 'subagent');
+	$bus.settle('b-1', deliverable => deliverable());
+	is $bus.state<queued>, 1, 'the turn is queued';
+
+	nok $bus.settle('b-1', :collected),
+		'the operation was already closed, so this answers False...';
+	is $bus.state<queued>, 0,
+		'...and STILL withdraws the queued turn, which is the whole reason '
+			~ 'collected does the withdraw unconditionally';
+	ok $bus.quiet, 'the bus is quiet, and the answer was said once';
+};
+
+subtest 'drain is destructive and FIFO' => {
+	plan 5;
+
+	my $bus = LLM::Agent::CompletionBus.new;
+	for <a b c> -> $key {
+		$bus.open($key, kind => 'subagent');
+		$bus.settle($key, deliverable => deliverable('subagent-settled',
+			body => "answer from $key"));
+	}
+
+	my @taken = $bus.drain;
+	is @taken.elems, 3, 'everything came back';
+	is @taken.map({ $_<body> }).List,
+		('answer from a', 'answer from b', 'answer from c'),
+		'in the order it arrived — a queue is a queue';
+	is @taken.map({ $_<op-id> }).List, ('a', 'b', 'c'),
+		'each stamped with the operation it settled';
+
+	ok $bus.quiet, 'and the bus is empty afterwards';
+	is $bus.drain.elems, 0, 'a second drain finds nothing: it is destructive';
+};
+
+subtest 'push is untracked: news the run never parks for' => {
+	plan 5;
+
+	my $bus = LLM::Agent::CompletionBus.new;
+
+	ok $bus.push(deliverable('job-exited')), 'the deliverable was carried';
+	is-deeply $bus.state, %( outstanding => 0, queued => 1, quiet => False ),
+		'it is queued, and it is not outstanding — nothing undertook to '
+			~ 'produce it, so nothing may park waiting for it';
+
+	my @taken = $bus.drain;
+	nok @taken[0]<op-id>:exists,
+		'an untracked deliverable has no op-id: it closes nothing';
+	is @taken[0]<kind>, 'job-exited', 'and carries its own kind';
+
+	ok $bus.quiet,
+		'once drained the bus is quiet, so a run with nothing but pushed '
+			~ 'news ends at the next terminal rather than waiting';
+};
+
+subtest 'a full bus refuses, with the numbers the refusal needs' => {
+	plan 6;
+
+	my $bus = LLM::Agent::CompletionBus.new(max-outstanding => 2);
+	ok $bus.open('a', kind => 'subagent')<ok>, 'one';
+	ok $bus.open('b', kind => 'subagent')<ok>, 'two';
+
+	my %refused = $bus.open('c', kind => 'subagent');
+	nok %refused<ok>, 'and the third is refused';
+	is %refused<reason>, 'at-capacity', 'saying which limit';
+	is-deeply %refused<outstanding max>.List, (2, 2),
+		'with both numbers, read at the instant the decision was made — a '
+			~ 'caller that had to go and ask again would be quoting a '
+			~ 'different moment to the model';
+
+	$bus.settle('a', deliverable => deliverable());
+	ok $bus.open('c', kind => 'subagent')<ok>,
+		'and room comes back as soon as one settles';
+};
+
+subtest 'a duplicate key is refused rather than silently replacing one' => {
+	plan 3;
+
+	my $bus = LLM::Agent::CompletionBus.new;
+	$bus.open('reviewer-1', kind => 'subagent', label => 'the first one');
+
+	my %again = $bus.open('reviewer-1', kind => 'subagent',
+		label => 'the second one');
+	nok %again<ok>, 'the second open is refused';
+	is %again<reason>, 'duplicate', 'and says why';
+	is $bus.outstanding-ops[0]<label>, 'the first one',
+		'the operation that was really opened is untouched — replacing it '
+			~ 'would lose the answer the first one is owed';
+};
+
+subtest 'close-all stops the waiting, and keeps what already arrived' => {
+	plan 5;
+
+	my $bus = LLM::Agent::CompletionBus.new;
+	$bus.open('a', kind => 'subagent');
+	$bus.open('b', kind => 'subagent');
+	$bus.open('c', kind => 'subagent');
+	$bus.settle('b', deliverable => deliverable('subagent-settled',
+		body => 'b answered'));
+
+	my @closed = $bus.close-all;
+	is @closed.List, ('a', 'c'), 'the outstanding ones, in the order they '
+		~ 'were opened — which is what a failure names when it says what '
+		~ 'never came back';
+
+	is $bus.state<outstanding>, 0, 'nothing is outstanding';
+	is $bus.state<queued>, 1,
+		'and B’S ANSWER IS STILL THERE: it was paid for, and throwing it '
+			~ 'away because something else will never answer would lose a '
+			~ 'result that exists';
+	is $bus.drain[0]<body>, 'b answered', 'and it is still deliverable';
+
+	is $bus.close-all.elems, 0, 'close-all on an empty bus is a no-op';
+};
+
+subtest 'a deliverable the bus will not carry is refused, not carried' => {
+	plan 6;
+
+	my $bus = LLM::Agent::CompletionBus.new;
+
+	nok $bus.push(%( head => 'no kind here' )),
+		'no kind: nothing downstream could say what this event IS';
+	nok $bus.push(%( kind => 'job-exited' )),
+		'no text at all: an empty user turn costs a round trip and tells '
+			~ 'the model nothing';
+	nok $bus.push(%( kind => 'job-exited', head => '', body => '', tail => '' )),
+		'and empty strings are the same nothing';
+	ok $bus.push(%( kind => 'job-exited', tail => 'the job finished' )),
+		'any ONE of the three is enough';
+
+	$bus.open('a', kind => 'subagent');
+	ok $bus.settle('a', deliverable => %( kind => 'nope' )),
+		'a settle with an unusable deliverable still CLOSES the operation';
+	is $bus.state<queued>, 1,
+		'and enqueues nothing — a run held open by an operation whose '
+			~ 'report was malformed would never end at all';
+};
+
+subtest 'extras travel, and are the caller’s outright' => {
+	plan 3;
+
+	my $bus = LLM::Agent::CompletionBus.new;
+	my %extras = 'completion-of' => 'reviewer-1', 'call-id' => 'c1';
+	$bus.open('reviewer-1', kind => 'subagent');
+	$bus.settle('reviewer-1',
+		deliverable => deliverable('subagent-settled', extras => %extras));
+
+	my %item = $bus.drain[0];
+	is-deeply %item<extras>, %( 'completion-of' => 'reviewer-1',
+		'call-id' => 'c1' ),
+		'the extras came through: they are what the injected turn is '
+			~ 'recorded with, and the durable delivery marker';
+
+	%item<extras><injected> = 'meddling';
+	is %extras<injected>:exists, False,
+		'and poking at what the drain handed over cannot change what the '
+			~ 'caller passed in';
+
+	is $bus.drain.elems, 0, 'nor is there a second copy on the bus';
+};
+
+subtest 'clear forgets everything, for a host swapping conversations' => {
+	plan 3;
+
+	my $bus = LLM::Agent::CompletionBus.new;
+	$bus.open('a', kind => 'subagent');
+	$bus.open('b', kind => 'subagent');
+	$bus.settle('b', deliverable => deliverable());
+
+	$bus.clear;
+	ok $bus.quiet, 'nothing outstanding and nothing queued';
+	is $bus.drain.elems, 0,
+		'the queued answer went too — unlike close-all, because a '
+			~ 'completion delivered into a conversation that never asked '
+			~ 'for it is a turn out of nowhere';
+	ok $bus.open('a', kind => 'subagent')<ok>,
+		'and the keys are free again';
+};
+
+subtest 'every count is right under contention' => {
+	plan 4;
+
+	# The lock is real, and this is what says so: forty threads opening
+	# and settling at once, against a bus whose capacity is exactly forty.
+	# No open may be lost, no settle may win twice, and the queue must
+	# hold exactly one deliverable per settle.
+	my $bus = LLM::Agent::CompletionBus.new(max-outstanding => 40);
+
+	my @opened = (^40).map(-> $n {
+		start { $bus.open("op-$n", kind => 'subagent')<ok> }
+	}).eager;
+	my @ok = await @opened;
+	is @ok.grep({ $_ }).elems, 40, 'every open was admitted';
+	is $bus.state<outstanding>, 40, 'and every one of them is counted';
+
+	# Two settles per operation, from two threads apiece: the once-guard
+	# is what decides how many deliverables there are, not the arithmetic
+	# of who called it.
+	my @settles = (^40).map(-> $n {
+		(^2).map({
+			start { $bus.settle("op-$n", deliverable => deliverable()) }
+		}).Slip;
+	}).eager;
+	my @won = await @settles;
+
+	is @won.grep({ $_ }).elems, 40,
+		'exactly one settle per operation won, out of eighty attempts';
+	is $bus.drain.elems, 40,
+		'and there are exactly forty deliverables — the once-guard is what '
+			~ 'stops one child being reported twice';
+};

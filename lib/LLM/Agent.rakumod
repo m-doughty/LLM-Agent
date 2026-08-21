@@ -57,7 +57,7 @@ L<LLM::Agent::Run>           | the handle on one run: events, result, cancel
 L<LLM::Agent::Event>         | the typed event taxonomy, and the framing contract
 L<LLM::Agent::Session>       | the durable JSONL transcript, and resuming from one
 L<LLM::Agent::ToolOperation> | one tool call's states: dispatched, settled, unknown
-L<LLM::Agent::Compactor>     | summarize the middle before the window fills
+L<LLM::Agent::Compactor>     | elide old observations, summarize the middle, before the window fills
 L<LLM::Agent::TokenCount>    | how big is this conversation: three answers
 L<LLM::Agent::RequestBudget> | what fits this backend, and what this run may spend
 L<LLM::Agent::Artifacts>     | one tool result too big to live in the conversation
@@ -65,10 +65,11 @@ L<LLM::Agent::RunContext>    | what is true right now, rendered into the request
 L<LLM::Agent::Prompt>        | the four pieces a system prompt is made of
 L<LLM::Agent::Canonical>     | stable digests: is this the same message, conversation, snapshot?
 L<LLM::Agent::Subagents>     | a provider that delegates: the model spawns child runs
+L<LLM::Agent::CompletionBus> | the background work a run will not end without
 
 =end table
 
-C<use LLM::Agent;> loads all thirteen, which is enough for every B<class>:
+C<use LLM::Agent;> loads all fourteen, which is enough for every B<class>:
 C<LLM::Agent::Loop>, C<LLM::Agent::Session> and the rest are global
 names and are reachable straight away. The one thing it does not do is
 re-export the B<subs> of L<LLM::Agent::Prompt>,
@@ -215,6 +216,10 @@ my $compactor = LLM::Agent::Compactor.new(
     backend        => @backends[0],
     counter        => $counter,
     context-budget => 128_000,
+    # Optional, off by default, and the cheapest thing in this file: old
+    # tool results are stubbed in place — no request, no summary — and
+    # only summarized when that was not enough. See the Compactor's Pod.
+    age-observations => True,
 );
 
 # --- 7. And the loop it all hangs off. --------------------------------
@@ -222,9 +227,26 @@ my $compactor = LLM::Agent::Compactor.new(
 # `provider` is the TOP of the stack — the subagent composer here, or
 # $policy directly when there is no delegation. The loop cannot tell how
 # deep it goes.
+#
+# `steer-source` is the one seam pointing the other way: the shims above
+# turn something the app is asked into an event, and this is the loop
+# asking the app a question — "has the user said anything since the last
+# round?" It is a thunk taking NO arguments and answering a list of Str,
+# each of which becomes an ordinary user turn, and it is called at a round
+# boundary with nothing in flight, so a steer can never land in the middle
+# of a tool batch. The queue behind it, its lock, and whether three queued
+# lines are three messages or one are all the app's business — see
+# LLM::Agent::Loop's `Steering: a user turn between rounds`. Omit it
+# entirely for a loop the user cannot interrupt.
+
+my @steers;                      # the app's queue: UI pushes, loop drains
+my $steer-lock = Lock.new;
 
 $loop = LLM::Agent::Loop.new(
     :@backends, :$counter, :$session, :$compactor, :$provider,
+    steer-source => {
+        $steer-lock.protect: { my @taken = @steers; @steers = (); @taken }
+    },
 );
 
 # --- 8. The run context: what is true RIGHT NOW. -----------------------
@@ -269,6 +291,11 @@ my $question = LLM::Chat::Conversation::Message.new(
 # message in it at all — the identity lives in the context now, so it is
 # re-rendered every run instead of fossilising at index 0.
 my $run = $loop.run([$question], :$context);
+
+# And while that is in flight, the user thinks of something else. It is
+# delivered at the next round boundary, as a user turn: no cancel, no
+# second run, and nothing lands in the middle of a tool batch.
+$steer-lock.protect: { @steers.push: 'stop after the first failing test' };
 
 =end code
 
@@ -426,6 +453,7 @@ L<MCP::Client::Policy> (permissions), L<JSONL> (the transcript format).
 # is its whole content. See the DESCRIPTION for why there is no wrapper
 # class here.
 use LLM::Agent::Compactor;
+use LLM::Agent::CompletionBus;
 use LLM::Agent::Event;
 use LLM::Agent::Loop;
 use LLM::Agent::Prompt;

@@ -12,7 +12,7 @@ use MCP::Client::Policy;
 # real policy, and a damaged file has to fail loudly everywhere except the
 # one place a crash really leaves damage.
 
-plan 21;
+plan 25;
 
 my $tmp = $*TMPDIR.add("llm-agent-t08-{$*PID}-{now.Int}");
 $tmp.mkdir;
@@ -162,6 +162,178 @@ subtest 'compactions compose: a summary can be summarized' => {
 	is $replayed.messages.elems, 3, 'and nothing accumulated';
 };
 
+subtest 'an elision replays as the stub the model was shown' => {
+	plan 7;
+
+	my $path = fresh-path();
+	my $session = test-session(path => $path, meta => {});
+
+	$session.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'system', content => 'be helpful', sysprompt => True));
+	$session.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'assistant', content => 'reading',
+		tool-calls => [tool-call('c1', 'fs_read', '{"path":"a"}'),]));
+	my $fat = $session.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'tool', content => 'A' x 4_000, tool-call-id => 'c1'));
+	$session.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'user', content => 'and now the tests'));
+
+	$session.append-elision(items => [
+		%(id => $fat, stub => '[elided by the harness: 4000-char fs_read result]'),
+	]);
+	$session.close;
+
+	my $replayed = reopen-session(path => $path);
+	is-deeply $replayed.messages.map({ .role ~ ':' ~ .content }).List,
+		(
+			'system:be helpful',
+			'assistant:reading',
+			'tool:[elided by the harness: 4000-char fs_read result]',
+			'user:and now the tests',
+		),
+		'the message is still there, in its place, with the stub as content';
+
+	is $replayed.messages[2].tool-call-id, 'c1',
+		'still answering the call the assistant turn made — which is the '
+			~ 'whole reason elision is safe';
+	is $replayed.message-ids[2], $fat,
+		'and still under its OWN id: an elision creates no message, so it '
+			~ 'takes no id of its own in the conversation';
+	is $replayed.messages.elems, 4, 'nothing was added or removed';
+	is $replayed.events.elems, 6, 'while every line is still in .events';
+
+	# The original result never left the file. A transcript records what
+	# happened; the elision records what the model was shown afterwards.
+	ok $replayed.events.first({
+		$_<type> eq 'message' && ($_<payload><content> // '').contains('AAAA')
+	}).defined, 'the 4,000 characters are still on the message line';
+	is $replayed.events.tail<payload><items>[0]<id>, $fat,
+		'and the elision line still names what it stubbed';
+};
+
+subtest 'elisions and compactions compose, in either order' => {
+	plan 6;
+
+	# --- an elision, then a compaction over the stubs. ------------------
+	my $first-path = fresh-path();
+	my $first = test-session(path => $first-path, meta => {});
+
+	$first.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'system', content => 'be helpful', sysprompt => True));
+	my $fat = $first.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'tool', content => 'A' x 4_000, tool-call-id => 'c1'));
+	$first.append-elision(items => [%(id => $fat, stub => '[elided: 4000]'),]);
+	my $compaction = $first.append-compaction(
+		summary => 'they read a big file', replaces-through-id => $fat);
+	$first.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'user', content => 'carry on'));
+	$first.close;
+
+	my $one = reopen-session(path => $first-path);
+	is-deeply $one.messages.map({ .role ~ ':' ~ .content }).List,
+		('system:be helpful', 'user:they read a big file', 'user:carry on'),
+		'the compaction folded the elided message away, as it would any other';
+	is $one.message-ids[1], $compaction,
+		'under the compaction’s own id';
+
+	# --- a compaction, then an elision of what survived it. -------------
+	my $second-path = fresh-path();
+	my $second = test-session(path => $second-path, meta => {});
+
+	$second.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'system', content => 'be helpful', sysprompt => True));
+	my $ancient = $second.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'user', content => 'ancient history'));
+	my $summary = $second.append-compaction(
+		summary => 'the ancient history', replaces-through-id => $ancient);
+	my $survivor = $second.append-message(LLM::Chat::Conversation::Message.new(
+		role => 'tool', content => 'B' x 4_000, tool-call-id => 'c9'));
+
+	# Two ids in one line, and one of them is the SUMMARY the compaction
+	# created — which is a message like any other as far as this is
+	# concerned, and the reason ids beat positions.
+	$second.append-elision(items => [
+		%(id => $survivor, stub => '[elided: 4000]'),
+		%(id => $summary, stub => '[elided: the summary]'),
+	]);
+	$second.close;
+
+	my $two = reopen-session(path => $second-path);
+	is-deeply $two.messages.map({ .role ~ ':' ~ .content }).List,
+		('system:be helpful', 'user:[elided: the summary]', 'tool:[elided: 4000]'),
+		'both were stubbed where they stood — including the summary, which '
+			~ 'replays under the compaction envelope’s id';
+	is $two.messages[2].tool-call-id, 'c9', 'and the pairing is intact';
+
+	# ...and the ordering rule that follows from all of this: an id a
+	# compaction has already replaced is GONE, so an elision naming it
+	# cannot be applied and does not load.
+	my $backwards = raw-transcript([
+		envelope('session-meta', {}),
+		envelope('message', { role => 'user', content => 'ancient' }, id => 'm1'),
+		envelope('compaction', {
+			summary => 'a summary', 'replaces-through-id' => 'm1',
+		}, id => 'k1'),
+		envelope('elision', { items => [%(id => 'm1', stub => 'too late'),] }),
+	]);
+	throws-like { reopen-session(path => $backwards) },
+		Exception, message => /'not a message this transcript still has'/,
+		'which is why the loop writes an elision BEFORE the compaction that '
+			~ 'may fold it in';
+
+	my $forwards = raw-transcript([
+		envelope('session-meta', {}),
+		envelope('message', { role => 'user', content => 'ancient' }, id => 'm2'),
+		envelope('elision', { items => [%(id => 'm2', stub => 'in time'),] }),
+		envelope('compaction', {
+			summary => 'a summary', 'replaces-through-id' => 'm2',
+		}),
+	]);
+	is reopen-session(path => $forwards).messages[0].content, 'a summary',
+		'and in that order both lines apply, in file order, composing';
+};
+
+subtest 'an elision that names nothing is fatal' => {
+	plan 4;
+
+	my $dangling = raw-transcript([
+		envelope('session-meta', {}),
+		envelope('message', { role => 'user', content => 'hello' }),
+		envelope('elision', { items => [%(id => 'no-such-id', stub => 'x'),] }),
+	]);
+	throws-like { reopen-session(path => $dangling) },
+		Exception, message => /'not a message this transcript still has'/,
+		'a stub for a message that is not there would silently change the '
+			~ 'conversation, so it does not load at all';
+
+	my $idless = raw-transcript([
+		envelope('session-meta', {}),
+		envelope('elision', { items => [%(stub => 'x'),] }),
+	]);
+	throws-like { reopen-session(path => $idless) },
+		Exception, message => /'has no id'/,
+		'and neither does an item with nothing to name';
+
+	my $shapeless = raw-transcript([
+		envelope('session-meta', {}),
+		envelope('elision', { summary => 'wrong type entirely' }),
+	]);
+	throws-like { reopen-session(path => $shapeless) },
+		Exception, message => /'no items list'/,
+		'nor a payload that is not an elision at all';
+
+	# An EMPTY items list is a different thing: the appender refuses one,
+	# and a line some other tool wrote with nothing in it applies nothing —
+	# the same posture replay takes towards every other payload shape.
+	my $empty = raw-transcript([
+		envelope('session-meta', {}),
+		envelope('message', { role => 'user', content => 'hello' }),
+		envelope('elision', { items => [] }),
+	]);
+	is reopen-session(path => $empty).messages[0].content, 'hello',
+		'an elision with no items stubs nothing and loads';
+};
+
 subtest 'grants replay into a real policy, which then does not ask' => {
 	plan 4;
 
@@ -308,6 +480,34 @@ subtest 'a CRLF transcript keeps its line endings through a repair' => {
 	my $again = reopen-session(path => $path);
 	is $again.messages.elems, 1, 'and it loads again, quietly';
 	$again.close;
+};
+
+subtest 'a valid final JSON line without EOL is made append-safe' => {
+	plan 10;
+
+	for ("\n", "\r\n") -> $nl {
+		my Str $name = $nl eq "\r\n" ?? 'CRLF' !! 'LF';
+		my $path = raw-transcript([
+			envelope('session-meta', {}),
+			envelope('message', { role => 'user', content => 'before' }),
+		], :$nl, :!eol);
+
+		my $session = reopen-session(path => $path);
+		is $session.warnings.elems, 0, "$name: a complete envelope is not damage";
+		is $session.messages.elems, 1, "$name: the existing message replays";
+		$session.append-message(msg('assistant', 'after'));
+		$session.close;
+
+		my Str $raw = $path.slurp(:bin).decode('latin-1');
+		is $raw.lines.elems, 3,
+			"$name: the appended envelope starts on its own line";
+		is $raw.comb($nl).elems, ($name eq 'CRLF' ?? 2 !! 3),
+			"$name: the repaired separator preserves the established convention";
+		my $again = reopen-session(path => $path);
+		is $again.messages.map(*.content).List, ('before', 'after'),
+			"$name: the result reopens without concatenated JSON";
+		$again.close;
+	}
 };
 
 subtest 'a repair copy left behind by an interrupted repair is not trusted' => {

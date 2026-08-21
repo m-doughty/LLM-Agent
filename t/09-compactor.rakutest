@@ -9,7 +9,7 @@ use LLM::Chat::Conversation::Message;
 # the summarizer, and — the part that matters most — what it does when
 # the summarizer is not there.
 
-plan 16;
+plan 18;
 
 # One token per character, no per-message overhead: every threshold in
 # this file is then plain arithmetic a reader can check.
@@ -501,7 +501,7 @@ subtest 'compacting to a target the caller supplies' => {
 };
 
 subtest 'the constructor refuses a configuration that cannot work' => {
-	plan 5;
+	plan 7;
 
 	my %base = counter => counter(), backend => scripted-backend(steps => []);
 
@@ -527,4 +527,156 @@ subtest 'the constructor refuses a configuration that cannot work' => {
 			counter => counter(), backend => 'not a backend', context-budget => 100,
 		)
 	}, Exception, message => /'chat-completion'/, 'a backend that is not one';
+
+	throws-like {
+		LLM::Agent::Compactor.new(|%base, context-budget => 100, age-min-chars => 0)
+	}, Exception, message => /'age-min-chars'/,
+		'a stub threshold of nothing — every result, however small, for a '
+			~ 'prefix cache epoch each';
+
+	throws-like {
+		LLM::Agent::Compactor.new(
+			|%base, context-budget => 100, age-reclaim-min => 0,
+		)
+	}, Exception, message => /'age-reclaim-min'/,
+		'and an epoch of nothing, which is the same mistake by the other '
+			~ 'knob: one result aged per round, one cache miss per result';
+};
+
+subtest 'a tool call’s arguments are capped too, and the cut is marked' => {
+	plan 6;
+
+	# The other half of the render cap. A conversation is compacted
+	# because something in it was enormous, and "something enormous" is as
+	# often a call as a result: a patch written into `fs_write` arguments
+	# is the model's own output, and the summarizer has no more business
+	# reading all of it than it has reading the file back.
+	my $backend = scripted-backend(steps => [{ content => 'SUMMARY' },]);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, counter => counter(), context-budget => 100_000,
+		keep-recent => 2, tool-result-cap => 100,
+	);
+
+	my @messages = (
+		sysprompt('SYSPROMPT-TEXT'),
+		LLM::Chat::Conversation::Message.new(role => 'user', content => 'write it'),
+		LLM::Chat::Conversation::Message.new(
+			role => 'assistant', content => 'writing',
+			tool-calls => [
+				tool-call('c1', 'fs_write', '{"path":"big","body":"' ~ ('A' x 5_000) ~ '"}'),
+			]),
+		LLM::Chat::Conversation::Message.new(
+			role => 'tool', content => 'X' x 5_000, tool-call-id => 'c1'),
+		LLM::Chat::Conversation::Message.new(role => 'assistant', content => 'written'),
+		LLM::Chat::Conversation::Message.new(role => 'user', content => 'thanks'),
+	);
+	$compactor.compact(@messages);
+
+	my $transcript = $backend.recorded-calls[0]<messages>[1].content;
+
+	# 5,000 characters of body, plus the JSON around it, minus the 100
+	# that survived: the marker says exactly how much went, computed from
+	# the arguments as they were.
+	my Int $arguments = ('{"path":"big","body":"' ~ ('A' x 5_000) ~ '"}').chars;
+	ok $transcript.contains(
+		"... [{$arguments - 100} more characters of tool-call arguments, "
+			~ 'truncated for summarization]'),
+		'the truncated arguments carry a marker with the exact number of '
+			~ 'characters elided';
+	ok $transcript.contains('-> calls fs_write({"path":"big","body":"A'),
+		'after the first tool-result-cap characters of the arguments, which '
+			~ 'are what they always were';
+	nok $transcript.contains('A' x 200),
+		'and the other 4,900 did not go out — a compaction that sent the '
+			~ 'whole call would fail for the reason it was invoked';
+
+	ok $transcript.contains('more characters of tool output, truncated for '
+		~ 'summarization'),
+		'the tool RESULT marker is still there beside it, unchanged';
+
+	# Under the cap: verbatim, and no marker at all. A summarizer told
+	# something was cut when nothing was is being lied to just as surely.
+	my $small = scripted-backend(steps => [{ content => 'SUMMARY' },]);
+	my $roomy = LLM::Agent::Compactor.new(
+		backend => $small, counter => counter(), context-budget => 100_000,
+		keep-recent => 2, tool-result-cap => 100,
+	);
+	$roomy.compact((
+		sysprompt('SYSPROMPT-TEXT'),
+		LLM::Chat::Conversation::Message.new(role => 'user', content => 'read it'),
+		LLM::Chat::Conversation::Message.new(
+			role => 'assistant', content => 'reading',
+			tool-calls => [tool-call('c1', 'fs_read', '{"path":"small"}'),]),
+		LLM::Chat::Conversation::Message.new(
+			role => 'tool', content => 'a short answer', tool-call-id => 'c1'),
+		LLM::Chat::Conversation::Message.new(role => 'assistant', content => 'read'),
+		LLM::Chat::Conversation::Message.new(role => 'user', content => 'thanks'),
+	));
+
+	my $short = $small.recorded-calls[0]<messages>[1].content;
+	ok $short.contains('-> calls fs_read({"path":"small"})'),
+		'arguments that fit the cap are rendered as they were';
+	nok $short.contains('tool-call arguments, truncated'),
+		'with nothing said about a truncation that did not happen';
+};
+
+subtest 'a sticky seed is never summarized, and over the target it exhausts' => {
+	plan 8;
+
+	# The child of a delegation is started from ONE user message carrying
+	# its whole brief, and a host that marks that message sticky is saying
+	# the brief is not summarizable: a child that reads a summary of its
+	# own instructions is a child working from a paraphrase.
+	sub seed(Str:D $content --> LLM::Chat::Conversation::Message) {
+		LLM::Chat::Conversation::Message.new(
+			role => 'user', :$content, sticky => True,
+		);
+	}
+
+	# --- nothing else to take, and the seed alone is over the target. ---
+	my $backend = scripted-backend(steps => []);
+	my $compactor = LLM::Agent::Compactor.new(
+		:$backend, counter => counter(), context-budget => 1_000, keep-recent => 2,
+	);
+
+	my @brief = (
+		sysprompt('SY'),
+		seed('BRIEF-' ~ ('b' x 2_000)),
+		LLM::Chat::Conversation::Message.new(role => 'assistant', content => 'starting'),
+		LLM::Chat::Conversation::Message.new(role => 'user', content => 'go on'),
+	);
+	my %result = $compactor.compact(@brief);
+
+	is %result<dropped>, 0, 'there was nothing compaction was allowed to take';
+	is-deeply %result<messages>.map({ .content }).List,
+		@brief.map({ .content }).List,
+		'so the conversation comes back exactly as it went in — the brief '
+			~ 'included';
+	ok %result<exhausted>,
+		'and the pass says EXHAUSTED rather than handing back a conversation '
+			~ 'whose next request cannot fit: a caller that turns this into a '
+			~ 'named failure tells the user the brief is too big, which is '
+			~ 'the truth, instead of quietly running on a paraphrase of it';
+	is $backend.recorded-calls.elems, 0,
+		'the summarizer was never called, so the brief was never even shown '
+			~ 'to it';
+
+	# --- and with a middle to work on, it is still not in the middle. ---
+	my $working = scripted-backend(steps => [{ content => 'THE SUMMARY' },]);
+	my $second = LLM::Agent::Compactor.new(
+		backend => $working, counter => counter(), context-budget => 1_000,
+		keep-recent => 2,
+	);
+
+	my @messages = (sysprompt('SY'), seed('BRIEF-TEXT'));
+	@messages.append: conversation(6).skip(1);
+	my %summarized = $second.compact(@messages);
+
+	ok %summarized<dropped> >= 1, 'the ordinary turns were summarized';
+	unlike $working.recorded-calls[0]<messages>[1].content, /'BRIEF-TEXT'/,
+		'and the seed was not among them — the summarizer never sees it';
+	ok %summarized<messages>.grep({ .content.contains('BRIEF-TEXT') }).elems,
+		'it survived the compaction';
+	ok %summarized<messages>[1].content.contains('BRIEF-TEXT'),
+		'in the sticky prefix, right where it was, ahead of the summary';
 };
