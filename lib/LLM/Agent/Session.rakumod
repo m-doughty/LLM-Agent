@@ -906,6 +906,11 @@ method !repair-tail(--> Int:D) {
 }
 
 method !open-handle(--> Nil) {
+	# JSONL::Writer turns the handle's newline translation off, so an
+	# appended envelope ends in exactly one 0x0A byte on every platform —
+	# Windows' default translation would append CRLF envelopes, silently
+	# flipping the transcript's separator convention (the
+	# repaired-separator contract t/08 pins).
 	$!fh = $!path.open(:a);
 	# Handle mode plus :flush, for the session's whole life. See the Pod:
 	# path mode reopens the file per call, and its write-all rewrites it.
