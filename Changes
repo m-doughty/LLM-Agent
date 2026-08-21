@@ -2,6 +2,15 @@ Revision history for LLM::Agent
 
 {{$NEXT}}
 
+0.6.1  2026-08-22T00:15:45+01:00
+    - An appended envelope ends in exactly the one 0x0A byte the writer
+      wrote, on Windows too: JSONL::Writer (0.1.6) writes records as
+      bytes, bypassing the handle's encoder — whose default newline
+      translation was appending CRLF envelopes on Windows, silently
+      flipping a transcript's separator convention and breaking the
+      repaired-separator contract (caught by Windows CI in t/08). The
+      repair path itself was always byte-exact. Requires JSONL 0.1.6.
+
 0.6.0  2026-08-21T22:50:40+01:00
     - A TOOL CALL CAN NOW ANSWER TWICE: once immediately, and once with
       what it actually did. New LLM::Agent::CompletionBus is the register
